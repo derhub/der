@@ -47,6 +47,8 @@ export {
   reconcileApprovalExpiryStep,
   type ApprovalDecisionPayload,
   type ApprovedEffectStepResult,
+  type AwaitApprovalInput,
+  type AwaitApprovalOutcome,
   type DurableWorkflow,
   type PreApprovalStageResult,
   type WorkflowDeps,

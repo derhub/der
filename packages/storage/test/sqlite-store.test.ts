@@ -368,6 +368,7 @@ describe("persist approvals, transactional outbox rows, and exact-operation effe
         { status: 409, code: "approval.scope_mismatch" },
       );
 
+      clock.advanceMs(60_000);
       const approved = await store.decide({
         approvalId: requested.approval.id,
         botId: bot.id,
@@ -375,12 +376,12 @@ describe("persist approvals, transactional outbox rows, and exact-operation effe
         runId: run.id,
         status: "approved",
         actor: "operator",
-        decidedAt: "2026-11-22T15:01:00Z",
+        decidedAt: "2020-01-01T00:00:00Z",
       });
       expect(approved.decision).toEqual({
         status: "approved",
         actor: "operator",
-        decidedAt: "2026-11-22T15:01:00Z",
+        decidedAt: "2026-11-22T15:01:00.000Z",
       });
 
       const replayed = await store.decide({
@@ -494,6 +495,7 @@ describe("persist approvals, transactional outbox rows, and exact-operation effe
         deadline: "2026-11-22T16:01:00Z",
       });
 
+      clock.advanceMs(2 * 60_000);
       let expiredError: unknown;
       try {
         await store.decide({
@@ -503,7 +505,7 @@ describe("persist approvals, transactional outbox rows, and exact-operation effe
           runId: run.id,
           status: "approved",
           actor: "operator",
-          decidedAt: "2026-11-22T16:02:00Z",
+          decidedAt: "2026-11-22T16:00:30Z",
         });
       } catch (error) {
         expiredError = error;
@@ -547,17 +549,17 @@ describe("persist approvals, transactional outbox rows, and exact-operation effe
         });
         expect(retrying.state).toBe("retrying");
         expect(retrying.attempts).toBe(1);
-        expect(store.listDueOutboxEvents("2026-11-22T16:00:05Z").map((e) => e.id)).not.toContain(
+        expect(store.listDueOutboxEvents("2026-11-22T16:02:05Z").map((e) => e.id)).not.toContain(
           firstOutbox.id,
         );
-        expect(store.listDueOutboxEvents("2026-11-22T16:00:15Z").map((e) => e.id)).toContain(
+        expect(store.listDueOutboxEvents("2026-11-22T16:02:15Z").map((e) => e.id)).toContain(
           firstOutbox.id,
         );
 
         const delivered = await store.recordOutboxDelivery(firstOutbox.id, {
           status: "delivered",
           externalMessageId: "ext-msg-1",
-          deliveredAt: "2026-11-22T16:00:15Z",
+          deliveredAt: "2026-11-22T16:02:15Z",
         });
         expect(delivered.state).toBe("delivered");
         expect(delivered.attempts).toBe(2);

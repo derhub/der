@@ -249,13 +249,7 @@ export function createMcpTools(options: McpToolsOptions): McpToolsHandle {
           continue;
         }
         const operationId = `${serverId}.${tool.name}`;
-        const annotationReadOnly =
-          tool.annotations?.readOnlyHint === true && tool.annotations?.destructiveHint !== true;
-        const requiresApproval = readOnlySet.has(tool.name)
-          ? false
-          : annotationReadOnly
-            ? false
-            : defaultRequiresApproval;
+        const requiresApproval = readOnlySet.has(tool.name) ? false : defaultRequiresApproval;
 
         const descriptor = compiledParsers.toolDescriptor.parse({
           kind: "mcp",
@@ -325,7 +319,13 @@ export function createMcpTools(options: McpToolsOptions): McpToolsHandle {
         );
       }
 
-      if (discovered.descriptor.requiresApproval && options.verifyApproval) {
+      if (discovered.descriptor.requiresApproval) {
+        if (!options.verifyApproval) {
+          return deniedToolResult(
+            "tool.approval_required",
+            `Exact-operation approval verifier is required for MCP operation "${effect.operationId}".`,
+          );
+        }
         const authorized = await options.verifyApproval(effect);
         if (!authorized) {
           return deniedToolResult(

@@ -116,7 +116,6 @@ export function handleRunEventsSse(
           const latestState = options.store.getRunStreamState(runId);
           if (!latestState) {
             const errorFrame = formatSseEvent({
-              id: cursor + 1,
               data: {
                 type: "RUN_ERROR",
                 message: `Run ${runId} is no longer available.`,
@@ -162,7 +161,6 @@ export function handleRunEventsSse(
         if (!closed) {
           const message = error instanceof Error ? error.message : "Stream failure.";
           const errorFrame = formatSseEvent({
-            id: cursor + 1,
             data: {
               type: "RUN_ERROR",
               message,

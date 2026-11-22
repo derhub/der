@@ -11,6 +11,7 @@ import {
   type Session,
 } from "@der/domain";
 import { compiledParsers } from "@der/domain/compiled";
+import { handleRunEventsSse } from "../src/http/sse";
 import { startServer, type RunningServer } from "../src/main";
 import { createFixtureTools } from "../src/workflows/index";
 import {
@@ -25,6 +26,7 @@ const cleanups: (() => Promise<void> | void)[] = [];
 function startVerticalSliceServer(options?: {
   readonly approvalTimeoutMs?: number;
   readonly seedFixture?: boolean;
+  readonly now?: () => Date;
 }) {
   const tempDb: TempDatabaseHandle = createTempDatabase("der-vertical-");
   const tools = createFixtureTools();
@@ -45,6 +47,7 @@ function startVerticalSliceServer(options?: {
       sseKeepAliveMs: 2_000,
       seedFixture: options?.seedFixture ?? true,
     },
+    ...(options?.now ? { now: options.now } : {}),
     tools,
   });
 
@@ -486,5 +489,136 @@ describe("enforce exact approval scope, decision replay, key conflicts, and SSE 
     expect(uncertainServer.server.store.getEffect(pendingUncertain.approval!.effect)?.status).toBe(
       "unknown",
     );
+  });
+
+  it("rejects a backdated client decidedAt after the approval deadline with 409 approval.expired", async () => {
+    let nowMs = Date.parse("2026-11-22T18:00:00.000Z");
+    const { server, tools } = startVerticalSliceServer({
+      approvalTimeoutMs: 60_000,
+      seedFixture: true,
+      now: () => new Date(nowMs),
+    });
+    const sessionId = server.seededFixture!.session.id;
+    const botId = server.seededFixture!.bot.id;
+
+    const admitRes = await fetch(`${server.url}/api/sessions/${sessionId}/runs`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "idempotency-key": "backdate-key-1",
+      },
+      body: JSON.stringify({ input: { parts: [{ type: "text", text: "lamp-backdate" }] } }),
+    });
+    expect(admitRes.status).toBe(202);
+    const admission = (await admitRes.json()) as RunAdmission;
+
+    const waiting = await waitUntil(async () => {
+      const res = await fetch(`${server.url}/api/runs/${admission.run.id}`);
+      const body = (await res.json()) as { run: Run; approval: Approval | null };
+      return body.run.status === "waiting_approval" && body.approval ? body : false;
+    });
+
+    nowMs = Date.parse("2026-11-22T18:02:00.000Z");
+    const backdatedRes = await fetch(
+      `${server.url}/api/approvals/${waiting.approval!.id}/decision`,
+      {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          botId,
+          sessionId,
+          runId: admission.run.id,
+          status: "approved",
+          actor: "operator",
+          decidedAt: "2026-11-22T18:00:10.000Z",
+        }),
+      },
+    );
+
+    expect(backdatedRes.status).toBe(409);
+    expect(backdatedRes.headers.get("content-type")).toBe(PROBLEM_DETAILS_MEDIA_TYPE);
+    expect(compiledParsers.problemDetails.parse(await backdatedRes.json()).code).toBe(
+      "approval.expired",
+    );
+    expect(tools.applied).toHaveLength(0);
+  });
+
+  it("omits SSE id on post-header error frames so reconnect resumes cleanly from the last committed cursor", async () => {
+    const { server } = startVerticalSliceServer({ seedFixture: true });
+    const botId = server.seededFixture!.bot.id;
+    const sessionId = server.seededFixture!.session.id;
+    const { run } = await server.store.admit({
+      botId,
+      sessionId,
+      origin: "http",
+      idempotencyKey: "sse-err-key-1",
+      input: { parts: [{ type: "text", text: "stream test" }] },
+    });
+
+    await server.store.appendRunEvents(run.id, [
+      { chunkKey: `${run.id}:1`, chunk: { type: "RUN_STARTED", runId: run.id } },
+      { chunkKey: `${run.id}:2`, chunk: { type: "TEXT_MESSAGE_CONTENT", delta: "part-1" } },
+    ]);
+
+    let readCalls = 0;
+    const flakyStore = Object.assign(
+      Object.create(Object.getPrototypeOf(server.store)),
+      server.store,
+      {
+        readRunEventsAfter(id: string, after: number, limit?: number) {
+          readCalls += 1;
+          if (readCalls === 2) {
+            throw new Error("transient sqlite read error");
+          }
+          return server.store.readRunEventsAfter(id, after, limit);
+        },
+      },
+    );
+
+    const firstUrl = new URL(`${server.url}/api/runs/${run.id}/events`);
+    const firstResponse = handleRunEventsSse(new Request(firstUrl), firstUrl, run.id, {
+      store: flakyStore,
+      pollIntervalMs: 10,
+      keepAliveMs: 2_000,
+    });
+    expect(firstResponse.status).toBe(200);
+    const firstFrames = await collectSseFrames(firstResponse);
+
+    expect(firstFrames).toHaveLength(3);
+    expect(firstFrames[0]).toMatchObject({ kind: "event", id: "1" });
+    expect(firstFrames[1]).toMatchObject({ kind: "event", id: "2" });
+    expect(firstFrames[2]).toMatchObject({ kind: "event" });
+    expect(firstFrames[2]?.kind === "event" ? firstFrames[2].id : "unexpected").toBeUndefined();
+    expect(firstFrames[2]?.kind === "event" ? JSON.parse(firstFrames[2].data) : null).toMatchObject(
+      {
+        type: "RUN_ERROR",
+        code: "sse.stream_error",
+        runId: run.id,
+      },
+    );
+
+    await server.store.finishRun({
+      runId: run.id,
+      status: "completed",
+      terminalEvent: {
+        chunkKey: `${run.id}:3`,
+        chunk: { type: "RUN_FINISHED", runId: run.id, threadId: sessionId },
+      },
+      finalMessageParts: [{ type: "text", text: "done" }],
+    });
+
+    const reconnectRes = await fetch(`${server.url}/api/runs/${run.id}/events`, {
+      headers: { "last-event-id": "2" },
+    });
+    expect(reconnectRes.status).toBe(200);
+    const resumedFrames = await collectSseFrames(reconnectRes);
+    expect(resumedFrames).toHaveLength(1);
+    expect(resumedFrames[0]).toMatchObject({ kind: "event", id: "3" });
+    expect(
+      resumedFrames[0]?.kind === "event" ? JSON.parse(resumedFrames[0].data) : null,
+    ).toMatchObject({
+      type: "RUN_FINISHED",
+      runId: run.id,
+    });
   });
 });

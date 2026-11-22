@@ -3,37 +3,7 @@ import {
   createSdkWasmerDriver,
   createWasmerSandbox,
   WASMER_RUNNER_CONTRACT,
-  type WasmerDriver,
-  type WasmerGuestKind,
-  type WasmerGuestPin,
 } from "../packages/runtime/src/sandbox/index";
-
-const VERIFIED_GUEST_PINS: Readonly<Record<WasmerGuestKind, WasmerGuestPin>> = {
-  bash: {
-    guest: "bash",
-    packageRef: "wasmer/bash@1.0.25",
-    version: "1.0.25",
-    digest: "sha256:059606d132e2e6bc1afe3b432ee64dcb1b1b059815c8bb213cf3b24798ef21e1",
-    commandName: "bash",
-    artifactPath: `${WASMER_RUNNER_CONTRACT.guestRoot}/bash-1.0.25.webc`,
-    abi: "wasix",
-  },
-  python: {
-    guest: "python",
-    packageRef: "python/python@3.13.20",
-    version: "3.13.20",
-    digest: "sha256:a9fa8202f1bf6a4eca8d31ee5f2b1970c8f45af5c5520cc954d28a133333d8e7",
-    commandName: "python",
-    artifactPath: `${WASMER_RUNNER_CONTRACT.guestRoot}/python-3.13.20.webc`,
-    abi: "wasix",
-  },
-};
-
-function toWorkspaceGuestPath(guestPath: string): string {
-  return guestPath.startsWith("/workspace/") || guestPath === "/workspace"
-    ? guestPath
-    : `/workspace${guestPath.startsWith("/") ? "" : "/"}${guestPath}`;
-}
 
 async function readRequestPayload(): Promise<string> {
   const flagIndex = process.argv.indexOf("--request-json");
@@ -61,24 +31,13 @@ async function main(): Promise<void> {
   }
 
   const request = compiledParsers.sandboxRequest.parse(JSON.parse(rawInput));
-  const baseDriver = createSdkWasmerDriver({
+  const driver = createSdkWasmerDriver({
     cacheDirectory: `${WASMER_RUNNER_CONTRACT.guestRoot}/cache`,
   });
-  const driver: WasmerDriver = {
-    createInstance(config) {
-      return baseDriver.createInstance({
-        ...config,
-        directoryGrants: config.directoryGrants.map((grant) => ({
-          ...grant,
-          guestPath: toWorkspaceGuestPath(grant.guestPath),
-        })),
-      });
-    },
-  };
 
   const sandbox = createWasmerSandbox({
     driver,
-    guestPins: VERIFIED_GUEST_PINS,
+    guestPins: WASMER_RUNNER_CONTRACT.guests,
     allowedHostRoots: resolveAllowedRoots(),
   });
 

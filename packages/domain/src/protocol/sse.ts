@@ -21,7 +21,7 @@ export interface ParseSseCursorInput {
 }
 
 export interface FormatSseEventInput {
-  readonly id: number | string;
+  readonly id?: number | string | undefined;
   readonly data: JsonValue;
   readonly event?: string | undefined;
 }
@@ -127,7 +127,7 @@ function validateEmittedId(id: number | string): string {
 }
 
 export function formatSseEvent(input: FormatSseEventInput): string {
-  const idText = validateEmittedId(input.id);
+  const idPrefix = input.id !== undefined ? `id: ${validateEmittedId(input.id)}\n` : "";
   const eventName = input.event ?? SSE_EVENT_NAME;
   if (eventName.length === 0 || hasForbiddenSseControlChars(eventName)) {
     throw new RangeError(
@@ -138,7 +138,7 @@ export function formatSseEvent(input: FormatSseEventInput): string {
   const parsedData = jsonValue.parse(input.data);
   const serialized = JSON.stringify(parsedData);
   const dataLines = serialized.split("\n").map((line) => `data: ${line}`);
-  return `id: ${idText}\nevent: ${eventName}\n${dataLines.join("\n")}\n\n`;
+  return `${idPrefix}event: ${eventName}\n${dataLines.join("\n")}\n\n`;
 }
 
 export function formatSseComment(comment: string): string {

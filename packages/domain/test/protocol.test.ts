@@ -454,6 +454,18 @@ describe("validate W3C SSE cursors and framing", () => {
       kind: "comment",
       comment: "keep-alive",
     });
+
+    const idlessError = formatSseEvent({
+      data: { type: "RUN_ERROR", code: "sse.stream_error", message: "transient" },
+    });
+    expect(idlessError).toBe(
+      `event: message\ndata: ${JSON.stringify({ type: "RUN_ERROR", code: "sse.stream_error", message: "transient" })}\n\n`,
+    );
+    expect(parseSseFrame(idlessError)).toEqual({
+      kind: "event",
+      event: "message",
+      data: JSON.stringify({ type: "RUN_ERROR", code: "sse.stream_error", message: "transient" }),
+    });
   });
 
   it.each([

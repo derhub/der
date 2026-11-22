@@ -4,6 +4,7 @@ import {
   createDockerSandbox,
   createHardenedDockerProvider,
   DEFAULT_ENGINE_SHADOW_HOMES,
+  probeDockerEgressNetwork,
   probeDockerIsolation,
   SandboxControlError,
   validateDockerContainerSpec,
@@ -247,6 +248,64 @@ describe("validate and build hardened Docker launch controls", () => {
         network: { mode: "scoped_egress", networkName: "host", allowedHosts: ["api.openai.com"] },
       }),
       expectedCode: "docker.host_network_forbidden",
+    },
+    {
+      name: "default network name in scoped egress",
+      spec: validContainerSpec({
+        network: {
+          mode: "scoped_egress",
+          networkName: "default",
+          allowedHosts: ["api.openai.com"],
+        },
+      }),
+      expectedCode: "docker.host_network_forbidden",
+    },
+    {
+      name: "container network sharing in scoped egress",
+      spec: validContainerSpec({
+        network: {
+          mode: "scoped_egress",
+          networkName: "container:other",
+          allowedHosts: ["api.openai.com"],
+        },
+      }),
+      expectedCode: "docker.host_network_forbidden",
+    },
+    {
+      name: "empty allowedHosts in scoped egress",
+      spec: validContainerSpec({
+        network: {
+          mode: "scoped_egress",
+          networkName: "der-egress-codex",
+          allowedHosts: [],
+        },
+      }),
+      expectedCode: "docker.egress_host_not_approved",
+    },
+    {
+      name: "path traversal in workspace bind mount",
+      spec: validContainerSpec({
+        workspaceMount: {
+          source: "/srv/der/workspaces/../etc/passwd",
+          target: "/workspace",
+          readonly: false,
+        },
+      }),
+      expectedCode: "docker.invalid_workspace_mount",
+    },
+    {
+      name: "extra bind mount outside workspace root",
+      spec: validContainerSpec({
+        extraMounts: [
+          {
+            type: "bind",
+            source: "/etc/passwd",
+            target: "/mnt/ro-0",
+            readonly: true,
+          },
+        ],
+      }),
+      expectedCode: "docker.bind_path_outside_root",
     },
     {
       name: "unapproved egress host",
@@ -505,5 +564,200 @@ describe("provide a hardened @tanstack/ai-sandbox handle and @der/domain Sandbox
     expect(runCall?.args).toContain("--cap-drop=ALL");
     expect(runCall?.args).toContain("--security-opt=no-new-privileges:true");
     expect(runCall?.args).toContain("--network=none");
+  });
+
+  it("rejects unapproved host bind paths in createDockerSandbox readonlyPaths and writablePaths", async () => {
+    const { runner, calls } = createFakeCommandRunner({
+      onExec: (_cmd, args) => {
+        if (args[0] === "info") {
+          return {
+            exitCode: 0,
+            stdout: JSON.stringify({
+              ServerVersion: "29.10.0",
+              SecurityOptions: ["name=rootless"],
+              MemoryLimit: true,
+              CpuCfsQuota: true,
+              PidsLimit: true,
+            }),
+            stderr: "",
+          };
+        }
+        return { exitCode: 0, stdout: "", stderr: "" };
+      },
+    });
+
+    const sandbox = createDockerSandbox({
+      dockerHost: "unix:///run/user/1000/docker.sock",
+      image: "der-engine-codex:pinned",
+      engine: "codex",
+      user: "1000:1000",
+      workspaceHostPath: "/srv/der/workspaces/sess-1",
+      allowedWorkspaceRoots: ["/srv/der/workspaces/sess-1"],
+      shadowHome: DEFAULT_ENGINE_SHADOW_HOMES.codex,
+      limits: { cpus: 1, memoryMb: 512, pidsLimit: 128 },
+      runner,
+    });
+
+    let caughtOutside: unknown;
+    try {
+      await sandbox.execute({
+        command: "cat",
+        args: ["/mnt/ro-0/passwd"],
+        readonlyPaths: ["/etc/passwd"],
+        timeoutMs: 2000,
+        network: "none",
+      });
+    } catch (error) {
+      caughtOutside = error;
+    }
+    expect(caughtOutside).toBeInstanceOf(SandboxControlError);
+    expect((caughtOutside as SandboxControlError).code).toBe("docker.bind_path_outside_root");
+
+    let caughtTraversal: unknown;
+    try {
+      await sandbox.execute({
+        command: "ls",
+        args: ["/mnt/rw-0"],
+        writablePaths: ["/srv/der/workspaces/sess-1/../../etc"],
+        timeoutMs: 2000,
+        network: "none",
+      });
+    } catch (error) {
+      caughtTraversal = error;
+    }
+    expect(caughtTraversal).toBeInstanceOf(SandboxControlError);
+    expect((caughtTraversal as SandboxControlError).code).toBe("docker.invalid_workspace_mount");
+    expect(calls.some((call) => call.args[0] === "run")).toBe(false);
+  });
+
+  it("verifies scoped egress network existence and internal isolation on probe and launch", async () => {
+    const { runner: unisolatedRunner } = createFakeCommandRunner({
+      onExec: (_cmd, args) => {
+        if (args[0] === "info") {
+          return {
+            exitCode: 0,
+            stdout: JSON.stringify({
+              ServerVersion: "29.10.0",
+              SecurityOptions: ["name=rootless"],
+              MemoryLimit: true,
+              CpuCfsQuota: true,
+              PidsLimit: true,
+            }),
+            stderr: "",
+          };
+        }
+        if (args[0] === "network" && args[1] === "inspect") {
+          return {
+            exitCode: 0,
+            stdout: JSON.stringify({
+              Name: "der-egress-codex",
+              Driver: "bridge",
+              Internal: false,
+              Options: {},
+            }),
+            stderr: "",
+          };
+        }
+        return { exitCode: 0, stdout: "ok", stderr: "" };
+      },
+    });
+
+    const badReport = await probeDockerEgressNetwork({
+      dockerHost: "unix:///run/user/1000/docker.sock",
+      networkName: "der-egress-codex",
+      runner: unisolatedRunner,
+    });
+    expect(badReport.verified).toBe(false);
+    expect(badReport.reasons.join("\n")).toContain("Internal=true");
+
+    const blockedSandbox = createDockerSandbox({
+      dockerHost: "unix:///run/user/1000/docker.sock",
+      image: "der-engine-codex:pinned",
+      engine: "codex",
+      user: "1000:1000",
+      workspaceHostPath: "/srv/der/workspaces/sess-1",
+      shadowHome: DEFAULT_ENGINE_SHADOW_HOMES.codex,
+      egressNetwork: {
+        networkName: "der-egress-codex",
+        allowedHosts: ["api.openai.com"],
+      },
+      limits: { cpus: 1, memoryMb: 512, pidsLimit: 128 },
+      runner: unisolatedRunner,
+    });
+
+    let caughtEgress: unknown;
+    try {
+      await blockedSandbox.execute({
+        command: "echo",
+        args: ["hi"],
+        timeoutMs: 2000,
+        network: "scoped_egress",
+      });
+    } catch (error) {
+      caughtEgress = error;
+    }
+    expect(caughtEgress).toBeInstanceOf(SandboxControlError);
+    expect((caughtEgress as SandboxControlError).code).toBe("docker.egress_network_unverified");
+
+    const { runner: isolatedRunner, calls: isolatedCalls } = createFakeCommandRunner({
+      onExec: (_cmd, args) => {
+        if (args[0] === "info") {
+          return {
+            exitCode: 0,
+            stdout: JSON.stringify({
+              ServerVersion: "29.10.0",
+              SecurityOptions: ["name=rootless"],
+              MemoryLimit: true,
+              CpuCfsQuota: true,
+              PidsLimit: true,
+            }),
+            stderr: "",
+          };
+        }
+        if (args[0] === "network" && args[1] === "inspect") {
+          return {
+            exitCode: 0,
+            stdout: JSON.stringify({
+              Name: "der-egress-codex",
+              Driver: "bridge",
+              Internal: true,
+              Options: {},
+            }),
+            stderr: "",
+          };
+        }
+        return { exitCode: 0, stdout: "isolated-ok", stderr: "" };
+      },
+    });
+
+    const allowedSandbox = createDockerSandbox({
+      dockerHost: "unix:///run/user/1000/docker.sock",
+      image: "der-engine-codex:pinned",
+      engine: "codex",
+      user: "1000:1000",
+      workspaceHostPath: "/srv/der/workspaces/sess-1",
+      shadowHome: DEFAULT_ENGINE_SHADOW_HOMES.codex,
+      egressNetwork: {
+        networkName: "der-egress-codex",
+        allowedHosts: ["api.openai.com"],
+      },
+      limits: { cpus: 1, memoryMb: 512, pidsLimit: 128 },
+      runner: isolatedRunner,
+      now: () => 1000,
+    });
+
+    const result = await allowedSandbox.execute({
+      command: "echo",
+      args: ["hi"],
+      timeoutMs: 2000,
+      network: "scoped_egress",
+    });
+    expect(result.exitCode).toBe(0);
+    expect(
+      isolatedCalls.some((call) => call.args[0] === "network" && call.args[1] === "inspect"),
+    ).toBe(true);
+    expect(isolatedCalls.find((call) => call.args[0] === "run")?.args).toContain(
+      "--network=der-egress-codex",
+    );
   });
 });

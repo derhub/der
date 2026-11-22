@@ -261,7 +261,7 @@ export async function decideApproval(
     }
 
     if (row.status === "pending") {
-      if (input.status !== "expired" && Date.parse(input.decidedAt) >= Date.parse(row.deadline)) {
+      if (input.status !== "expired" && Date.parse(now) >= Date.parse(row.deadline)) {
         db.query(
           `UPDATE approvals
            SET status = 'expired', actor = NULL, decided_at = ?, updated_at = ?
@@ -272,13 +272,14 @@ export async function decideApproval(
       }
 
       const actor = input.status === "expired" ? null : input.actor;
+      const decidedAt = input.status === "expired" ? row.deadline : now;
       const result = db
         .query(
           `UPDATE approvals
            SET status = ?, actor = ?, decided_at = ?, updated_at = ?
            WHERE id = ? AND status = 'pending'`,
         )
-        .run(input.status, actor, input.decidedAt, now, input.approvalId);
+        .run(input.status, actor, decidedAt, now, input.approvalId);
 
       if (result.changes !== 1) {
         throw conflictError(

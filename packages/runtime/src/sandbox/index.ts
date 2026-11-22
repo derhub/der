@@ -2,9 +2,11 @@ export {
   APPROVED_VENDOR_EGRESS,
   buildDockerRunArgs,
   DEFAULT_ENGINE_SHADOW_HOMES,
+  probeDockerEgressNetwork,
   probeDockerIsolation,
   validateDockerContainerSpec,
   type DockerContainerSpec,
+  type DockerEgressNetworkReport,
   type DockerIsolationReport,
   type DockerMountSpec,
   type DockerNetworkPolicy,
@@ -13,6 +15,7 @@ export {
   type DockerWorkspaceMount,
   type EngineShadowHomeSpec,
   type OfficialEngineKind,
+  type ProbeDockerEgressNetworkOptions,
   type ProbeDockerIsolationOptions,
 } from "./docker-policy";
 export {
@@ -42,8 +45,11 @@ export {
   type WasmerRunnerContract,
 } from "./wasmer-contract";
 export {
+  createDockerWasmerSandbox,
   createSdkWasmerDriver,
   createWasmerSandbox,
+  verifyWasmerArtifactBytes,
+  type DockerWasmerSandboxConfig,
   type ManagedWasmerSandbox,
   type WasmerDriver,
   type WasmerGuestInstance,

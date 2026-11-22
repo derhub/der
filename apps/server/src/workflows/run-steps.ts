@@ -23,12 +23,25 @@ import {
 import type { SqliteStore } from "@der/storage";
 import { UncertainEffectError } from "./fixture-engine";
 
+export interface AwaitApprovalInput {
+  readonly run: Run;
+  readonly effect: EffectIdentity;
+  readonly prompt: string;
+}
+
+export interface AwaitApprovalOutcome {
+  readonly status: "approved" | "denied" | "expired";
+  readonly approvalId: ApprovalId;
+  readonly effect: EffectIdentity;
+}
+
 export interface DurableWorkflow extends Workflow {
   admit(request: RunRequest): Promise<RunAdmission>;
   decide(
     decision: ApprovalResolutionInput,
     channelIntake?: ChannelIntakeMetadata,
   ): Promise<Approval>;
+  awaitApproval?(input: AwaitApprovalInput, signal?: AbortSignal): Promise<AwaitApprovalOutcome>;
 }
 
 export interface WorkflowDeps {

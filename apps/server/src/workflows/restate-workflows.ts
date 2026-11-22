@@ -23,6 +23,8 @@ import {
   persistPendingApprovalStep,
   reconcileApprovalExpiryStep,
   type ApprovalDecisionPayload,
+  type AwaitApprovalInput,
+  type AwaitApprovalOutcome,
   type DurableWorkflow,
   type WorkflowDeps,
 } from "./run-steps";
@@ -267,6 +269,56 @@ export function createCommandsService(deps: WorkflowDeps, runWorkflow: RunWorkfl
 
         return approval;
       },
+
+      awaitApproval: async (
+        ctx: restate.Context,
+        input: AwaitApprovalInput,
+      ): Promise<AwaitApprovalOutcome> => {
+        const awakeable = ctx.awakeable<ApprovalDecisionPayload>();
+        const nowMs = await ctx.date.now();
+        const deadlineMs = nowMs + deps.approvalTimeoutMs;
+        const deadline = formatUtcTimestamp(new Date(deadlineMs));
+
+        const persisted = await ctx.run("persist-engine-approval", async () => {
+          try {
+            return await persistPendingApprovalStep(deps, {
+              run: input.run,
+              effect: input.effect,
+              prompt: input.prompt,
+              awakeable: awakeable.id,
+              deadline,
+            });
+          } catch (error) {
+            toRestateTerminalError(error);
+          }
+        });
+
+        let decisionStatus: "approved" | "denied" | "expired";
+        try {
+          const currentMs = await ctx.date.now();
+          const remainingMs = Math.max(1, Date.parse(persisted.deadline) - currentMs);
+          const resolved = await awakeable.promise.orTimeout(remainingMs);
+          decisionStatus = resolved.status;
+        } catch (error) {
+          if (error instanceof restate.TimeoutError) {
+            decisionStatus = await ctx.run("reconcile-engine-approval-expiry", () =>
+              reconcileApprovalExpiryStep(deps, {
+                run: input.run,
+                approvalId: persisted.approvalId,
+                deadline: persisted.deadline,
+              }),
+            );
+          } else {
+            throw error;
+          }
+        }
+
+        return {
+          status: decisionStatus,
+          approvalId: persisted.approvalId,
+          effect: input.effect,
+        };
+      },
     },
   });
 }
@@ -327,6 +379,42 @@ export function createRestateWorkflowClient(ingressUrl: string): DurableWorkflow
         return await ingress
           .serviceClient(CommandsApi)
           .decide(payload, clients.rpc.opts({ idempotencyKey: restateKey }));
+      } catch (error) {
+        throw mapRestateIngressError(error, instance);
+      }
+    },
+
+    async awaitApproval(
+      input: AwaitApprovalInput,
+      signal?: AbortSignal,
+    ): Promise<AwaitApprovalOutcome> {
+      const instance = `/api/runs/${input.run.id}`;
+      try {
+        const fingerprint = await fingerprintJson(input.effect);
+        const restateKey = `await-approval:${input.run.id}:${input.effect.operationKind}:${input.effect.operationId}:${input.effect.attemptId}:${fingerprint}`;
+        const callPromise = ingress
+          .serviceClient(CommandsApi)
+          .awaitApproval(input, clients.rpc.opts({ idempotencyKey: restateKey }));
+        if (!signal) {
+          return await callPromise;
+        }
+        if (signal.aborted) {
+          throw new Error("Approval request aborted.");
+        }
+        return await new Promise<AwaitApprovalOutcome>((resolve, reject) => {
+          const onAbort = () => reject(new Error("Approval request aborted."));
+          signal.addEventListener("abort", onAbort, { once: true });
+          callPromise.then(
+            (value) => {
+              signal.removeEventListener("abort", onAbort);
+              resolve(value);
+            },
+            (error) => {
+              signal.removeEventListener("abort", onAbort);
+              reject(error);
+            },
+          );
+        });
       } catch (error) {
         throw mapRestateIngressError(error, instance);
       }

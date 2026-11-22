@@ -31,20 +31,20 @@ export const WASMER_RUNNER_CONTRACT: WasmerRunnerContract = {
   guests: {
     bash: {
       guest: "bash",
-      packageRef: "sharrattj/bash@1.0.25",
+      packageRef: "wasmer/bash@1.0.25",
       version: "1.0.25",
-      digest: "sha256:4a6c2f7b1d8e9a0c3f5b7e2d1a9c4b8e6f0a2d4c8e1b3a5f7d9c2e4a6b8d0f12",
+      digest: "sha256:059606d132e2e6bc1afe3b432ee64dcb1b1b059815c8bb213cf3b24798ef21e1",
       commandName: "bash",
       artifactPath: "/guests/bash-1.0.25.webc",
       abi: "wasix",
     },
     python: {
       guest: "python",
-      packageRef: "wasmer/python@3.12.2",
-      version: "3.12.2",
-      digest: "sha256:9f3e1c5a7b9d2e4f6a8c0b2d4e6f8a1c3e5b7d9f1a3c5e7b9d1f3a5c7e9b1d34",
+      packageRef: "python/python@3.13.20",
+      version: "3.13.20",
+      digest: "sha256:a9fa8202f1bf6a4eca8d31ee5f2b1970c8f45af5c5520cc954d28a133333d8e7",
       commandName: "python",
-      artifactPath: "/guests/python-3.12.2.webc",
+      artifactPath: "/guests/python-3.13.20.webc",
       abi: "wasix",
     },
   },
@@ -185,7 +185,7 @@ export function validateWasmerDirectoryGrants(
     const hostPath = validateHostGrantPath(rawPath, policy.allowedHostRoots);
     grants.push({
       hostPath,
-      guestPath: `/mnt/ro-${i}`,
+      guestPath: `/workspace/mnt/ro-${i}`,
       access: "readonly",
     });
   }
@@ -198,7 +198,7 @@ export function validateWasmerDirectoryGrants(
     const hostPath = validateHostGrantPath(rawPath, policy.allowedHostRoots);
     grants.push({
       hostPath,
-      guestPath: `/mnt/rw-${i}`,
+      guestPath: `/workspace/mnt/rw-${i}`,
       access: "readwrite",
     });
   }

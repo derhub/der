@@ -275,4 +275,36 @@ describe("resume SSE stream with deduplication and terminal 204", () => {
     expect(yielded).toEqual(["RUN_STARTED", "CUSTOM", "RUN_FINISHED"]);
     expect(approvalEvents).toEqual(["approval.requested"]);
   });
+
+  it("does not advance the committed cursor when an SSE frame omits id", async () => {
+    const cursors: number[] = [];
+    const fakeFetch: typeof fetch = async () =>
+      sseResponse([
+        formatSseEvent({
+          id: 2,
+          data: { type: "TEXT_MESSAGE_CONTENT", messageId: "m-1", delta: "ok" },
+        }),
+        formatSseEvent({
+          data: {
+            type: "RUN_ERROR",
+            runId: "run-idless",
+            code: "sse.stream_error",
+            message: "boom",
+          },
+        }),
+      ]);
+
+    const sequences: number[] = [];
+    for await (const item of streamRunEvents({
+      runId: "run-idless",
+      fetcher: fakeFetch,
+      wait: async () => {},
+      onCursorAdvance: (seq) => cursors.push(seq),
+    })) {
+      sequences.push(item.sequence);
+    }
+
+    expect(cursors).toEqual([2]);
+    expect(sequences).toEqual([2, 2]);
+  });
 });

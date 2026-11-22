@@ -36,9 +36,23 @@ const nonRootDockerUser = z
 const egressNetworkName = z
   .string()
   .min(1)
-  .refine((value) => value !== "host" && value !== "bridge", {
-    message: 'Docker egress network cannot be "host" or "bridge".',
-  });
+  .refine(
+    (value) => {
+      const lower = value.trim().toLowerCase();
+      return (
+        lower !== "host" &&
+        lower !== "bridge" &&
+        lower !== "default" &&
+        lower !== "none" &&
+        !lower.startsWith("container:") &&
+        /^[a-zA-Z0-9][a-zA-Z0-9_.-]*$/.test(value.trim())
+      );
+    },
+    {
+      message:
+        'Docker egress network must be a dedicated isolated network, never "default", "host", "bridge", "none", or "container:*".',
+    },
+  );
 
 const mcpTransportSchema = z.discriminatedUnion("kind", [
   z.object({
@@ -153,6 +167,7 @@ const serverConfigSchema = z.object({
     claudeCode: "claude-sonnet-4-5",
     antigravity: "default",
   }),
+  wasmerRunnerImage: z.string().min(1).default("der-wasmer-runner:latest"),
   wasmerAllowedRoots: z.array(z.string().min(1)).default([]),
   wasmerMaxTimeoutMs: z.number().int().positive().default(30_000),
   mcpServers: z.array(mcpServerConfigSchema).default([]),
@@ -445,6 +460,9 @@ export function parseServerConfig(
       ? {
           engineModels: engineModelsSchema.parse(engineModelsFromEnv),
         }
+      : {}),
+    ...(env["DER_WASMER_RUNNER_IMAGE"]
+      ? { wasmerRunnerImage: env["DER_WASMER_RUNNER_IMAGE"].trim() }
       : {}),
     ...(wasmerAllowedRoots !== undefined ? { wasmerAllowedRoots } : {}),
     ...(wasmerMaxTimeoutMs !== undefined ? { wasmerMaxTimeoutMs } : {}),

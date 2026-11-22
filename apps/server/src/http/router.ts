@@ -565,8 +565,7 @@ export function createHttpHandler(deps: HttpRouterDeps): (request: Request) => P
           });
         }
 
-        const decidedAt =
-          parsedBody.data.decidedAt ?? formatUtcTimestamp(deps.store.database.now());
+        const decidedAt = formatUtcTimestamp(deps.store.database.now());
         const approval = await deps.workflow.decide(
           {
             approvalId,

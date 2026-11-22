@@ -18,6 +18,8 @@ import {
   persistPendingApprovalStep,
   reconcileApprovalExpiryStep,
   type ApprovalDecisionPayload,
+  type AwaitApprovalInput,
+  type AwaitApprovalOutcome,
   type DurableWorkflow,
   type WorkflowDeps,
 } from "./run-steps";
@@ -138,6 +140,86 @@ export function createDirectWorkflow(deps: WorkflowDeps): DurableWorkflow & {
         });
       }
       return settled;
+    },
+
+    async awaitApproval(
+      input: AwaitApprovalInput,
+      signal?: AbortSignal,
+    ): Promise<AwaitApprovalOutcome> {
+      if (signal?.aborted) {
+        throw new Error("Approval request aborted.");
+      }
+
+      const awakeableId = `direct_awk_${crypto.randomUUID()}`;
+      const deadlineMs = deps.store.database.now().getTime() + deps.approvalTimeoutMs;
+      const deadline = formatUtcTimestamp(new Date(deadlineMs));
+
+      const { approvalId, deadline: persistedDeadline } = await persistPendingApprovalStep(deps, {
+        run: input.run,
+        effect: input.effect,
+        prompt: input.prompt,
+        awakeable: awakeableId,
+        deadline,
+      });
+
+      const existing = deps.store.getApproval(approvalId);
+      if (existing && existing.decision.status !== "pending") {
+        return {
+          status: existing.decision.status,
+          approvalId,
+          effect: input.effect,
+        };
+      }
+
+      const targetAwakeable = existing?.awakeable ?? awakeableId;
+      const decisionStatus = await new Promise<"approved" | "denied" | "expired">(
+        (resolveWait, rejectWait) => {
+          const remainingMs = Math.max(
+            1,
+            Date.parse(persistedDeadline) - deps.store.database.now().getTime(),
+          );
+          const cleanupAbort = () => {
+            signal?.removeEventListener("abort", onAbort);
+          };
+          const timer = setTimeout(() => {
+            awakeables.delete(targetAwakeable);
+            cleanupAbort();
+            void reconcileApprovalExpiryStep(deps, {
+              run: input.run,
+              approvalId,
+              deadline: persistedDeadline,
+            })
+              .then(resolveWait)
+              .catch(() => resolveWait("expired"));
+          }, remainingMs);
+
+          const onAbort = () => {
+            clearTimeout(timer);
+            awakeables.delete(targetAwakeable);
+            rejectWait(new Error("Approval request aborted."));
+          };
+
+          if (signal) {
+            signal.addEventListener("abort", onAbort, { once: true });
+          }
+
+          awakeables.set(targetAwakeable, {
+            timer,
+            resolve: (payload) => {
+              clearTimeout(timer);
+              awakeables.delete(targetAwakeable);
+              cleanupAbort();
+              resolveWait(payload.status);
+            },
+          });
+        },
+      );
+
+      return {
+        status: decisionStatus,
+        approvalId,
+        effect: input.effect,
+      };
     },
 
     close(): void {

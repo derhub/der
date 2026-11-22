@@ -31,6 +31,7 @@ import type {
   ToolResult,
   Tools,
 } from "@der/domain";
+import type { AnyTool } from "@tanstack/ai";
 import { compiledParsers } from "@der/domain/compiled";
 import {
   createHomeAssistantTools,
@@ -48,6 +49,9 @@ import {
   createCodexEngine,
   DEFAULT_TERMS_COVERAGE,
   diagnoseEngine,
+  digestJson,
+  normalizeToJsonValue,
+  type ApprovalBroker,
   type EngineAuthProbeResult,
   type LoadEngineRunInput,
 } from "@der/runtime/engines";
@@ -55,8 +59,8 @@ import {
   APPROVED_VENDOR_EGRESS,
   bunCommandRunner,
   createDockerSandbox,
+  createDockerWasmerSandbox,
   createHardenedDockerProvider,
-  createWasmerSandbox,
   DEFAULT_ENGINE_SHADOW_HOMES,
   DOCKER_TOOL_DESCRIPTOR,
   WASMER_TOOL_DESCRIPTOR,
@@ -181,6 +185,7 @@ export interface CreateServerOptions {
   readonly tools?: Tools;
   readonly skills?: SkillCatalog;
   readonly commandRunner?: CommandRunner;
+  readonly probeEngineAuth?: (engine: OfficialEngineKind) => Promise<EngineAuthProbeResult>;
   readonly extraRestateServices?: readonly AnyRestateService[];
   readonly extraHttpHandler?: ExtraHttpHandler;
   readonly reconcileEffect?: (effect: EffectIdentity) => Promise<ToolResult | undefined>;
@@ -308,12 +313,40 @@ function createSandboxToolsAdapter(input: {
   };
 }
 
+const SHADOW_HOME_AUTH_MARKERS: Readonly<Record<OfficialEngineKind, readonly string[]>> = {
+  codex: ["/home/engine/.codex/auth.json", "/home/engine/.codex/credentials.json"],
+  "claude-code": [
+    "/home/engine/.claude/.credentials.json",
+    "/home/engine/.claude/credentials.json",
+    "/home/engine/.claude.json",
+  ],
+  antigravity: [
+    "/home/engine/.antigravity/auth.json",
+    "/home/engine/.gemini/oauth_creds.json",
+    "/home/engine/.config/antigravity/auth.json",
+    "/home/engine/.local/share/antigravity/auth.json",
+  ],
+} as const;
+
+function engineImageFor(engine: OfficialEngineKind, config: ServerConfig): string {
+  if (engine === "codex") {
+    return config.engineImages.codex;
+  }
+  if (engine === "claude-code") {
+    return config.engineImages.claudeCode;
+  }
+  return config.engineImages.antigravity;
+}
+
 function createShadowHomeAuthProbe(
   engine: OfficialEngineKind,
   config: ServerConfig,
   runner: CommandRunner,
 ): () => Promise<EngineAuthProbeResult> {
   const shadowHome = DEFAULT_ENGINE_SHADOW_HOMES[engine];
+  const markers = SHADOW_HOME_AUTH_MARKERS[engine];
+  const probeImage = engineImageFor(engine, config);
+
   return async () => {
     if (config.dockerHost.length === 0) {
       return {
@@ -337,9 +370,40 @@ function createShadowHomeAuthProbe(
           detail: `Shadow-home volume "${shadowHome.volumeName}" is not provisioned on the dedicated rootless daemon.`,
         };
       }
+
+      const checkCommand = markers.map((marker) => `test -s '${marker}'`).join(" || ");
+      const probe = await runner.exec(
+        config.dockerBinary,
+        [
+          "run",
+          "--rm",
+          "--network=none",
+          "--read-only",
+          "--cap-drop=ALL",
+          "--security-opt=no-new-privileges:true",
+          "--user",
+          config.dockerUser,
+          "--mount",
+          `type=volume,source=${shadowHome.volumeName},target=${shadowHome.containerHomePath},readonly`,
+          probeImage,
+          "sh",
+          "-lc",
+          checkCommand,
+        ],
+        {
+          env: { DOCKER_HOST: config.dockerHost },
+          timeoutMs: 5_000,
+        },
+      );
+      if (probe.exitCode === 0) {
+        return {
+          authenticated: true,
+          detail: `Shadow-home volume "${shadowHome.volumeName}" contains verified auth artifacts.`,
+        };
+      }
       return {
         authenticated: false,
-        detail: `Shadow-home volume "${shadowHome.volumeName}" exists, but interactive login verification has not been completed.`,
+        detail: `Shadow-home volume "${shadowHome.volumeName}" exists, but no interactive login credentials were found.`,
       };
     } catch (error) {
       return {
@@ -350,10 +414,62 @@ function createShadowHomeAuthProbe(
   };
 }
 
+async function buildEngineHostTools(
+  run: Run,
+  tools: Tools,
+  approvalBroker: ApprovalBroker,
+): Promise<Array<AnyTool>> {
+  const descriptors = tools.list ? await tools.list() : [];
+  let toolCallSeq = 0;
+
+  return descriptors.map((descriptor): AnyTool => ({
+    name: descriptor.id,
+    description: descriptor.description,
+    inputSchema: descriptor.inputSchema as AnyTool["inputSchema"],
+    metadata: { requiresApproval: descriptor.requiresApproval },
+    execute: async (rawArgs: unknown, ctx?: { readonly signal?: AbortSignal }) => {
+      toolCallSeq += 1;
+      const canonicalArguments = normalizeToJsonValue(rawArgs ?? {});
+      const fingerprint = await digestJson({
+        operationId: descriptor.id,
+        canonicalArguments,
+        toolCallSeq,
+      });
+      const effect: EffectIdentity = {
+        runId: run.id,
+        operationKind: descriptor.kind,
+        operationId: descriptor.id,
+        canonicalArguments,
+        attemptId: `${run.id}:tool:${toolCallSeq}:${fingerprint}`,
+      };
+
+      if (descriptor.requiresApproval) {
+        const decision = await approvalBroker.requestApproval({
+          effect,
+          prompt: `Approve host tool ${descriptor.id}?`,
+          signal: ctx?.signal ?? new AbortController().signal,
+        });
+        if (decision.status !== "approved") {
+          return deniedToolResult(
+            "tool.approval_required",
+            decision.status === "expired"
+              ? `Approval expired for host tool "${descriptor.id}".`
+              : `Operator denied host tool "${descriptor.id}".`,
+          );
+        }
+      }
+
+      return tools.invoke({ effect });
+    },
+  }));
+}
+
 function createContextLoader(input: {
   readonly store: SqliteStore;
   readonly memory: SqliteMemory;
   readonly skills: SkillCatalog;
+  readonly getTools: () => Tools;
+  readonly getWorkflow: () => DurableWorkflow;
   readonly maxTokens: number;
 }): LoadEngineRunInput {
   return async (run: Run) => {
@@ -375,9 +491,35 @@ function createContextLoader(input: {
       },
     });
 
+    const approvalBroker: ApprovalBroker = {
+      async requestApproval(req) {
+        const wf = input.getWorkflow();
+        if (!wf.awaitApproval) {
+          return {
+            status: "denied",
+            approvalId: `appr_unavailable_${crypto.randomUUID().slice(0, 8)}`,
+            effect: req.effect,
+            reason: "Durable approval broker is unavailable on this workflow.",
+          };
+        }
+        return wf.awaitApproval(
+          {
+            run,
+            effect: req.effect,
+            prompt: req.prompt,
+          },
+          req.signal,
+        );
+      },
+    };
+
+    const hostTools = await buildEngineHostTools(run, input.getTools(), approvalBroker);
+
     return {
       messages: [...built.messages],
       systemPrompts: [...built.systemPrompts],
+      tools: hostTools,
+      approvalBroker,
     };
   };
 }
@@ -388,6 +530,7 @@ function buildOfficialEngine(input: {
   readonly workspaceHostPath: string;
   readonly loadRunInput: LoadEngineRunInput;
   readonly runner: CommandRunner;
+  readonly probeEngineAuth?: (engine: OfficialEngineKind) => Promise<EngineAuthProbeResult>;
 }): Engine {
   const shadowHome = DEFAULT_ENGINE_SHADOW_HOMES[input.kind];
   const network: DockerNetworkPolicy =
@@ -399,12 +542,7 @@ function buildOfficialEngine(input: {
         }
       : { mode: "none" };
 
-  const image =
-    input.kind === "codex"
-      ? input.config.engineImages.codex
-      : input.kind === "claude-code"
-        ? input.config.engineImages.claudeCode
-        : input.config.engineImages.antigravity;
+  const image = engineImageFor(input.kind, input.config);
 
   const sandboxProvider = createHardenedDockerProvider({
     dockerHost: input.config.dockerHost,
@@ -413,6 +551,7 @@ function buildOfficialEngine(input: {
     engine: input.kind,
     user: input.config.dockerUser,
     workspaceHostPath: input.workspaceHostPath,
+    allowedWorkspaceRoots: [input.workspaceHostPath],
     shadowHome,
     network,
     limits: {
@@ -423,6 +562,10 @@ function buildOfficialEngine(input: {
     runner: input.runner,
   });
 
+  const probeAuth = input.probeEngineAuth
+    ? () => input.probeEngineAuth!(input.kind)
+    : createShadowHomeAuthProbe(input.kind, input.config, input.runner);
+
   const diagnose = () =>
     diagnoseEngine({
       engine: input.kind,
@@ -430,7 +573,7 @@ function buildOfficialEngine(input: {
       dockerBinary: input.config.dockerBinary,
       terms: DEFAULT_TERMS_COVERAGE[input.kind],
       runner: input.runner,
-      probeAuth: createShadowHomeAuthProbe(input.kind, input.config, input.runner),
+      probeAuth,
     });
 
   if (input.kind === "codex") {
@@ -448,6 +591,7 @@ function buildOfficialEngine(input: {
         typeof createClaudeCodeEngine
       >[0]["model"],
       sandboxProvider,
+      callbackContinuity: "verified",
       diagnose,
       loadRunInput: input.loadRunInput,
     });
@@ -456,6 +600,7 @@ function buildOfficialEngine(input: {
   return createAntigravityEngine({
     model: input.config.engineModels.antigravity,
     sandboxProvider,
+    callbackContinuity: "verified",
     diagnose,
     loadRunInput: input.loadRunInput,
   });
@@ -529,10 +674,14 @@ export function startServer(options: CreateServerOptions = {}): RunningServer {
 
   const seededFixture = config.seedFixture ? seedFixtureRecords(store) : undefined;
   const runner = options.commandRunner ?? bunCommandRunner;
+  let tools!: Tools;
+  let workflow!: DurableWorkflow;
   const loadRunInput = createContextLoader({
     store,
     memory,
     skills,
+    getTools: () => tools,
+    getWorkflow: () => workflow,
     maxTokens: config.contextMaxTokens,
   });
 
@@ -554,6 +703,9 @@ export function startServer(options: CreateServerOptions = {}): RunningServer {
             workspaceHostPath,
             loadRunInput,
             runner,
+            ...(options.probeEngineAuth !== undefined
+              ? { probeEngineAuth: options.probeEngineAuth }
+              : {}),
           }),
         );
       }
@@ -563,7 +715,6 @@ export function startServer(options: CreateServerOptions = {}): RunningServer {
   }
 
   let mcpHandle: McpToolsHandle | undefined;
-  let tools: Tools;
   if (options.tools !== undefined) {
     tools = options.tools;
   } else {
@@ -581,6 +732,7 @@ export function startServer(options: CreateServerOptions = {}): RunningServer {
       engine: "codex",
       user: config.dockerUser,
       workspaceHostPath,
+      allowedWorkspaceRoots: [workspaceHostPath],
       shadowHome: DEFAULT_ENGINE_SHADOW_HOMES.codex,
       ...(config.dockerEgressNetwork !== undefined
         ? {
@@ -608,9 +760,19 @@ export function startServer(options: CreateServerOptions = {}): RunningServer {
 
     const wasmerRoots =
       config.wasmerAllowedRoots.length > 0 ? config.wasmerAllowedRoots : [workspaceHostPath];
-    const wasmerSandbox = createWasmerSandbox({
+    const wasmerSandbox = createDockerWasmerSandbox({
+      dockerHost: config.dockerHost,
+      dockerBinary: config.dockerBinary,
+      image: config.wasmerRunnerImage,
+      user: config.dockerUser,
+      limits: {
+        cpus: config.dockerCpus,
+        memoryMb: config.dockerMemoryMb,
+        pidsLimit: config.dockerPidsLimit,
+      },
       allowedHostRoots: wasmerRoots,
       maxTimeoutMs: config.wasmerMaxTimeoutMs,
+      runner,
     });
     providers.push(
       createSandboxToolsAdapter({
@@ -656,7 +818,6 @@ export function startServer(options: CreateServerOptions = {}): RunningServer {
   };
 
   let closeDirectWorkflow: (() => void) | undefined;
-  let workflow: DurableWorkflow;
   let routineSchedule: RoutineScheduleClient;
   if (config.restateMode === "direct") {
     const direct = createDirectWorkflow(workflowDeps);

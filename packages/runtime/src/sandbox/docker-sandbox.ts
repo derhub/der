@@ -18,6 +18,7 @@ import {
 } from "@tanstack/ai-sandbox";
 import {
   buildDockerRunArgs,
+  probeDockerEgressNetwork,
   probeDockerIsolation,
   type DockerContainerSpec,
   type DockerMountSpec,
@@ -54,6 +55,7 @@ export interface HardenedDockerProviderConfig {
   readonly engine: OfficialEngineKind;
   readonly user: string;
   readonly workspaceHostPath: string;
+  readonly allowedWorkspaceRoots?: readonly string[];
   readonly workspaceContainerPath?: string;
   readonly shadowHome: EngineShadowHomeSpec;
   readonly network: DockerNetworkPolicy;
@@ -318,6 +320,21 @@ export function createHardenedDockerProvider(
             `Hardened Docker isolation check failed: ${probe.reasons.join("; ")}`,
           );
         }
+        if (config.network.mode === "scoped_egress") {
+          const egressProbe = await probeDockerEgressNetwork({
+            dockerHost: config.dockerHost,
+            networkName: config.network.networkName,
+            dockerBinary,
+            runner,
+            ...(input.signal !== undefined ? { signal: input.signal } : {}),
+          });
+          if (!egressProbe.verified) {
+            throw new SandboxControlError(
+              "docker.egress_network_unverified",
+              `Hardened Docker egress network check failed: ${egressProbe.reasons.join("; ")}`,
+            );
+          }
+        }
       }
 
       const containerName = `der-${config.engine}-${sanitizeContainerSegment(
@@ -337,6 +354,7 @@ export function createHardenedDockerProvider(
           target: workspaceRoot,
           readonly: false,
         },
+        allowedWorkspaceRoots: config.allowedWorkspaceRoots ?? [config.workspaceHostPath],
         shadowHome: config.shadowHome,
         network: config.network,
         limits: config.limits,
@@ -417,6 +435,7 @@ export interface DockerSandboxConfig {
   readonly engine: OfficialEngineKind;
   readonly user: string;
   readonly workspaceHostPath: string;
+  readonly allowedWorkspaceRoots?: readonly string[];
   readonly shadowHome: EngineShadowHomeSpec;
   readonly egressNetwork?: {
     readonly networkName: string;
@@ -491,6 +510,7 @@ export function createDockerSandbox(config: DockerSandboxConfig): Sandbox {
             target: request.cwd ?? "/workspace",
             readonly: false,
           },
+          allowedWorkspaceRoots: config.allowedWorkspaceRoots ?? [config.workspaceHostPath],
           shadowHome: config.shadowHome,
           network,
           limits: config.limits,
@@ -504,6 +524,21 @@ export function createDockerSandbox(config: DockerSandboxConfig): Sandbox {
           command: [request.command, ...request.args],
         },
       );
+
+      if (network.mode === "scoped_egress") {
+        const egressProbe = await probeDockerEgressNetwork({
+          dockerHost: config.dockerHost,
+          networkName: network.networkName,
+          dockerBinary,
+          runner,
+        });
+        if (!egressProbe.verified) {
+          throw new SandboxControlError(
+            "docker.egress_network_unverified",
+            `Hardened Docker egress network check failed: ${egressProbe.reasons.join("; ")}`,
+          );
+        }
+      }
 
       const startedAt = now();
       const result = await runner.exec(dockerBinary, args, {

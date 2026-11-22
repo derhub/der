@@ -117,6 +117,7 @@ describe("MCP tools adapter with typed descriptors, exact-operation approval, an
           id: "notes",
           transport: { kind: "custom", createTransport: () => fixture.clientTransport },
           allowedTools: ["search_notes", "append_note"],
+          readOnlyTools: ["search_notes"],
           redactedSecrets: ["secret-mcp-token-999"],
         },
       ],
@@ -220,5 +221,77 @@ describe("MCP tools adapter with typed descriptors, exact-operation approval, an
     expect(caught).toBeInstanceOf(ToolEffectUncertainError);
     expect((caught as ToolEffectUncertainError).code).toBe("effect.outcome_uncertain");
     expect((caught as ToolEffectUncertainError).message).not.toContain("secret-mcp-token-999");
+  });
+
+  it("requires exact-operation approval for remote readOnlyHint tools unless operator-allowlisted in readOnlyTools", async () => {
+    const fixture = await startFixtureMcpServer();
+    const approvedReadEffect: EffectIdentity = {
+      runId: "run-3",
+      operationKind: "mcp",
+      operationId: "notes.search_notes",
+      canonicalArguments: { query: "approved" },
+      attemptId: "attempt-read-1",
+    };
+
+    const mcp = createMcpTools({
+      servers: [
+        {
+          id: "notes",
+          transport: { kind: "custom", createTransport: () => fixture.clientTransport },
+          allowedTools: ["search_notes"],
+        },
+      ],
+      verifyApproval: createExactApprovalVerifier([approvedReadEffect]),
+    });
+    closers.push(() => mcp.close());
+
+    const descriptors = await mcp.list();
+    expect(descriptors).toHaveLength(1);
+    expect(descriptors[0]?.id).toBe("notes.search_notes");
+    expect(descriptors[0]?.requiresApproval).toBe(true);
+
+    const denied = await mcp.invoke(
+      makeOperation({
+        runId: "run-3",
+        operationId: "notes.search_notes",
+        canonicalArguments: { query: "unapproved" },
+        attemptId: "attempt-read-unapproved",
+      }),
+    );
+    expect(denied.ok).toBe(false);
+    expect(denied.outcome).toEqual({
+      denied: true,
+      code: "tool.approval_required",
+    });
+
+    const allowed = await mcp.invoke({ effect: approvedReadEffect });
+    expect(allowed.ok).toBe(true);
+    expect(allowed.outcome).toEqual({ matches: ["note:approved"] });
+
+    const fixtureNoVerifier = await startFixtureMcpServer();
+    const mcpWithoutVerifier = createMcpTools({
+      servers: [
+        {
+          id: "notes",
+          transport: { kind: "custom", createTransport: () => fixtureNoVerifier.clientTransport },
+          allowedTools: ["search_notes"],
+        },
+      ],
+    });
+    closers.push(() => mcpWithoutVerifier.close());
+
+    const closedResult = await mcpWithoutVerifier.invoke(
+      makeOperation({
+        runId: "run-4",
+        operationId: "notes.search_notes",
+        canonicalArguments: { query: "no-verifier" },
+        attemptId: "attempt-read-2",
+      }),
+    );
+    expect(closedResult.ok).toBe(false);
+    expect(closedResult.outcome).toEqual({
+      denied: true,
+      code: "tool.approval_required",
+    });
   });
 });

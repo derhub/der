@@ -1,3 +1,4 @@
+import { posix } from "node:path";
 import type { EngineKind } from "@der/domain";
 import { SandboxControlError } from "./errors";
 import { bunCommandRunner, type CommandRunner } from "./process-runner";
@@ -88,6 +89,7 @@ export interface DockerContainerSpec {
   readonly engine: OfficialEngineKind;
   readonly user: string;
   readonly workspaceMount: DockerWorkspaceMount;
+  readonly allowedWorkspaceRoots?: readonly string[];
   readonly shadowHome: EngineShadowHomeSpec;
   readonly network: DockerNetworkPolicy;
   readonly limits: DockerResourceLimits;
@@ -114,6 +116,23 @@ export interface DockerIsolationReport {
 export interface ProbeDockerIsolationOptions {
   readonly dockerHost: string;
   readonly dockerBinary?: string;
+  readonly egressNetworkName?: string;
+  readonly runner?: CommandRunner;
+  readonly signal?: AbortSignal;
+}
+
+export interface DockerEgressNetworkReport {
+  readonly verified: boolean;
+  readonly networkName: string;
+  readonly driver: string | null;
+  readonly internal: boolean;
+  readonly reasons: readonly string[];
+}
+
+export interface ProbeDockerEgressNetworkOptions {
+  readonly dockerHost: string;
+  readonly networkName: string;
+  readonly dockerBinary?: string;
   readonly runner?: CommandRunner;
   readonly signal?: AbortSignal;
 }
@@ -125,12 +144,15 @@ const FORBIDDEN_HOST_HOME_PATTERNS = [
   /^\/Users\/[^/]+(?:\/|$)/,
   /(?:^|\/)\.(?:codex|claude|gemini|ssh|aws|gnupg|docker)(?:\/|$)/,
 ];
+const FORBIDDEN_NETWORK_NAMES = new Set(["host", "bridge", "default", "none"]);
+const VALID_DOCKER_NETWORK_NAME = /^[a-zA-Z0-9][a-zA-Z0-9_.-]*$/;
 
 function extractUnixSocketPath(dockerHost: string): string | null {
   if (!dockerHost.startsWith("unix://")) {
     return null;
   }
-  return dockerHost.slice("unix://".length);
+  const raw = dockerHost.slice("unix://".length).trim();
+  return raw.length > 0 ? posix.resolve(raw) : null;
 }
 
 function isRootUserSpec(user: string): boolean {
@@ -145,45 +167,141 @@ function isRootUserSpec(user: string): boolean {
   return uidPart === "root" || uidPart === "0";
 }
 
-function assertMountSafe(
-  mount: { readonly source: string; readonly target: string; readonly type: "bind" | "volume" },
-  daemonSocketPath: string | null,
-): void {
-  const source = mount.source.trim();
-  const target = mount.target.trim();
-  if (source.length === 0 || target.length === 0 || !target.startsWith("/")) {
+function normalizeCleanAbsolutePath(rawPath: string, label: string): string {
+  const trimmed = rawPath.trim();
+  if (trimmed.length === 0 || !trimmed.startsWith("/") || trimmed.includes("\0")) {
     throw new SandboxControlError(
       "docker.invalid_workspace_mount",
-      `Docker mount source "${source}" and target "${target}" must be non-empty with an absolute container target.`,
+      `${label} "${rawPath}" must be a clean absolute path.`,
     );
   }
+  const segments = trimmed.split("/");
+  if (segments.includes("..") || segments.includes(".")) {
+    throw new SandboxControlError(
+      "docker.invalid_workspace_mount",
+      `${label} "${rawPath}" cannot contain relative path segments.`,
+    );
+  }
+  return posix.resolve(trimmed);
+}
 
-  const normalizedSource = source.toLowerCase();
+function isWithinAllowedRoots(normalizedPath: string, allowedRoots: readonly string[]): boolean {
+  return allowedRoots.some((root) => {
+    const normalizedRoot = root === "/" ? "/" : root.replace(/\/+$/, "");
+    if (normalizedRoot === "/") {
+      return normalizedPath.startsWith("/");
+    }
+    return normalizedPath === normalizedRoot || normalizedPath.startsWith(`${normalizedRoot}/`);
+  });
+}
+
+function assertNotForbiddenHostPath(
+  rawSource: string,
+  normalizedSource: string,
+  target: string,
+  daemonSocketPath: string | null,
+  isBind: boolean,
+): void {
+  const lowerRaw = rawSource.toLowerCase();
+  const lowerNorm = normalizedSource.toLowerCase();
+  const lowerTarget = target.toLowerCase();
+
   for (const marker of FORBIDDEN_SOCKET_MARKERS) {
-    if (normalizedSource.includes(marker) || target.toLowerCase().includes(marker)) {
+    if (lowerRaw.includes(marker) || lowerNorm.includes(marker) || lowerTarget.includes(marker)) {
       throw new SandboxControlError(
         "docker.socket_mount_forbidden",
-        `Mounting container daemon socket "${source}" into a guest container is forbidden.`,
+        `Mounting container daemon socket "${rawSource}" into a guest container is forbidden.`,
       );
     }
   }
-  if (daemonSocketPath !== null && source === daemonSocketPath) {
+  if (daemonSocketPath !== null && normalizedSource === daemonSocketPath) {
     throw new SandboxControlError(
       "docker.socket_mount_forbidden",
       `Mounting configured rootless daemon socket "${daemonSocketPath}" into a guest container is forbidden.`,
     );
   }
 
-  if (mount.type === "bind") {
+  if (isBind) {
     for (const pattern of FORBIDDEN_HOST_HOME_PATTERNS) {
-      if (pattern.test(source)) {
+      if (pattern.test(rawSource) || pattern.test(normalizedSource)) {
         throw new SandboxControlError(
           "docker.host_home_mount_forbidden",
-          `Binding host home or credential directory "${source}" into a guest container is forbidden.`,
+          `Binding host home or credential directory "${rawSource}" into a guest container is forbidden.`,
         );
       }
     }
   }
+}
+
+function validateAllowedWorkspaceRoots(
+  roots: readonly string[],
+  daemonSocketPath: string | null,
+): string[] {
+  if (roots.length === 0) {
+    throw new SandboxControlError(
+      "docker.invalid_workspace_mount",
+      "allowedWorkspaceRoots must contain at least one explicit absolute root path.",
+    );
+  }
+  return roots.map((root) => {
+    const normalized = normalizeCleanAbsolutePath(root, "Allowed workspace root");
+    assertNotForbiddenHostPath(root, normalized, "/workspace", daemonSocketPath, true);
+    return normalized;
+  });
+}
+
+function assertMountSafe(
+  mount: { readonly source: string; readonly target: string; readonly type: "bind" | "volume" },
+  daemonSocketPath: string | null,
+  allowedBindRoots?: readonly string[],
+): string {
+  const source = mount.source.trim();
+  const target = mount.target.trim();
+  if (
+    source.length === 0 ||
+    target.length === 0 ||
+    !target.startsWith("/") ||
+    target.includes("\0")
+  ) {
+    throw new SandboxControlError(
+      "docker.invalid_workspace_mount",
+      `Docker mount source "${source}" and target "${target}" must be non-empty with an absolute container target.`,
+    );
+  }
+
+  if (mount.type === "volume") {
+    assertNotForbiddenHostPath(source, source, target, daemonSocketPath, false);
+    return source;
+  }
+
+  const normalizedSource = normalizeCleanAbsolutePath(source, "Docker bind mount source");
+  assertNotForbiddenHostPath(source, normalizedSource, target, daemonSocketPath, true);
+
+  if (allowedBindRoots !== undefined && !isWithinAllowedRoots(normalizedSource, allowedBindRoots)) {
+    throw new SandboxControlError(
+      "docker.bind_path_outside_root",
+      `Host bind mount "${source}" resolves to "${normalizedSource}", which is outside allowed workspace roots.`,
+    );
+  }
+
+  return normalizedSource;
+}
+
+function validateEgressNetworkName(rawName: string): string {
+  const netName = rawName.trim();
+  const lower = netName.toLowerCase();
+  if (
+    netName.length === 0 ||
+    FORBIDDEN_NETWORK_NAMES.has(lower) ||
+    lower.startsWith("container:") ||
+    !VALID_DOCKER_NETWORK_NAME.test(netName)
+  ) {
+    throw new SandboxControlError(
+      "docker.host_network_forbidden",
+      `Scoped egress network "${rawName}" must be a dedicated isolated network, never default, host, bridge, none, or container-shared.`,
+    );
+  }
+  return netName;
 }
 
 export function validateDockerContainerSpec(spec: DockerContainerSpec): void {
@@ -226,12 +344,20 @@ export function validateDockerContainerSpec(spec: DockerContainerSpec): void {
     );
   }
 
+  const networkMode = (spec.network as { readonly mode?: unknown }).mode;
+  if (networkMode !== "none" && networkMode !== "scoped_egress") {
+    throw new SandboxControlError(
+      "docker.host_network_forbidden",
+      `Unsupported Docker network mode "${String(networkMode)}". Only "none" or "scoped_egress" is allowed.`,
+    );
+  }
+
   if (spec.network.mode === "scoped_egress") {
-    const netName = spec.network.networkName.trim();
-    if (netName.length === 0 || netName === "host" || netName === "bridge") {
+    validateEgressNetworkName(spec.network.networkName);
+    if (spec.network.allowedHosts.length === 0) {
       throw new SandboxControlError(
-        "docker.host_network_forbidden",
-        `Scoped egress network "${netName}" must be a dedicated isolated network, never host or default bridge.`,
+        "docker.egress_host_not_approved",
+        `Scoped egress for engine "${spec.engine}" must declare at least one approved vendor host.`,
       );
     }
     const approved = new Set(APPROVED_VENDOR_EGRESS[spec.engine]);
@@ -246,13 +372,19 @@ export function validateDockerContainerSpec(spec: DockerContainerSpec): void {
   }
 
   const daemonSocketPath = extractUnixSocketPath(spec.dockerHost);
-  assertMountSafe(
+  const explicitAllowedRoots =
+    spec.allowedWorkspaceRoots !== undefined
+      ? validateAllowedWorkspaceRoots(spec.allowedWorkspaceRoots, daemonSocketPath)
+      : undefined;
+
+  const normalizedWorkspaceSource = assertMountSafe(
     {
       type: "bind",
       source: spec.workspaceMount.source,
       target: spec.workspaceMount.target,
     },
     daemonSocketPath,
+    explicitAllowedRoots,
   );
   assertMountSafe(
     {
@@ -263,13 +395,15 @@ export function validateDockerContainerSpec(spec: DockerContainerSpec): void {
     daemonSocketPath,
   );
 
+  const effectiveBindRoots = explicitAllowedRoots ?? [normalizedWorkspaceSource];
   for (const extra of spec.extraMounts ?? []) {
-    assertMountSafe(extra, daemonSocketPath);
+    assertMountSafe(extra, daemonSocketPath, effectiveBindRoots);
   }
 }
 
 function formatMountArg(mount: DockerMountSpec): string {
-  const base = `type=${mount.type},source=${mount.source},target=${mount.target}`;
+  const source = mount.type === "bind" ? posix.resolve(mount.source.trim()) : mount.source.trim();
+  const base = `type=${mount.type},source=${source},target=${mount.target.trim()}`;
   return mount.readonly ? `${base},readonly` : base;
 }
 
@@ -299,7 +433,7 @@ export function buildDockerRunArgs(
   if (spec.network.mode === "none") {
     args.push("--network=none");
   } else {
-    args.push(`--network=${spec.network.networkName}`);
+    args.push(`--network=${spec.network.networkName.trim()}`);
   }
 
   args.push(`--cpus=${spec.limits.cpus}`);
@@ -356,6 +490,129 @@ interface DockerInfoPayload {
   readonly MemoryLimit?: unknown;
   readonly CpuCfsQuota?: unknown;
   readonly PidsLimit?: unknown;
+}
+
+interface DockerNetworkInspectPayload {
+  readonly Name?: unknown;
+  readonly Driver?: unknown;
+  readonly Internal?: unknown;
+  readonly Options?: unknown;
+}
+
+export async function probeDockerEgressNetwork(
+  options: ProbeDockerEgressNetworkOptions,
+): Promise<DockerEgressNetworkReport> {
+  const runner = options.runner ?? bunCommandRunner;
+  const dockerBinary = options.dockerBinary ?? "docker";
+  const netName = options.networkName.trim();
+  const reasons: string[] = [];
+
+  try {
+    validateEgressNetworkName(netName);
+  } catch (error) {
+    return {
+      verified: false,
+      networkName: netName,
+      driver: null,
+      internal: false,
+      reasons: [error instanceof Error ? error.message : String(error)],
+    };
+  }
+
+  if (options.dockerHost.trim().length === 0) {
+    return {
+      verified: false,
+      networkName: netName,
+      driver: null,
+      internal: false,
+      reasons: ["Dedicated rootless DOCKER_HOST is not configured."],
+    };
+  }
+
+  let execResult;
+  try {
+    execResult = await runner.exec(
+      dockerBinary,
+      ["network", "inspect", netName, "--format", "{{json .}}"],
+      {
+        env: { DOCKER_HOST: options.dockerHost },
+        ...(options.signal !== undefined ? { signal: options.signal } : {}),
+      },
+    );
+  } catch (error) {
+    return {
+      verified: false,
+      networkName: netName,
+      driver: null,
+      internal: false,
+      reasons: [
+        `Docker egress network probe failed for "${netName}": ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      ],
+    };
+  }
+
+  if (execResult.exitCode !== 0) {
+    return {
+      verified: false,
+      networkName: netName,
+      driver: null,
+      internal: false,
+      reasons: [
+        `Configured scoped egress network "${netName}" does not exist or cannot be inspected (exit ${execResult.exitCode}).`,
+      ],
+    };
+  }
+
+  let parsed: DockerNetworkInspectPayload;
+  try {
+    const raw: unknown = JSON.parse(execResult.stdout);
+    const candidate = Array.isArray(raw) ? raw[0] : raw;
+    if (candidate === null || typeof candidate !== "object") {
+      throw new Error("docker network inspect JSON payload was not an object");
+    }
+    parsed = candidate as DockerNetworkInspectPayload;
+  } catch {
+    return {
+      verified: false,
+      networkName: netName,
+      driver: null,
+      internal: false,
+      reasons: [`Docker daemon returned malformed JSON when inspecting network "${netName}".`],
+    };
+  }
+
+  const inspectedName = typeof parsed.Name === "string" ? parsed.Name.trim() : netName;
+  const driver = typeof parsed.Driver === "string" ? parsed.Driver.trim() : null;
+  const internal = parsed.Internal === true;
+  const networkOptions =
+    parsed.Options !== null && typeof parsed.Options === "object" && !Array.isArray(parsed.Options)
+      ? (parsed.Options as Record<string, unknown>)
+      : {};
+
+  if (FORBIDDEN_NETWORK_NAMES.has(inspectedName.toLowerCase())) {
+    reasons.push(`Egress network "${inspectedName}" cannot be a default or host network.`);
+  }
+  if (driver === null || driver === "host" || driver === "null") {
+    reasons.push(`Egress network "${netName}" uses disallowed driver "${String(driver)}".`);
+  }
+  if (networkOptions["com.docker.network.bridge.default_bridge"] === "true") {
+    reasons.push(`Egress network "${netName}" is the default Docker bridge and is not isolated.`);
+  }
+  if (!internal) {
+    reasons.push(
+      `Egress network "${netName}" must be configured as an internal isolated network (Internal=true).`,
+    );
+  }
+
+  return {
+    verified: reasons.length === 0,
+    networkName: inspectedName,
+    driver,
+    internal,
+    reasons,
+  };
 }
 
 export async function probeDockerIsolation(
@@ -439,6 +696,19 @@ export async function probeDockerIsolation(
   }
   if (parsed.PidsLimit !== true) {
     reasons.push("Docker daemon does not enforce cgroup PIDs limits.");
+  }
+
+  if (options.egressNetworkName !== undefined) {
+    const egressReport = await probeDockerEgressNetwork({
+      dockerHost: options.dockerHost,
+      networkName: options.egressNetworkName,
+      dockerBinary,
+      runner,
+      ...(options.signal !== undefined ? { signal: options.signal } : {}),
+    });
+    if (!egressReport.verified) {
+      reasons.push(...egressReport.reasons);
+    }
   }
 
   return {

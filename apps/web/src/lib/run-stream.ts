@@ -217,18 +217,19 @@ export async function* streamRunEvents(
             continue;
           }
 
-          const effectiveSeq = sequence ?? lastCommittedSequence + 1;
-          seenSequences.add(effectiveSeq);
-          if (effectiveSeq > lastCommittedSequence) {
-            lastCommittedSequence = effectiveSeq;
-            options.onCursorAdvance?.(effectiveSeq);
+          if (sequence !== undefined) {
+            seenSequences.add(sequence);
+            if (sequence > lastCommittedSequence) {
+              lastCommittedSequence = sequence;
+              options.onCursorAdvance?.(sequence);
+            }
           }
           madeProgress = true;
           consecutiveNoProgress = 0;
 
           const streamChunk = validatedChunk.data as unknown as StreamChunk;
           yield {
-            sequence: effectiveSeq,
+            sequence: sequence ?? lastCommittedSequence,
             chunk: streamChunk,
           };
 
