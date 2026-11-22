@@ -1,0 +1,15 @@
+# Optional Phase 2 Telegram overlay for der.
+# Enables long-polling intake and serialized outbox delivery on the singleton Bun server.
+# Supply DER_TELEGRAM_BOT_TOKEN and optional DER_TELEGRAM_BINDINGS_JSON at runtime via env or .env.
+# Never commit bot tokens or mount credentials into engine containers.
+
+services:
+  server:
+    environment:
+      DER_TELEGRAM_ENABLED: ${DER_TELEGRAM_ENABLED:-true}
+      DER_TELEGRAM_BOT_TOKEN: ${DER_TELEGRAM_BOT_TOKEN:-}
+      DER_TELEGRAM_API_BASE_URL: ${DER_TELEGRAM_API_BASE_URL:-https://api.telegram.org}
+      DER_TELEGRAM_CONSUMER: ${DER_TELEGRAM_CONSUMER:-telegram-default}
+      DER_TELEGRAM_POLL_TIMEOUT_SECONDS: ${DER_TELEGRAM_POLL_TIMEOUT_SECONDS:-25}
+      DER_TELEGRAM_OUTBOX_POLL_INTERVAL_MS: ${DER_TELEGRAM_OUTBOX_POLL_INTERVAL_MS:-500}
+      DER_TELEGRAM_BINDINGS_JSON: ${DER_TELEGRAM_BINDINGS_JSON:-[]}

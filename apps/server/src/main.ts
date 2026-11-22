@@ -7,6 +7,7 @@ import type {
   BotId,
   ChannelBinding,
   ChannelIntakeMetadata,
+  ChannelIntegration,
   EffectIdentity,
   Engine,
   EngineKind,
@@ -14,6 +15,7 @@ import type {
   MemoryRecord,
   MemoryWriteInput,
   Message,
+  Messaging,
   OutboxEvent,
   Routine,
   RoutineId,
@@ -62,7 +64,12 @@ import {
   type DockerNetworkPolicy,
   type OfficialEngineKind,
 } from "@der/runtime/sandbox";
-import { openSqliteStore, type SqliteStore, type StorageMigration } from "@der/storage";
+import {
+  openSqliteStore,
+  type SqliteStore,
+  type StorageMigration,
+  type UpsertChannelBindingInput,
+} from "@der/storage";
 import {
   createMemoryProjection,
   MEMORY_ROUTINE_SLOTS_MIGRATION,
@@ -70,8 +77,18 @@ import {
   type SqliteMemory,
 } from "@der/storage/memory";
 import { openSqliteRoutines, type SqliteRoutines } from "@der/storage/routines";
+import {
+  createTelegramMessaging,
+  redactTelegramSecret,
+  type TelegramMessaging,
+} from "@der/telegram";
 import { parseServerConfig, type ServerConfig } from "./config";
 import { createHttpHandler, type ExtraHttpHandler } from "./http/index";
+import {
+  createMessagingRuntime,
+  type ChannelCallbackAcknowledger,
+  type MessagingRuntime,
+} from "./messaging/index";
 import {
   createDirectRoutineScheduleClient,
   createDirectWorkflow,
@@ -151,6 +168,8 @@ export interface ServerCommands {
   listRoutines(botId?: BotId): Routine[];
   diagnoseEngines(): Promise<readonly EngineReadiness[]>;
   listOutboxEvents(filter?: Parameters<SqliteStore["listOutboxEvents"]>[0]): OutboxEvent[];
+  upsertChannelBinding(input: UpsertChannelBindingInput): ChannelBinding;
+  listChannelBindings(filter?: Parameters<SqliteStore["listChannelBindings"]>[0]): ChannelBinding[];
 }
 
 export interface CreateServerOptions {
@@ -165,6 +184,7 @@ export interface CreateServerOptions {
   readonly extraRestateServices?: readonly AnyRestateService[];
   readonly extraHttpHandler?: ExtraHttpHandler;
   readonly reconcileEffect?: (effect: EffectIdentity) => Promise<ToolResult | undefined>;
+  readonly telegramMessaging?: TelegramMessaging;
 }
 
 export interface RunningServer {
@@ -177,6 +197,7 @@ export interface RunningServer {
   readonly engines: ReadonlyMap<EngineKind, Engine>;
   readonly workflow: DurableWorkflow;
   readonly routineSchedule: RoutineScheduleClient;
+  readonly messaging?: MessagingRuntime;
   readonly commands: ServerCommands;
   readonly url: string;
   readonly restateUrl: string;
@@ -704,6 +725,79 @@ export function startServer(options: CreateServerOptions = {}): RunningServer {
     fetch: httpHandler,
   });
 
+  let telegramAbort: AbortController | undefined;
+  let messagingRuntime: MessagingRuntime | undefined;
+  const telegramConfig = config.telegram;
+
+  if (telegramConfig !== undefined || options.telegramMessaging !== undefined) {
+    if (telegramConfig !== undefined) {
+      for (const configuredBinding of telegramConfig.bindings) {
+        const targetSession = store.getSession(configuredBinding.sessionId);
+        if (targetSession === undefined || targetSession.botId !== configuredBinding.botId) {
+          console.warn(
+            `skipping Telegram binding for session "${configuredBinding.sessionId}" and bot "${configuredBinding.botId}": session not found in bot scope`,
+          );
+          continue;
+        }
+        store.upsertChannelBinding({
+          ...(configuredBinding.id !== undefined ? { id: configuredBinding.id } : {}),
+          integration: "telegram",
+          externalChatId: configuredBinding.externalChatId,
+          externalActorId: configuredBinding.externalActorId,
+          botId: configuredBinding.botId,
+          sessionId: configuredBinding.sessionId,
+          enabled: configuredBinding.enabled,
+        });
+      }
+    }
+
+    let telegramAdapter: TelegramMessaging | undefined;
+    if (options.telegramMessaging !== undefined) {
+      telegramAdapter = options.telegramMessaging;
+    } else if (telegramConfig !== undefined) {
+      telegramAbort = new AbortController();
+      telegramAdapter = createTelegramMessaging({
+        botToken: telegramConfig.botToken,
+        apiBaseUrl: telegramConfig.apiBaseUrl,
+        pollTimeoutSeconds: telegramConfig.pollTimeoutSeconds,
+        initialBackoffMs: telegramConfig.pollInitialBackoffMs,
+        maxBackoffMs: telegramConfig.pollMaxBackoffMs,
+        ...(options.now ? { now: options.now } : {}),
+        signal: telegramAbort.signal,
+      });
+    }
+
+    if (telegramAdapter !== undefined) {
+      const adapters = new Map<ChannelIntegration, Messaging & ChannelCallbackAcknowledger>([
+        ["telegram", telegramAdapter],
+      ]);
+
+      messagingRuntime = createMessagingRuntime({
+        store,
+        workflow,
+        adapters,
+        telegramConsumer: telegramConfig?.consumer ?? "telegram-default",
+        ...(telegramConfig !== undefined
+          ? {
+              pollRetryInitialBackoffMs: telegramConfig.pollInitialBackoffMs,
+              pollRetryMaxBackoffMs: telegramConfig.pollMaxBackoffMs,
+              outboxPollIntervalMs: telegramConfig.outboxPollIntervalMs,
+              outboxInitialBackoffMs: telegramConfig.outboxInitialBackoffMs,
+              outboxMaxBackoffMs: telegramConfig.outboxMaxBackoffMs,
+            }
+          : {}),
+        ...(options.now ? { now: options.now } : {}),
+        onError: (error) => {
+          const rawMessage = error instanceof Error ? error.message : String(error);
+          console.error(
+            `telegram messaging error: ${redactTelegramSecret(rawMessage, telegramConfig?.botToken)}`,
+          );
+        },
+      });
+      messagingRuntime.start();
+    }
+  }
+
   const commands: ServerCommands = {
     admitRun: (request) => workflow.admit(request),
     decideApproval: (decision, channelIntake) => workflow.decide(decision, channelIntake),
@@ -743,6 +837,8 @@ export function startServer(options: CreateServerOptions = {}): RunningServer {
       return results;
     },
     listOutboxEvents: (filter) => store.listOutboxEvents(filter),
+    upsertChannelBinding: (input) => store.upsertChannelBinding(input),
+    listChannelBindings: (filter) => store.listChannelBindings(filter),
   };
 
   return {
@@ -755,11 +851,14 @@ export function startServer(options: CreateServerOptions = {}): RunningServer {
     engines,
     workflow,
     routineSchedule,
+    ...(messagingRuntime ? { messaging: messagingRuntime } : {}),
     commands,
     url: `http://${config.host}:${httpServer.port}`,
     restateUrl: `http://${config.restateHost}:${restateServer.port}`,
     ...(seededFixture ? { seededFixture } : {}),
     async close() {
+      telegramAbort?.abort();
+      await messagingRuntime?.stop();
       closeDirectWorkflow?.();
       await mcpHandle?.close();
       await httpServer.stop(true);
