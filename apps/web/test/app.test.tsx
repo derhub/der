@@ -475,9 +475,9 @@ describe("operate der through the Web operator console", () => {
 
     const promptInput = screen.getByPlaceholderText("Send an instruction to Fixture Bot...");
     await user.type(promptInput, "lamp-1");
-    await user.click(screen.getByRole("button", { name: "Send prompt" }));
+    await user.click(screen.getByRole("button", { name: "Send" }));
 
-    const alert = await screen.findByRole("alert");
+    const alert = await screen.findByRole("alert", { name: "Restate ingress unavailable" });
     expect(within(alert).getByText("Restate ingress unavailable")).toBeTruthy();
     expect(within(alert).getByText("restate.unavailable")).toBeTruthy();
 
@@ -505,7 +505,9 @@ describe("operate der through the Web operator console", () => {
         actor: "operator",
       },
     });
-    expect(screen.getByRole("status").textContent).toContain("Recorded approved decision");
+    expect(screen.getByRole("status", { name: "Operator status" }).textContent).toContain(
+      "Recorded approved decision",
+    );
   });
 
   it("manages bot Memory, inspects Skills, toggles Routines, and shows engine Readiness diagnostics", async () => {
@@ -540,5 +542,97 @@ describe("operate der through the Web operator console", () => {
     await user.click(screen.getByRole("tab", { name: "Skills" }));
     await screen.findByText(/Read sensor state before mutating\./);
     expect(screen.getByText("broken/SKILL.md")).toBeTruthy();
+  });
+
+  it("renders tool call history in Astryx ChatToolCalls and creates sessions via Astryx Dialog", async () => {
+    const user = userEvent.setup();
+    const createdSessions: Array<Record<string, unknown>> = [];
+    const base = createFakeServerFetch();
+
+    const fetcher: typeof fetch = async (input, init) => {
+      const rawUrl =
+        typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
+      const url = new URL(rawUrl, "http://127.0.0.1:5173");
+      const method = init?.method ?? "GET";
+
+      if (method === "GET" && url.pathname === "/api/tools") {
+        return Response.json({ tools: [] });
+      }
+
+      if (method === "GET" && url.pathname === "/api/sessions/sess-fixture/messages") {
+        return Response.json({
+          messages: [
+            {
+              id: "msg-tool",
+              botId: "bot-fixture",
+              sessionId: "sess-fixture",
+              ordinal: 1,
+              role: "assistant",
+              parts: [
+                {
+                  type: "tool-call",
+                  toolCallId: "tc-1",
+                  toolName: "docker.execute",
+                  arguments: { cmd: "uname -a" },
+                },
+                {
+                  type: "tool-result",
+                  toolCallId: "tc-1",
+                  toolName: "docker.execute",
+                  outcome: { stdout: "Linux" },
+                  isError: false,
+                },
+                { type: "text", text: "Checked container kernel." },
+              ],
+              runId: "run-0",
+              createdAt: "2026-01-01T00:00:00.000Z",
+            },
+          ],
+        });
+      }
+
+      if (method === "POST" && url.pathname === "/api/bots/bot-fixture/sessions") {
+        const body = parseJsonRequestBody(init);
+        createdSessions.push(body);
+        return Response.json(
+          {
+            id: "sess-2",
+            botId: "bot-fixture",
+            title: String(body["title"] ?? "Untitled"),
+            engine: "fixture",
+            createdAt: "2026-01-01T00:05:00.000Z",
+            updatedAt: "2026-01-01T00:05:00.000Z",
+          },
+          { status: 201 },
+        );
+      }
+
+      if (method === "GET" && url.pathname === "/api/sessions/sess-2/messages") {
+        return Response.json({ messages: [] });
+      }
+
+      return base.fetcher(input, init);
+    };
+
+    render(<App fetcher={fetcher} />);
+
+    await screen.findByText("Checked container kernel.");
+    expect(screen.getByText("docker.execute")).toBeTruthy();
+
+    await user.click(screen.getByRole("button", { name: "New session" }));
+    const titleInput = await screen.findByLabelText(/^Title/);
+    await user.type(titleInput, "Nightly audit");
+    await user.click(screen.getByRole("button", { name: "Create session" }));
+
+    await waitFor(() => {
+      expect(createdSessions).toEqual([{ title: "Nightly audit" }]);
+    });
+    await screen.findByText("No messages in this session");
+
+    await user.click(screen.getByRole("tab", { name: "Readiness" }));
+    await screen.findByText("No host tools registered");
+    expect(
+      screen.getByText("Configure MCP servers, Docker, or Wasmer tools on the server."),
+    ).toBeTruthy();
   });
 });

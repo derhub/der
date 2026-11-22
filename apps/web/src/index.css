@@ -1,87 +1,19 @@
-@import "tailwindcss";
+@layer reset, theme, base, astryx-base, astryx-theme, components, utilities;
 
-:root {
-  --background: #f7f8fa;
-  --foreground: #111827;
-  --card: #ffffff;
-  --card-foreground: #111827;
-  --popover: #ffffff;
-  --popover-foreground: #111827;
-  --primary: #1d4ed8;
-  --primary-foreground: #ffffff;
-  --secondary: #e8edf5;
-  --secondary-foreground: #1e293b;
-  --muted: #eef1f6;
-  --muted-foreground: #4b5563;
-  --accent: #e0e7ff;
-  --accent-foreground: #1e3a8a;
-  --destructive: #b91c1c;
-  --destructive-foreground: #ffffff;
-  --border: #dce2ec;
-  --input: #cbd5e1;
-  --ring: #1d4ed8;
-  --sidebar: #f0f3f8;
-  --sidebar-foreground: #111827;
-  --sidebar-border: #dce2ec;
-  --status-ready: #15803d;
-  --status-ready-surface: #ecfdf3;
-  --status-warn: #b45309;
-  --status-warn-surface: #fffbeb;
-  --status-danger: #b91c1c;
-  --status-danger-surface: #fef2f2;
-  --radius: 0.5rem;
-}
-
-@theme inline {
-  --color-background: var(--background);
-  --color-foreground: var(--foreground);
-  --color-card: var(--card);
-  --color-card-foreground: var(--card-foreground);
-  --color-popover: var(--popover);
-  --color-popover-foreground: var(--popover-foreground);
-  --color-primary: var(--primary);
-  --color-primary-foreground: var(--primary-foreground);
-  --color-secondary: var(--secondary);
-  --color-secondary-foreground: var(--secondary-foreground);
-  --color-muted: var(--muted);
-  --color-muted-foreground: var(--muted-foreground);
-  --color-accent: var(--accent);
-  --color-accent-foreground: var(--accent-foreground);
-  --color-destructive: var(--destructive);
-  --color-destructive-foreground: var(--destructive-foreground);
-  --color-border: var(--border);
-  --color-input: var(--input);
-  --color-ring: var(--ring);
-  --color-sidebar: var(--sidebar);
-  --color-sidebar-foreground: var(--sidebar-foreground);
-  --color-sidebar-border: var(--sidebar-border);
-  --color-status-ready: var(--status-ready);
-  --color-status-ready-surface: var(--status-ready-surface);
-  --color-status-warn: var(--status-warn);
-  --color-status-warn-surface: var(--status-warn-surface);
-  --color-status-danger: var(--status-danger);
-  --color-status-danger-surface: var(--status-danger-surface);
-  --radius-sm: calc(var(--radius) - 0.25rem);
-  --radius-md: var(--radius);
-  --radius-lg: calc(var(--radius) + 0.25rem);
-  --font-sans:
-    "IBM Plex Sans", "Inter", system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-  --font-mono: "IBM Plex Mono", ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
-}
+@import "@astryxdesign/theme-neutral/fonts.css";
+@import "tailwindcss/theme.css" layer(theme);
+@import "tailwindcss/preflight.css" layer(base);
+@import "@astryxdesign/core/reset.css";
+@import "@astryxdesign/core/astryx.css";
+@import "@astryxdesign/theme-neutral/theme.css";
+@import "@astryxdesign/core/tailwind-theme.css";
+@import "tailwindcss/utilities.css" layer(utilities);
 
 @layer base {
-  * {
-    @apply border-border outline-ring/50;
-  }
-
   body {
-    @apply bg-background text-foreground font-sans;
-    font-feature-settings: "cv02", "cv03", "cv04", "cv11";
-  }
-
-  button:not(:disabled),
-  [role="button"]:not([aria-disabled="true"]) {
-    cursor: pointer;
+    font-family: var(--font-family-body);
+    background-color: var(--color-background-body);
+    color: var(--color-text-primary);
   }
 }
 
