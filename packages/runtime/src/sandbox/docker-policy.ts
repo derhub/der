@@ -879,50 +879,56 @@ export async function probeDockerEgressNetwork(
     }
   }
 
-  if (parsed.Containers !== undefined) {
-    const containersMap =
-      parsed.Containers !== null &&
-      typeof parsed.Containers === "object" &&
-      !Array.isArray(parsed.Containers)
-        ? (parsed.Containers as Record<string, unknown>)
-        : null;
-    if (containersMap === null) {
-      reasons.push(`Egress network "${netName}" reported malformed Containers metadata.`);
-    } else {
-      const attachedContainers = Object.values(containersMap).filter(
-        (entry): entry is DockerNetworkEndpointPayload =>
-          entry !== null && typeof entry === "object" && !Array.isArray(entry),
+  if (parsed.Containers !== undefined || options.egressProxyUrl !== undefined) {
+    if (parsed.Containers === undefined) {
+      reasons.push(
+        `Egress network "${netName}" is missing Containers metadata required to verify egress proxy attachment.`,
       );
-      if (attachedContainers.length === 0) {
-        reasons.push(
-          `Egress network "${netName}" has no containers attached to serve scoped egress proxy traffic.`,
+    } else {
+      const containersMap =
+        parsed.Containers !== null &&
+        typeof parsed.Containers === "object" &&
+        !Array.isArray(parsed.Containers)
+          ? (parsed.Containers as Record<string, unknown>)
+          : null;
+      if (containersMap === null) {
+        reasons.push(`Egress network "${netName}" reported malformed Containers metadata.`);
+      } else {
+        const attachedContainers = Object.values(containersMap).filter(
+          (entry): entry is DockerNetworkEndpointPayload =>
+            entry !== null && typeof entry === "object" && !Array.isArray(entry),
         );
-      } else if (proxyHost !== undefined) {
-        const inspectedLower = inspectedName.toLowerCase();
-        const proxyAttached = attachedContainers.some((endpoint) => {
-          const name =
-            typeof endpoint.Name === "string"
-              ? endpoint.Name.trim().replace(/^\/+/, "").toLowerCase()
-              : "";
-          const ipv4 =
-            typeof endpoint.IPv4Address === "string"
-              ? (endpoint.IPv4Address.trim().split("/")[0]?.toLowerCase() ?? "")
-              : "";
-          const ipv6 =
-            typeof endpoint.IPv6Address === "string"
-              ? normalizeUrlHost(endpoint.IPv6Address.trim().split("/")[0] ?? "")
-              : "";
-          return (
-            (name.length > 0 &&
-              (name === proxyHost || `${name}.${inspectedLower}` === proxyHost)) ||
-            (ipv4.length > 0 && ipv4 === proxyHost) ||
-            (ipv6.length > 0 && ipv6 === proxyHost)
-          );
-        });
-        if (!proxyAttached) {
+        if (attachedContainers.length === 0) {
           reasons.push(
-            `Egress proxy host "${proxyHost}" is not attached to internal egress network "${netName}".`,
+            `Egress network "${netName}" has no containers attached to serve scoped egress proxy traffic.`,
           );
+        } else if (proxyHost !== undefined) {
+          const inspectedLower = inspectedName.toLowerCase();
+          const proxyAttached = attachedContainers.some((endpoint) => {
+            const name =
+              typeof endpoint.Name === "string"
+                ? endpoint.Name.trim().replace(/^\/+/, "").toLowerCase()
+                : "";
+            const ipv4 =
+              typeof endpoint.IPv4Address === "string"
+                ? (endpoint.IPv4Address.trim().split("/")[0]?.toLowerCase() ?? "")
+                : "";
+            const ipv6 =
+              typeof endpoint.IPv6Address === "string"
+                ? normalizeUrlHost(endpoint.IPv6Address.trim().split("/")[0] ?? "")
+                : "";
+            return (
+              (name.length > 0 &&
+                (name === proxyHost || `${name}.${inspectedLower}` === proxyHost)) ||
+              (ipv4.length > 0 && ipv4 === proxyHost) ||
+              (ipv6.length > 0 && ipv6 === proxyHost)
+            );
+          });
+          if (!proxyAttached) {
+            reasons.push(
+              `Egress proxy host "${proxyHost}" is not attached to internal egress network "${netName}".`,
+            );
+          }
         }
       }
     }

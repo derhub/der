@@ -846,6 +846,13 @@ describe("provide a hardened @tanstack/ai-sandbox handle and @der/domain Sandbox
               Labels: {
                 "der.egress.allowed_hosts": "api.openai.com,auth.openai.com",
               },
+              Containers: {
+                cid1: {
+                  Name: "egress-proxy",
+                  IPv4Address: "172.22.0.2/16",
+                  IPv6Address: "",
+                },
+              },
             }),
             stderr: "",
           };
@@ -940,6 +947,13 @@ describe("provide a hardened @tanstack/ai-sandbox handle and @der/domain Sandbox
                 Internal: true,
                 Options: {},
                 Labels: labels,
+                Containers: {
+                  cid1: {
+                    Name: "egress-proxy",
+                    IPv4Address: "172.22.0.2/16",
+                    IPv6Address: "",
+                  },
+                },
               }),
               stderr: "",
             };
@@ -1220,6 +1234,13 @@ describe("provide a hardened @tanstack/ai-sandbox handle and @der/domain Sandbox
               Internal: true,
               Options: {},
               Labels: { "der.egress.allowed_hosts": "api.openai.com" },
+              Containers: {
+                cid1: {
+                  Name: "egress-proxy",
+                  IPv4Address: "172.22.0.2/16",
+                  IPv6Address: "",
+                },
+              },
             }),
             stderr: "",
           };
@@ -1371,5 +1392,66 @@ describe("provide a hardened @tanstack/ai-sandbox handle and @der/domain Sandbox
       attachedCalls.some((call) => call.args[0] === "network" && call.args[1] === "inspect"),
     ).toBe(true);
     expect(attachedCalls.some((call) => call.args[0] === "run")).toBe(true);
+  });
+
+  it("fails closed when Docker network inspect omits Containers metadata for scoped egress proxy verification", async () => {
+    const { runner, calls } = createFakeCommandRunner({
+      onExec: (_cmd, args) => {
+        if (args[0] === "network" && args[1] === "inspect") {
+          return {
+            exitCode: 0,
+            stdout: JSON.stringify({
+              Name: "der-egress-codex",
+              Driver: "bridge",
+              Internal: true,
+              Options: {},
+              Labels: { "der.egress.allowed_hosts": "api.openai.com" },
+            }),
+            stderr: "",
+          };
+        }
+        return { exitCode: 0, stdout: "should-not-run", stderr: "" };
+      },
+    });
+
+    const report = await probeDockerEgressNetwork({
+      dockerHost: "unix:///run/user/1000/docker.sock",
+      networkName: "der-egress-codex",
+      engine: "codex",
+      allowedHosts: ["api.openai.com"],
+      egressProxyUrl: "http://egress-proxy:3128",
+      runner,
+    });
+    expect(report.verified).toBe(false);
+    expect(report.reasons.join("\n")).toContain("Containers");
+
+    const provider = createHardenedDockerProvider({
+      dockerHost: "unix:///run/user/1000/docker.sock",
+      image: "der-engine-codex:pinned",
+      engine: "codex",
+      user: "1000:1000",
+      workspaceHostPath: "/srv/der/workspaces/sess-1",
+      shadowHome: DEFAULT_ENGINE_SHADOW_HOMES.codex,
+      network: {
+        mode: "scoped_egress",
+        networkName: "der-egress-codex",
+        allowedHosts: ["api.openai.com"],
+        egressProxyUrl: "http://egress-proxy:3128",
+      },
+      limits: { cpus: 1, memoryMb: 512, pidsLimit: 128 },
+      runner,
+      verifyIsolationOnCreate: false,
+      resolveRealPath: identityRealPath,
+    });
+
+    let caught: unknown;
+    try {
+      await provider.create({ id: "sess-missing-containers" });
+    } catch (error) {
+      caught = error;
+    }
+    expect(caught).toBeInstanceOf(SandboxControlError);
+    expect((caught as SandboxControlError).code).toBe("docker.egress_network_unverified");
+    expect(calls.some((call) => call.args[0] === "run")).toBe(false);
   });
 });
