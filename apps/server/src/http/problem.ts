@@ -1,3 +1,4 @@
+import type { ErrorHandler, MiddlewareHandler } from "hono";
 import { DomainError, PROBLEM_DETAILS_MEDIA_TYPE, type ProblemDetails } from "@der/domain";
 import { compiledParsers } from "@der/domain/compiled";
 
@@ -110,6 +111,21 @@ export function enforceSameOrigin(
 
   return undefined;
 }
+
+export function sameOriginMiddleware(allowedOrigins: readonly string[]): MiddlewareHandler {
+  return async (c, next) => {
+    const pathname = new URL(c.req.url).pathname;
+    const originError = enforceSameOrigin(c.req.raw, allowedOrigins, pathname);
+    if (originError) {
+      return originError;
+    }
+    await next();
+  };
+}
+
+export const problemErrorHandler: ErrorHandler = (error, c) => {
+  return errorToProblemResponse(error, new URL(c.req.url).pathname);
+};
 
 export async function parseJsonBody(request: Request, instance: string): Promise<unknown> {
   const raw = await request.text();

@@ -16,6 +16,7 @@
     "@restatedev/restate-sdk-clients": "1.18.4",
     "@tanstack/ai": "1.8.0",
     "croner": "11.0.1",
+    "hono": "^4.13.20",
     "zod": "4.6.7"
   }
 }
