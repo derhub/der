@@ -1,0 +1,553 @@
+import {
+  formatUtcTimestamp,
+  type Approval,
+  type ApprovalId,
+  type ApprovalResolutionInput,
+  type Bot,
+  type BotId,
+  type ChannelBinding,
+  type ChannelBindingId,
+  type ChannelCursor,
+  type ChannelIntakeMetadata,
+  type ChannelIntegration,
+  type ChannelReceipt,
+  type ChannelReceiptDisposition,
+  type CreateBotInput,
+  type CreateSessionInput,
+  type DeliveryResult,
+  type EffectId,
+  type EffectIdentity,
+  type EffectRecord,
+  type EngineKind,
+  type JsonValue,
+  type Message,
+  type OutboxDeliveryState,
+  type OutboxEvent,
+  type OutboxEventId,
+  type Routine,
+  type RoutineId,
+  type Run,
+  type RunAdmission,
+  type RunEvent,
+  type RunId,
+  type RunRequest,
+  type Session,
+  type SessionId,
+  type Store,
+  type UpdateBotInput,
+  type UtcTimestamp,
+} from "@der/domain";
+import { compiledParsers } from "@der/domain/compiled";
+import {
+  beginEffect as beginEffectCommand,
+  completeEffect as completeEffectCommand,
+  decideApproval,
+  getApproval as getApprovalQuery,
+  getEffect as getEffectQuery,
+  getLatestApprovalForRun as getLatestApprovalForRunQuery,
+  markEffectUnknown as markEffectUnknownCommand,
+  requestApproval as requestApprovalCommand,
+  type BeginEffectOutcome,
+  type RequestApprovalInput,
+  type RequestApprovalOutcome,
+} from "./approvals-effects";
+import {
+  findChannelBinding as findChannelBindingQuery,
+  getChannelCursor as getChannelCursorQuery,
+  getChannelReceipt as getChannelReceiptQuery,
+  listChannelBindings as listChannelBindingsQuery,
+  listDueOutboxEvents as listDueOutboxEventsQuery,
+  listOutboxEvents as listOutboxEventsQuery,
+  recordChannelReceipt as recordChannelReceiptCommand,
+  recordOutboxDelivery as recordOutboxDeliveryCommand,
+  setChannelCursor as setChannelCursorCommand,
+  upsertChannelBinding as upsertChannelBindingCommand,
+  type UpsertChannelBindingInput,
+} from "./channel-outbox";
+import { SqliteDatabase, type SqliteDatabaseOptions } from "./database";
+import { notFoundError, validationError } from "./errors";
+import {
+  mapBotRow,
+  mapMessageRow,
+  mapRoutineRow,
+  mapSessionRow,
+  type BotRow,
+  type MessageRow,
+  type RoutineRow,
+  type SessionRow,
+} from "./rows";
+import {
+  admitRun,
+  appendRunEvents as appendRunEventsCommand,
+  finishRun as finishRunCommand,
+  getRun as getRunQuery,
+  getRunStreamState as getRunStreamStateQuery,
+  markRunRunning as markRunRunningCommand,
+  readRunEventsAfter as readRunEventsAfterQuery,
+  type FinishRunInput,
+  type FinishRunOutcome,
+  type RunEventInput,
+  type RunStreamState,
+} from "./runs";
+
+export type {
+  BeginEffectOutcome,
+  RequestApprovalInput,
+  RequestApprovalOutcome,
+} from "./approvals-effects";
+export type { UpsertChannelBindingInput } from "./channel-outbox";
+export type { FinishRunInput, FinishRunOutcome, RunEventInput, RunStreamState } from "./runs";
+
+export interface SqliteStoreOptions extends SqliteDatabaseOptions {
+  readonly maxEventBatchSize?: number;
+  readonly replayPageSize?: number;
+}
+
+export interface CreateRoutineInput {
+  readonly id?: RoutineId;
+  readonly botId: BotId;
+  readonly sessionId: SessionId;
+  readonly name: string;
+  readonly cron: string;
+  readonly enabled: boolean;
+  readonly revision?: number;
+  readonly engine: EngineKind;
+  readonly prompt: string;
+}
+
+const DEFAULT_MAX_EVENT_BATCH_SIZE = 16;
+const DEFAULT_REPLAY_PAGE_SIZE = 64;
+
+export class SqliteStore implements Store {
+  readonly database: SqliteDatabase;
+  private readonly maxEventBatchSize: number;
+  private readonly replayPageSize: number;
+
+  constructor(options: SqliteStoreOptions) {
+    this.database = new SqliteDatabase(options);
+    this.maxEventBatchSize = options.maxEventBatchSize ?? DEFAULT_MAX_EVENT_BATCH_SIZE;
+    this.replayPageSize = options.replayPageSize ?? DEFAULT_REPLAY_PAGE_SIZE;
+  }
+
+  private nowUtc(): UtcTimestamp {
+    return formatUtcTimestamp(this.database.now());
+  }
+
+  createBot(input: CreateBotInput & { readonly id?: BotId }): Bot {
+    const parsed = compiledParsers.createBotInput.safeParse(input);
+    if (!parsed.success) {
+      throw validationError(
+        "bot.invalid_input",
+        "Invalid bot input",
+        parsed.error.message,
+        "/api/bots",
+      );
+    }
+    if (!parsed.data.allowedEngines.includes(parsed.data.defaultEngine)) {
+      throw validationError(
+        "bot.invalid_engine",
+        "Default engine is not allowed",
+        `defaultEngine "${parsed.data.defaultEngine}" must appear in allowedEngines.`,
+        "/api/bots",
+      );
+    }
+
+    const now = this.nowUtc();
+    const botId = input.id ?? `bot_${crypto.randomUUID()}`;
+
+    return this.database.inTransaction((db) => {
+      db.query(
+        `INSERT INTO bots (id, name, persona, default_engine, allowed_engines_json, workspace_path, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+      ).run(
+        botId,
+        parsed.data.name,
+        parsed.data.persona,
+        parsed.data.defaultEngine,
+        JSON.stringify(parsed.data.allowedEngines),
+        parsed.data.workspacePath ?? null,
+        now,
+        now,
+      );
+
+      const row = db.query<BotRow, [string]>("SELECT * FROM bots WHERE id = ?").get(botId);
+      if (!row) {
+        throw new Error(`Bot ${botId} was not persisted`);
+      }
+      return mapBotRow(row);
+    });
+  }
+
+  getBot(botId: BotId): Bot | undefined {
+    const row = this.database.db
+      .query<BotRow, [string]>("SELECT * FROM bots WHERE id = ?")
+      .get(botId);
+    return row ? mapBotRow(row) : undefined;
+  }
+
+  listBots(): Bot[] {
+    const rows = this.database.db
+      .query<BotRow, []>("SELECT * FROM bots ORDER BY created_at ASC, id ASC")
+      .all();
+    return rows.map(mapBotRow);
+  }
+
+  updateBot(botId: BotId, input: UpdateBotInput): Bot {
+    const parsed = compiledParsers.updateBotInput.safeParse(input);
+    if (!parsed.success) {
+      throw validationError(
+        "bot.invalid_input",
+        "Invalid bot update",
+        parsed.error.message,
+        `/api/bots/${botId}`,
+      );
+    }
+
+    const now = this.nowUtc();
+    return this.database.inTransaction((db) => {
+      const existingRow = db.query<BotRow, [string]>("SELECT * FROM bots WHERE id = ?").get(botId);
+      if (!existingRow) {
+        throw notFoundError(
+          "bot.not_found",
+          "Bot not found",
+          `Bot ${botId} does not exist.`,
+          `/api/bots/${botId}`,
+        );
+      }
+      const existing = mapBotRow(existingRow);
+      const nextDefault = parsed.data.defaultEngine ?? existing.defaultEngine;
+      const nextAllowed = parsed.data.allowedEngines ?? existing.allowedEngines;
+      if (!nextAllowed.includes(nextDefault)) {
+        throw validationError(
+          "bot.invalid_engine",
+          "Default engine is not allowed",
+          `defaultEngine "${nextDefault}" must appear in allowedEngines.`,
+          `/api/bots/${botId}`,
+        );
+      }
+
+      const nextName = parsed.data.name ?? existing.name;
+      const nextPersona = parsed.data.persona ?? existing.persona;
+      const nextWorkspacePath =
+        parsed.data.workspacePath !== undefined
+          ? parsed.data.workspacePath
+          : (existing.workspacePath ?? null);
+
+      db.query(
+        `UPDATE bots
+         SET name = ?, persona = ?, default_engine = ?, allowed_engines_json = ?, workspace_path = ?, updated_at = ?
+         WHERE id = ?`,
+      ).run(
+        nextName,
+        nextPersona,
+        nextDefault,
+        JSON.stringify(nextAllowed),
+        nextWorkspacePath,
+        now,
+        botId,
+      );
+
+      const updated = db.query<BotRow, [string]>("SELECT * FROM bots WHERE id = ?").get(botId);
+      if (!updated) {
+        throw new Error(`Bot ${botId} disappeared after update`);
+      }
+      return mapBotRow(updated);
+    });
+  }
+
+  createSession(input: CreateSessionInput & { readonly id?: SessionId }): Session {
+    const parsed = compiledParsers.createSessionInput.safeParse(input);
+    if (!parsed.success) {
+      throw validationError(
+        "session.invalid_input",
+        "Invalid session input",
+        parsed.error.message,
+        `/api/bots/${input.botId}/sessions`,
+      );
+    }
+
+    const now = this.nowUtc();
+    const sessionId = input.id ?? `sess_${crypto.randomUUID()}`;
+
+    return this.database.inTransaction((db) => {
+      const botRow = db
+        .query<BotRow, [string]>("SELECT * FROM bots WHERE id = ?")
+        .get(parsed.data.botId);
+      if (!botRow) {
+        throw notFoundError(
+          "bot.not_found",
+          "Bot not found",
+          `Bot ${parsed.data.botId} does not exist.`,
+          `/api/bots/${parsed.data.botId}/sessions`,
+        );
+      }
+      const bot = mapBotRow(botRow);
+      if (parsed.data.engine !== undefined && !bot.allowedEngines.includes(parsed.data.engine)) {
+        throw validationError(
+          "session.invalid_engine",
+          "Engine is not allowed for bot",
+          `Engine "${parsed.data.engine}" is not allowed on bot ${bot.id}.`,
+          `/api/bots/${bot.id}/sessions`,
+        );
+      }
+
+      db.query(
+        `INSERT INTO sessions (id, bot_id, title, engine, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?)`,
+      ).run(sessionId, parsed.data.botId, parsed.data.title, parsed.data.engine ?? null, now, now);
+
+      const row = db
+        .query<SessionRow, [string]>("SELECT * FROM sessions WHERE id = ?")
+        .get(sessionId);
+      if (!row) {
+        throw new Error(`Session ${sessionId} was not persisted`);
+      }
+      return mapSessionRow(row);
+    });
+  }
+
+  getSession(sessionId: SessionId): Session | undefined {
+    const row = this.database.db
+      .query<SessionRow, [string]>("SELECT * FROM sessions WHERE id = ?")
+      .get(sessionId);
+    return row ? mapSessionRow(row) : undefined;
+  }
+
+  listSessions(botId: BotId): Session[] {
+    const rows = this.database.db
+      .query<SessionRow, [string]>(
+        "SELECT * FROM sessions WHERE bot_id = ? ORDER BY created_at ASC, id ASC",
+      )
+      .all(botId);
+    return rows.map(mapSessionRow);
+  }
+
+  createRoutine(input: CreateRoutineInput): Routine {
+    const now = this.nowUtc();
+    const routineId = input.id ?? `rt_${crypto.randomUUID()}`;
+    const revision = input.revision ?? 1;
+
+    return this.database.inTransaction((db) => {
+      const sessionRow = db
+        .query<SessionRow, [string, string]>("SELECT * FROM sessions WHERE id = ? AND bot_id = ?")
+        .get(input.sessionId, input.botId);
+      if (!sessionRow) {
+        throw notFoundError(
+          "session.not_found",
+          "Session not found in bot scope",
+          `Session ${input.sessionId} does not belong to bot ${input.botId}.`,
+          `/api/bots/${input.botId}/routines`,
+        );
+      }
+
+      db.query(
+        `INSERT INTO routines (id, bot_id, session_id, name, cron, enabled, revision, engine, prompt, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      ).run(
+        routineId,
+        input.botId,
+        input.sessionId,
+        input.name,
+        input.cron,
+        input.enabled ? 1 : 0,
+        revision,
+        input.engine,
+        input.prompt,
+        now,
+        now,
+      );
+
+      const row = db
+        .query<RoutineRow, [string]>("SELECT * FROM routines WHERE id = ?")
+        .get(routineId);
+      if (!row) {
+        throw new Error(`Routine ${routineId} was not persisted`);
+      }
+      return mapRoutineRow(row);
+    });
+  }
+
+  getRoutine(routineId: RoutineId): Routine | undefined {
+    const row = this.database.db
+      .query<RoutineRow, [string]>("SELECT * FROM routines WHERE id = ?")
+      .get(routineId);
+    return row ? mapRoutineRow(row) : undefined;
+  }
+
+  listMessages(
+    sessionId: SessionId,
+    options?: { readonly limit?: number; readonly afterOrdinal?: number },
+  ): Message[] {
+    const limit = options?.limit ?? 100;
+    const afterOrdinal = options?.afterOrdinal ?? 0;
+    const rows = this.database.db
+      .query<MessageRow, [string, number, number]>(
+        `SELECT * FROM messages
+         WHERE session_id = ? AND ordinal > ?
+         ORDER BY ordinal ASC
+         LIMIT ?`,
+      )
+      .all(sessionId, afterOrdinal, limit);
+    return rows.map(mapMessageRow);
+  }
+
+  admit(request: RunRequest): Promise<RunAdmission> {
+    return admitRun(this.database, request);
+  }
+
+  getRun(runId: RunId): Run | undefined {
+    return getRunQuery(this.database, runId);
+  }
+
+  markRunRunning(runId: RunId, checkpoint?: JsonValue | null): Promise<Run> {
+    return markRunRunningCommand(this.database, runId, checkpoint);
+  }
+
+  appendRunEvents(runId: RunId, events: readonly RunEventInput[]): Promise<RunEvent[]> {
+    return appendRunEventsCommand(this.database, runId, events, this.maxEventBatchSize);
+  }
+
+  getRunStreamState(runId: RunId): RunStreamState | undefined {
+    return getRunStreamStateQuery(this.database, runId);
+  }
+
+  readRunEventsAfter(runId: RunId, after: number, limit = this.replayPageSize): RunEvent[] {
+    return readRunEventsAfterQuery(this.database, runId, after, limit);
+  }
+
+  async *replay(runId: RunId, after: number): AsyncIterable<RunEvent> {
+    let cursor = after;
+    while (true) {
+      const page = this.readRunEventsAfter(runId, cursor, this.replayPageSize);
+      if (page.length === 0) {
+        break;
+      }
+      for (const event of page) {
+        cursor = event.sequence;
+        yield event;
+      }
+      if (page.length < this.replayPageSize) {
+        break;
+      }
+    }
+  }
+
+  requestApproval(input: RequestApprovalInput): Promise<RequestApprovalOutcome> {
+    return requestApprovalCommand(this.database, input);
+  }
+
+  getApproval(approvalId: ApprovalId): Approval | undefined {
+    return getApprovalQuery(this.database, approvalId);
+  }
+
+  getLatestApprovalForRun(runId: RunId): Approval | undefined {
+    return getLatestApprovalForRunQuery(this.database, runId);
+  }
+
+  decide(
+    decision: ApprovalResolutionInput,
+    channelIntake?: ChannelIntakeMetadata,
+  ): Promise<Approval> {
+    return decideApproval(this.database, decision, channelIntake);
+  }
+
+  beginEffect(
+    identity: EffectIdentity,
+    options?: { readonly approvalId?: ApprovalId },
+  ): Promise<BeginEffectOutcome> {
+    return beginEffectCommand(this.database, identity, options);
+  }
+
+  completeEffect(effectId: EffectId, outcome: JsonValue): Promise<EffectRecord> {
+    return completeEffectCommand(this.database, effectId, outcome);
+  }
+
+  markEffectUnknown(effectId: EffectId): Promise<EffectRecord> {
+    return markEffectUnknownCommand(this.database, effectId);
+  }
+
+  getEffect(identity: EffectIdentity): EffectRecord | undefined {
+    return getEffectQuery(this.database, identity);
+  }
+
+  finishRun(input: FinishRunInput): Promise<FinishRunOutcome> {
+    return finishRunCommand(this.database, input);
+  }
+
+  upsertChannelBinding(input: UpsertChannelBindingInput): ChannelBinding {
+    return upsertChannelBindingCommand(this.database, input);
+  }
+
+  listChannelBindings(filter?: {
+    readonly botId?: BotId;
+    readonly sessionId?: SessionId;
+    readonly integration?: ChannelIntegration;
+    readonly enabledOnly?: boolean;
+  }): ChannelBinding[] {
+    return listChannelBindingsQuery(this.database, filter);
+  }
+
+  findChannelBinding(query: {
+    readonly integration: ChannelIntegration;
+    readonly externalChatId: string;
+    readonly externalActorId: string;
+    readonly sessionId?: SessionId;
+  }): ChannelBinding | undefined {
+    return findChannelBindingQuery(this.database, query);
+  }
+
+  getChannelReceipt(
+    integration: ChannelIntegration,
+    consumer: string,
+    externalUpdateId: string,
+  ): ChannelReceipt | undefined {
+    return getChannelReceiptQuery(this.database, integration, consumer, externalUpdateId);
+  }
+
+  recordChannelReceipt(input: {
+    readonly integration: ChannelIntegration;
+    readonly consumer: string;
+    readonly externalUpdateId: string;
+    readonly disposition: ChannelReceiptDisposition;
+    readonly referenceId: string | null;
+    readonly nextCursor?: string;
+  }): Promise<ChannelReceipt> {
+    return recordChannelReceiptCommand(this.database, input);
+  }
+
+  getChannelCursor(integration: ChannelIntegration, consumer: string): ChannelCursor | undefined {
+    return getChannelCursorQuery(this.database, integration, consumer);
+  }
+
+  setChannelCursor(
+    integration: ChannelIntegration,
+    consumer: string,
+    position: string,
+  ): Promise<ChannelCursor> {
+    return setChannelCursorCommand(this.database, integration, consumer, position);
+  }
+
+  listOutboxEvents(filter?: {
+    readonly eventId?: string;
+    readonly bindingId?: ChannelBindingId;
+    readonly state?: OutboxDeliveryState;
+  }): OutboxEvent[] {
+    return listOutboxEventsQuery(this.database, filter);
+  }
+
+  listDueOutboxEvents(now: UtcTimestamp = this.nowUtc(), limit = 50): OutboxEvent[] {
+    return listDueOutboxEventsQuery(this.database, now, limit);
+  }
+
+  recordOutboxDelivery(outboxId: OutboxEventId, result: DeliveryResult): Promise<OutboxEvent> {
+    return recordOutboxDeliveryCommand(this.database, outboxId, result);
+  }
+
+  close(): void {
+    this.database.close();
+  }
+}
+
+export function openSqliteStore(options: SqliteStoreOptions): SqliteStore {
+  return new SqliteStore(options);
+}
