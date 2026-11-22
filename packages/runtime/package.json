@@ -1,0 +1,28 @@
+{
+  "name": "@der/runtime",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts",
+    "./sandbox": "./src/sandbox/index.ts",
+    "./engines": "./src/engines/index.ts",
+    "./context": "./src/context/index.ts"
+  },
+  "scripts": {
+    "test": "bun test"
+  },
+  "dependencies": {
+    "@der/domain": "workspace:*",
+    "@tanstack/ai": "1.8.0",
+    "@tanstack/ai-acp": "1.0.3",
+    "@tanstack/ai-claude-code": "1.0.3",
+    "@tanstack/ai-codex": "1.1.0",
+    "@tanstack/ai-compaction": "1.1.0",
+    "@tanstack/ai-sandbox": "1.5.0",
+    "@tanstack/ai-skills": "1.0.3",
+    "@wasmer/sdk": "0.19.1",
+    "yaml": "2.9.1",
+    "zod": "4.6.7"
+  }
+}

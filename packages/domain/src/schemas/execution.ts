@@ -1,0 +1,86 @@
+import * as z from "zod";
+import { effectIdentity, effectOperationKind } from "./approval";
+import { engineKind, jsonValue } from "./common";
+import { messagePart } from "./message";
+
+export const engineEvent = z.discriminatedUnion("type", [
+  z.object({
+    type: z.literal("chunk"),
+    chunkKey: z.string().min(1),
+    chunk: jsonValue,
+    isTerminal: z.boolean().optional(),
+  }),
+  z.object({
+    type: z.literal("approval_required"),
+    effect: effectIdentity,
+    prompt: z.string().min(1),
+  }),
+  z.object({
+    type: z.literal("completed"),
+    finalMessage: z
+      .object({
+        parts: z.array(messagePart),
+      })
+      .optional(),
+  }),
+  z.object({
+    type: z.literal("failed"),
+    code: z.string().min(1),
+    detail: z.string().min(1),
+  }),
+]);
+export type EngineEvent = z.infer<typeof engineEvent>;
+
+export const engineReadiness = z.object({
+  engine: engineKind,
+  interactive: z.enum(["ready", "login_required", "blocked"]),
+  unattended: z.enum(["ready", "blocked", "unverified"]),
+  isolationVerified: z.boolean(),
+  reasons: z.array(z.string()),
+  loginGuidance: z.string().min(1).optional(),
+});
+export type EngineReadiness = z.infer<typeof engineReadiness>;
+
+export const sandboxRequest = z.object({
+  command: z.string().min(1),
+  args: z.array(z.string()),
+  cwd: z.string().min(1).optional(),
+  env: z.record(z.string(), z.string()).optional(),
+  timeoutMs: z.number().int().positive(),
+  writablePaths: z.array(z.string().min(1)).optional(),
+  readonlyPaths: z.array(z.string().min(1)).optional(),
+  network: z.enum(["none", "scoped_egress"]),
+});
+export type SandboxRequest = z.infer<typeof sandboxRequest>;
+
+export const sandboxResult = z.object({
+  exitCode: z.number().int(),
+  stdout: z.string(),
+  stderr: z.string(),
+  timedOut: z.boolean(),
+  durationMs: z.number().nonnegative(),
+});
+export type SandboxResult = z.infer<typeof sandboxResult>;
+
+export const toolDescriptor = z.object({
+  kind: effectOperationKind,
+  id: z.string().min(1),
+  name: z.string().min(1),
+  description: z.string(),
+  requiresApproval: z.boolean(),
+  inputSchema: jsonValue,
+});
+export type ToolDescriptor = z.infer<typeof toolDescriptor>;
+
+export const toolOperation = z.object({
+  effect: effectIdentity,
+});
+export type ToolOperation = z.infer<typeof toolOperation>;
+
+export const toolResult = z.object({
+  ok: z.boolean(),
+  outcome: jsonValue,
+  isError: z.boolean(),
+  detail: z.string().optional(),
+});
+export type ToolResult = z.infer<typeof toolResult>;

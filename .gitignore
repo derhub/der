@@ -1,0 +1,9 @@
+node_modules/
+dist/
+.vite/
+*.tsbuildinfo
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+.env
+.env.local
