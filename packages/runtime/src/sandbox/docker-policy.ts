@@ -894,11 +894,14 @@ export async function probeDockerEgressNetwork(
       if (containersMap === null) {
         reasons.push(`Egress network "${netName}" reported malformed Containers metadata.`);
       } else {
-        const attachedContainers = Object.values(containersMap).filter(
+        const containerEntries = Object.values(containersMap);
+        const attachedContainers = containerEntries.filter(
           (entry): entry is DockerNetworkEndpointPayload =>
             entry !== null && typeof entry === "object" && !Array.isArray(entry),
         );
-        if (attachedContainers.length === 0) {
+        if (attachedContainers.length !== containerEntries.length) {
+          reasons.push(`Egress network "${netName}" reported malformed Containers metadata.`);
+        } else if (attachedContainers.length === 0) {
           reasons.push(
             `Egress network "${netName}" has no containers attached to serve scoped egress proxy traffic.`,
           );

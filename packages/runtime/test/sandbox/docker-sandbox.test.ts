@@ -1454,4 +1454,45 @@ describe("provide a hardened @tanstack/ai-sandbox handle and @der/domain Sandbox
     expect((caught as SandboxControlError).code).toBe("docker.egress_network_unverified");
     expect(calls.some((call) => call.args[0] === "run")).toBe(false);
   });
+
+  it("fails closed when Containers metadata includes a malformed entry alongside a valid proxy entry", async () => {
+    const { runner } = createFakeCommandRunner({
+      onExec: (_cmd, args) => {
+        if (args[0] === "network" && args[1] === "inspect") {
+          return {
+            exitCode: 0,
+            stdout: JSON.stringify({
+              Name: "der-egress-codex",
+              Driver: "bridge",
+              Internal: true,
+              Options: {},
+              Labels: { "der.egress.allowed_hosts": "api.openai.com" },
+              Containers: {
+                cid1: {
+                  Name: "egress-proxy",
+                  IPv4Address: "172.22.0.2/16",
+                  IPv6Address: "",
+                },
+                cid2: null,
+              },
+            }),
+            stderr: "",
+          };
+        }
+        return { exitCode: 0, stdout: "should-not-run", stderr: "" };
+      },
+    });
+
+    const report = await probeDockerEgressNetwork({
+      dockerHost: "unix:///run/user/1000/docker.sock",
+      networkName: "der-egress-codex",
+      engine: "codex",
+      allowedHosts: ["api.openai.com"],
+      egressProxyUrl: "http://egress-proxy:3128",
+      runner,
+    });
+
+    expect(report.verified).toBe(false);
+    expect(report.reasons.join("\n")).toContain("malformed Containers metadata");
+  });
 });
