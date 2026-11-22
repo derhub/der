@@ -1,0 +1,45 @@
+# syntax=docker/dockerfile:1.7
+
+FROM docker:27-dind@sha256:aa3df78ecf320f5fafdce71c659f1629e96e9de0968305fe1de670e0ca9176ce AS docker-cli
+
+FROM oven/bun:1@sha256:3aa040e5445efa09d75bb428a64ba50db13e2b3ac9b6b0c7f145615f62b2ee18 AS der-server
+
+WORKDIR /app
+
+COPY --from=docker-cli /usr/local/bin/docker /usr/local/bin/docker
+
+COPY package.json bun.lock tsconfig.json ./
+COPY packages/domain/package.json packages/domain/package.json
+COPY packages/storage/package.json packages/storage/package.json
+COPY packages/runtime/package.json packages/runtime/package.json
+COPY integrations/mcp/package.json integrations/mcp/package.json
+COPY integrations/telegram/package.json integrations/telegram/package.json
+COPY apps/server/package.json apps/server/package.json
+COPY apps/web/package.json apps/web/package.json
+
+RUN bun install --frozen-lockfile
+
+COPY packages/ packages/
+COPY integrations/ integrations/
+COPY apps/server/ apps/server/
+
+RUN mkdir -p /data/memory /data/skills /data/workspaces /run/der-rootless \
+  && chown -R 1000:1000 /app /data /run/der-rootless
+
+USER 1000:1000
+
+ENV DER_HOST=0.0.0.0 \
+    DER_PORT=3000 \
+    DER_RESTATE_HOST=0.0.0.0 \
+    DER_RESTATE_PORT=9080 \
+    DER_DATABASE_PATH=/data/der.sqlite \
+    DER_MEMORY_PROJECTION_DIR=/data/memory \
+    DER_SKILLS_ROOT_DIR=/data/skills \
+    DER_WORKSPACE_ROOT_DIR=/data/workspaces
+
+EXPOSE 3000 9080
+
+HEALTHCHECK --interval=5s --timeout=3s --start-period=10s --retries=12 \
+  CMD ["bun", "-e", "const r = await fetch('http://127.0.0.1:3000/healthz'); if (!r.ok) process.exit(1);"]
+
+ENTRYPOINT ["bun", "run", "apps/server/src/main.ts"]

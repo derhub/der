@@ -11,11 +11,15 @@ import {
   type Engine,
   type EngineKind,
   type EngineReadiness,
+  type Tools,
 } from "@der/domain";
 import { compileSchema } from "@der/domain/compiled";
+import type { SkillCatalog } from "@der/runtime/context";
 import type { SqliteStore } from "@der/storage";
+import type { SqliteMemory } from "@der/storage/memory";
+import type { SqliteRoutines } from "@der/storage/routines";
 import type { ServerConfig } from "../config";
-import type { DurableWorkflow } from "../workflows/index";
+import type { DurableWorkflow, RoutineScheduleClient } from "../workflows/index";
 import {
   enforceSameOrigin,
   errorToProblemResponse,
@@ -51,11 +55,46 @@ const decisionBodySchema = compileSchema(
   }),
 );
 
+const writeMemoryBodySchema = compileSchema(
+  z.object({
+    markdown: z.string(),
+    expectedVersion: z.number().int().nonnegative().optional(),
+  }),
+);
+
+const createRoutineBodySchema = compileSchema(
+  z.object({
+    id: id.optional(),
+    sessionId: id,
+    name: z.string().min(1),
+    cron: z.string().min(1),
+    enabled: z.boolean().default(true),
+    engine: engineKind.optional(),
+    prompt: z.string().min(1),
+  }),
+);
+
+const updateRoutineBodySchema = compileSchema(
+  z.object({
+    name: z.string().min(1).optional(),
+    cron: z.string().min(1).optional(),
+    enabled: z.boolean().optional(),
+    engine: engineKind.optional(),
+    prompt: z.string().min(1).optional(),
+    expectedRevision: z.number().int().positive().optional(),
+  }),
+);
+
 export type ExtraHttpHandler = (request: Request, url: URL) => Promise<Response | undefined>;
 
 export interface HttpRouterDeps {
   readonly store: SqliteStore;
+  readonly memory: SqliteMemory;
+  readonly routines: SqliteRoutines;
+  readonly skills: SkillCatalog;
+  readonly tools: Tools;
   readonly workflow: DurableWorkflow;
+  readonly routineSchedule: RoutineScheduleClient;
   readonly engines: ReadonlyMap<EngineKind, Engine>;
   readonly config: ServerConfig;
   readonly extraHttpHandler?: ExtraHttpHandler;
@@ -131,6 +170,38 @@ export function createHttpHandler(deps: HttpRouterDeps): (request: Request) => P
         return jsonResponse({ engines: readiness });
       }
 
+      if (request.method === "GET" && pathname === "/api/tools") {
+        const listed = deps.tools.list ? await deps.tools.list() : [];
+        return jsonResponse({ tools: listed });
+      }
+
+      if (request.method === "GET" && pathname === "/api/skills") {
+        const catalog = await deps.skills.loadCatalog();
+        return jsonResponse({
+          skills: catalog.skills,
+          rejected: catalog.rejected,
+        });
+      }
+
+      const skillMatch = /^\/api\/skills\/([^/]+)$/.exec(pathname);
+      if (skillMatch?.[1] && request.method === "GET") {
+        const skillId = decodeURIComponent(skillMatch[1]);
+        const skills = await deps.skills.listSkills();
+        const metadata = skills.find((entry) => entry.id === skillId);
+        if (!metadata) {
+          return problemResponse({
+            type: "https://der.invalid/problems/skill-not-found",
+            title: "Skill not found",
+            status: 404,
+            detail: `Skill "${skillId}" does not exist in the catalog.`,
+            instance: pathname,
+            code: "skill.not_found",
+          });
+        }
+        const body = await deps.skills.readSkillBody(skillId);
+        return jsonResponse({ skill: metadata, body });
+      }
+
       if (pathname === "/api/bots") {
         if (request.method === "GET") {
           return jsonResponse({ bots: deps.store.listBots() });
@@ -151,6 +222,181 @@ export function createHttpHandler(deps: HttpRouterDeps): (request: Request) => P
           body as Parameters<SqliteStore["updateBot"]>[1],
         );
         return jsonResponse(updated);
+      }
+
+      const botMemoryMatch = /^\/api\/bots\/([^/]+)\/memory$/.exec(pathname);
+      if (botMemoryMatch?.[1]) {
+        const botId = decodeURIComponent(botMemoryMatch[1]);
+        if (!deps.store.getBot(botId)) {
+          return problemResponse({
+            type: "https://der.invalid/problems/bot-not-found",
+            title: "Bot not found",
+            status: 404,
+            detail: `Bot ${botId} does not exist.`,
+            instance: pathname,
+            code: "bot.not_found",
+          });
+        }
+
+        if (request.method === "GET") {
+          const version = parsePositiveIntParam(
+            url.searchParams.get("version"),
+            "version",
+            pathname,
+            1,
+            Number.MAX_SAFE_INTEGER,
+          );
+          const record = await deps.memory.read(botId, version);
+          if (version !== undefined && !record) {
+            return problemResponse({
+              type: "https://der.invalid/problems/memory-not-found",
+              title: "Memory version not found",
+              status: 404,
+              detail: `Memory version ${version} does not exist for bot ${botId}.`,
+              instance: pathname,
+              code: "memory.not_found",
+            });
+          }
+          const versions = deps.memory.listVersions(botId).map((entry) => ({
+            version: entry.version,
+            updatedAt: entry.updatedAt,
+          }));
+          return jsonResponse({
+            memory: record ?? null,
+            versions,
+          });
+        }
+
+        if (request.method === "PUT") {
+          const rawBody = await parseJsonBody(request, pathname);
+          const parsedBody = writeMemoryBodySchema.safeParse(rawBody);
+          if (!parsedBody.success) {
+            return problemResponse({
+              type: "https://der.invalid/problems/invalid-memory-write",
+              title: "Invalid memory payload",
+              status: 400,
+              detail: parsedBody.error.message,
+              instance: pathname,
+              code: "memory.invalid_input",
+            });
+          }
+          const written = await deps.memory.write({
+            botId,
+            markdown: parsedBody.data.markdown,
+            ...(parsedBody.data.expectedVersion !== undefined
+              ? { expectedVersion: parsedBody.data.expectedVersion }
+              : {}),
+          });
+          return jsonResponse({ memory: written });
+        }
+      }
+
+      const botRoutinesMatch = /^\/api\/bots\/([^/]+)\/routines$/.exec(pathname);
+      if (botRoutinesMatch?.[1]) {
+        const botId = decodeURIComponent(botRoutinesMatch[1]);
+        const bot = deps.store.getBot(botId);
+        if (!bot) {
+          return problemResponse({
+            type: "https://der.invalid/problems/bot-not-found",
+            title: "Bot not found",
+            status: 404,
+            detail: `Bot ${botId} does not exist.`,
+            instance: pathname,
+            code: "bot.not_found",
+          });
+        }
+
+        if (request.method === "GET") {
+          return jsonResponse({ routines: deps.routines.listRoutines(botId) });
+        }
+
+        if (request.method === "POST") {
+          const rawBody = await parseJsonBody(request, pathname);
+          const parsedBody = createRoutineBodySchema.safeParse(rawBody);
+          if (!parsedBody.success) {
+            return problemResponse({
+              type: "https://der.invalid/problems/invalid-routine",
+              title: "Invalid routine request",
+              status: 400,
+              detail: parsedBody.error.message,
+              instance: pathname,
+              code: "routine.invalid_input",
+            });
+          }
+
+          const session = deps.store.getSession(parsedBody.data.sessionId);
+          if (!session || session.botId !== botId) {
+            return problemResponse({
+              type: "https://der.invalid/problems/session-not-found",
+              title: "Session not found in bot scope",
+              status: 404,
+              detail: `Session ${parsedBody.data.sessionId} does not belong to bot ${botId}.`,
+              instance: pathname,
+              code: "session.not_found",
+            });
+          }
+
+          const routineId = parsedBody.data.id ?? `rt_${crypto.randomUUID()}`;
+          const resolvedEngine = parsedBody.data.engine ?? session.engine ?? bot.defaultEngine;
+          const configured = await deps.routineSchedule.configure(routineId, {
+            kind: "create",
+            botId,
+            sessionId: parsedBody.data.sessionId,
+            name: parsedBody.data.name,
+            cron: parsedBody.data.cron,
+            enabled: parsedBody.data.enabled,
+            engine: resolvedEngine,
+            prompt: parsedBody.data.prompt,
+          });
+          return jsonResponse(configured, 201);
+        }
+      }
+
+      const routineMatch = /^\/api\/routines\/([^/]+)$/.exec(pathname);
+      if (routineMatch?.[1]) {
+        const routineId = decodeURIComponent(routineMatch[1]);
+        if (request.method === "GET") {
+          const routine = deps.routines.getRoutine(routineId);
+          if (!routine) {
+            return problemResponse({
+              type: "https://der.invalid/problems/routine-not-found",
+              title: "Routine not found",
+              status: 404,
+              detail: `Routine ${routineId} does not exist.`,
+              instance: pathname,
+              code: "routine.not_found",
+            });
+          }
+          const slots = deps.routines.listSlots(routineId);
+          return jsonResponse({ routine, slots });
+        }
+
+        if (request.method === "PATCH") {
+          const rawBody = await parseJsonBody(request, pathname);
+          const parsedBody = updateRoutineBodySchema.safeParse(rawBody);
+          if (!parsedBody.success) {
+            return problemResponse({
+              type: "https://der.invalid/problems/invalid-routine",
+              title: "Invalid routine update",
+              status: 400,
+              detail: parsedBody.error.message,
+              instance: pathname,
+              code: "routine.invalid_input",
+            });
+          }
+          const updated = await deps.routineSchedule.configure(routineId, {
+            kind: "update",
+            ...(parsedBody.data.name !== undefined ? { name: parsedBody.data.name } : {}),
+            ...(parsedBody.data.cron !== undefined ? { cron: parsedBody.data.cron } : {}),
+            ...(parsedBody.data.enabled !== undefined ? { enabled: parsedBody.data.enabled } : {}),
+            ...(parsedBody.data.engine !== undefined ? { engine: parsedBody.data.engine } : {}),
+            ...(parsedBody.data.prompt !== undefined ? { prompt: parsedBody.data.prompt } : {}),
+            ...(parsedBody.data.expectedRevision !== undefined
+              ? { expectedRevision: parsedBody.data.expectedRevision }
+              : {}),
+          });
+          return jsonResponse(updated);
+        }
       }
 
       const botSessionsMatch = /^\/api\/bots\/([^/]+)\/sessions$/.exec(pathname);

@@ -1,0 +1,99 @@
+# Base Phase 1 deployment for der (Bun server + private Restate runtime).
+# Dedicated rootless Docker daemon prerequisites:
+#   1. Run a dedicated rootless Docker daemon on the host (e.g. `dockerd-rootless.sh`).
+#   2. Provision named engine shadow-home volumes on that rootless daemon:
+#      der-home-codex, der-home-claude-code, der-home-antigravity.
+#   3. Set DER_DOCKER_HOST (e.g. unix:///run/der-rootless/docker.sock) and bind-mount
+#      the rootless socket directory into the server container when enabling live engines.
+#   4. Never mount /var/run/docker.sock or host ~/.codex, ~/.claude, ~/.gemini into containers.
+
+services:
+  restate:
+    image: docker.restate.dev/restatedev/restate:1.8.1@sha256:6ed8ad9c7c09d64e7655c0debcb713e3cf5f875b26f700a74ad15640a72d6243
+    command: ["--no-logo"]
+    restart: unless-stopped
+    environment:
+      RESTATE_BASE_DIR: /restate-data
+      RESTATE_INGRESS__BIND_ADDRESS: 0.0.0.0:8080
+      RESTATE_ADMIN__BIND_ADDRESS: 0.0.0.0:9070
+      RESTATE_NODE_NAME: der-restate
+    volumes:
+      - der-restate-data:/restate-data
+    networks:
+      - der-internal
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:9070/health"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+      start_period: 3s
+
+  server:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.server
+      target: der-server
+    image: der-server:phase1
+    restart: unless-stopped
+    depends_on:
+      restate:
+        condition: service_healthy
+    ports:
+      - "127.0.0.1:${DER_HTTP_PORT:-3000}:3000"
+    environment:
+      DER_HOST: 0.0.0.0
+      DER_PORT: "3000"
+      DER_RESTATE_HOST: 0.0.0.0
+      DER_RESTATE_PORT: "9080"
+      DER_RESTATE_MODE: restate
+      DER_RESTATE_INGRESS_URL: http://restate:8080
+      DER_RESTATE_ADMIN_URL: http://restate:9070
+      DER_RESTATE_DEPLOYMENT_URL: http://server:9080
+      DER_RESTATE_AUTO_REGISTER: "true"
+      DER_DATABASE_PATH: /data/der.sqlite
+      DER_MEMORY_PROJECTION_DIR: /data/memory
+      DER_SKILLS_ROOT_DIR: /data/skills
+      DER_WORKSPACE_ROOT_DIR: /data/workspaces
+      DER_ALLOWED_ORIGINS: ${DER_ALLOWED_ORIGINS:-http://127.0.0.1:3000,http://localhost:3000,http://127.0.0.1:5173,http://localhost:5173}
+      DER_APPROVAL_TIMEOUT_MS: ${DER_APPROVAL_TIMEOUT_MS:-300000}
+      DER_DOCKER_HOST: ${DER_DOCKER_HOST:-}
+      DER_DOCKER_USER: ${DER_DOCKER_USER:-1000:1000}
+      DER_DOCKER_CPUS: ${DER_DOCKER_CPUS:-2}
+      DER_DOCKER_MEMORY_MB: ${DER_DOCKER_MEMORY_MB:-2048}
+      DER_DOCKER_PIDS_LIMIT: ${DER_DOCKER_PIDS_LIMIT:-256}
+      DER_ENGINE_IMAGE_CODEX: ${DER_ENGINE_IMAGE_CODEX:-der-engine-codex:latest}
+      DER_ENGINE_IMAGE_CLAUDE_CODE: ${DER_ENGINE_IMAGE_CLAUDE_CODE:-der-engine-claude-code:latest}
+      DER_ENGINE_IMAGE_ANTIGRAVITY: ${DER_ENGINE_IMAGE_ANTIGRAVITY:-der-engine-antigravity:latest}
+      DER_SEED_FIXTURE: ${DER_SEED_FIXTURE:-false}
+    volumes:
+      - der-sqlite-data:/data
+      - ${DER_SKILLS_HOST_DIR:-./docker/skills}:/data/skills:ro
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    networks:
+      - der-internal
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "bun",
+          "-e",
+          "const r = await fetch('http://127.0.0.1:3000/healthz'); if (!r.ok) process.exit(1);",
+        ]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+      start_period: 5s
+
+networks:
+  der-internal:
+    driver: bridge
+
+volumes:
+  der-sqlite-data:
+  der-restate-data:
+  der-home-codex:
+  der-home-claude-code:
+  der-home-antigravity:

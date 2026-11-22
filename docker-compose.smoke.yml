@@ -1,0 +1,22 @@
+# Isolated live Phase 1 smoke overlay.
+# Invoked by scripts/smoke-phase-one.sh under a unique COMPOSE_PROJECT_NAME so cleanup
+# touches only the isolated smoke project's containers, networks, and volumes.
+
+services:
+  server:
+    ports: !override
+      - "127.0.0.1:${DER_SMOKE_HTTP_PORT:-13000}:3000"
+    environment:
+      DER_SEED_FIXTURE: "true"
+      DER_ENABLED_ENGINES: fixture,codex,claude-code,antigravity
+      DER_APPROVAL_TIMEOUT_MS: "120000"
+      DER_SSE_POLL_INTERVAL_MS: "20"
+      DER_DOCKER_HOST: ${DER_SMOKE_DOCKER_HOST:-unix:///run/der-rootless/docker.sock}
+      DER_ALLOWED_ORIGINS: http://127.0.0.1:${DER_SMOKE_HTTP_PORT:-13000},http://localhost:${DER_SMOKE_HTTP_PORT:-13000}
+    volumes: !override
+      - der-sqlite-data:/data
+      - ${DER_SMOKE_SKILLS_DIR:-./docker/skills}:/data/skills:ro
+      - ${DER_SMOKE_ROOTLESS_RUN_DIR:-./docker/skills}:/run/der-rootless
+    security_opt: !override
+      - no-new-privileges:true
+      - label:disable

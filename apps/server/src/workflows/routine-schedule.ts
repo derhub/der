@@ -710,3 +710,253 @@ export function createRoutineScheduleClient(ingressUrl: string): RoutineSchedule
     },
   };
 }
+
+export interface DirectRoutineScheduleDeps {
+  readonly store: SqliteStore;
+  readonly routines: SqliteRoutines;
+  readonly engines: ReadonlyMap<EngineKind, Engine>;
+  readonly admitRun: (input: {
+    readonly botId: BotId;
+    readonly sessionId: SessionId;
+    readonly engine: EngineKind;
+    readonly routineId: RoutineId;
+    readonly routineSlot: UtcTimestamp;
+    readonly prompt: string;
+  }) => Promise<{ readonly runId: RunId }>;
+  readonly now?: () => Date;
+}
+
+export function createDirectRoutineScheduleClient(
+  deps: DirectRoutineScheduleDeps,
+): RoutineScheduleClient {
+  const scheduledSlots = new Map<RoutineId, UtcTimestamp | null>();
+
+  return {
+    async configure(
+      routineId: RoutineId,
+      input: ConfigureRoutineInput,
+    ): Promise<ConfigureRoutineResult> {
+      let routine: Routine;
+      if (input.kind === "create") {
+        parseUtcCron(input.cron, `/api/bots/${input.botId}/routines`);
+        if (input.enabled) {
+          const eligibility = await checkUnattendedEligibility(deps.engines, input.engine);
+          if (!eligibility.eligible) {
+            throw new DomainError({
+              type: "https://der.invalid/problems/routine-engine-ineligible",
+              title: "Engine is not eligible for unattended schedules",
+              status: 409,
+              detail:
+                eligibility.reason ??
+                `Engine "${input.engine}" is not eligible for scheduled execution.`,
+              instance: `/api/bots/${input.botId}/routines`,
+              code: "routine.engine_ineligible",
+            });
+          }
+        }
+        routine = await deps.routines.createRoutine({
+          id: routineId,
+          botId: input.botId,
+          sessionId: input.sessionId,
+          name: input.name,
+          cron: input.cron,
+          enabled: input.enabled,
+          engine: input.engine,
+          prompt: input.prompt,
+        });
+      } else {
+        const existing = deps.routines.getRoutine(routineId);
+        if (!existing) {
+          throw new DomainError({
+            type: "https://der.invalid/problems/routine-not-found",
+            title: "Routine not found",
+            status: 404,
+            detail: `Routine ${routineId} does not exist.`,
+            instance: `/api/routines/${routineId}`,
+            code: "routine.not_found",
+          });
+        }
+        const targetCron = input.cron ?? existing.cron;
+        const targetEngine = input.engine ?? existing.engine;
+        const targetEnabled = input.enabled ?? existing.enabled;
+        parseUtcCron(targetCron, `/api/routines/${routineId}`);
+        if (targetEnabled) {
+          const eligibility = await checkUnattendedEligibility(deps.engines, targetEngine);
+          if (!eligibility.eligible) {
+            throw new DomainError({
+              type: "https://der.invalid/problems/routine-engine-ineligible",
+              title: "Engine is not eligible for unattended schedules",
+              status: 409,
+              detail:
+                eligibility.reason ??
+                `Engine "${targetEngine}" is not eligible for scheduled execution.`,
+              instance: `/api/routines/${routineId}`,
+              code: "routine.engine_ineligible",
+            });
+          }
+        }
+        routine = await deps.routines.updateRoutine(routineId, {
+          ...(input.name !== undefined ? { name: input.name } : {}),
+          ...(input.cron !== undefined ? { cron: input.cron } : {}),
+          ...(input.enabled !== undefined ? { enabled: input.enabled } : {}),
+          ...(input.engine !== undefined ? { engine: input.engine } : {}),
+          ...(input.prompt !== undefined ? { prompt: input.prompt } : {}),
+          ...(input.expectedRevision !== undefined
+            ? { expectedRevision: input.expectedRevision }
+            : {}),
+        });
+      }
+
+      if (!routine.enabled) {
+        scheduledSlots.set(routine.id, null);
+        return { routine, nextSlot: null };
+      }
+
+      const nowMs = (deps.now ?? deps.store.database.now)().getTime();
+      const nextSlot = nextUtcSlotAfter(routine.cron, nowMs) ?? null;
+      scheduledSlots.set(routine.id, nextSlot);
+      return { routine, nextSlot };
+    },
+
+    async tick(routineId: RoutineId, input: RoutineTickInput): Promise<RoutineTickResult> {
+      const routine = deps.routines.getRoutine(routineId);
+      if (!routine || input.revision !== routine.revision) {
+        return {
+          routineId,
+          revision: input.revision,
+          disposition: "skipped_obsolete_revision",
+          slot: input.scheduledSlot ?? null,
+          runId: null,
+          nextSlot: null,
+        };
+      }
+      if (!routine.enabled) {
+        return {
+          routineId,
+          revision: input.revision,
+          disposition: "disabled",
+          slot: input.scheduledSlot ?? null,
+          runId: null,
+          nextSlot: null,
+        };
+      }
+
+      const nowMs =
+        input.nowOverride !== undefined
+          ? Date.parse(input.nowOverride)
+          : (deps.now ?? deps.store.database.now)().getTime();
+      const latestRecorded = deps.routines.getLatestSlot(routine.id);
+      const afterExclusiveMs = latestRecorded
+        ? Date.parse(latestRecorded.slot)
+        : input.scheduledSlot !== undefined
+          ? Date.parse(input.scheduledSlot) - 1000
+          : Date.parse(routine.updatedAt) - 1000;
+
+      const dueSlot = resolveLatestDueUtcSlot(routine.cron, nowMs, afterExclusiveMs);
+      if (!dueSlot) {
+        const nextSlot = nextUtcSlotAfter(routine.cron, nowMs) ?? null;
+        scheduledSlots.set(routine.id, nextSlot);
+        return {
+          routineId,
+          revision: routine.revision,
+          disposition: "not_due",
+          slot: null,
+          runId: null,
+          nextSlot,
+        };
+      }
+
+      const existingSlot = deps.routines.getSlot(routine.id, dueSlot);
+      if (existingSlot) {
+        const nextSlot =
+          nextUtcSlotAfter(routine.cron, Math.max(nowMs, Date.parse(dueSlot))) ?? null;
+        scheduledSlots.set(routine.id, nextSlot);
+        return {
+          routineId,
+          revision: routine.revision,
+          disposition: "already_recorded",
+          slot: existingSlot.slot,
+          runId: existingSlot.runId,
+          nextSlot,
+        };
+      }
+
+      const eligibility = await checkUnattendedEligibility(deps.engines, routine.engine);
+      if (!eligibility.eligible) {
+        const recorded = await deps.routines.recordSlot({
+          routineId: routine.id,
+          slot: dueSlot,
+          revision: routine.revision,
+          disposition: "blocked_ineligible",
+          runId: null,
+        });
+        const nextSlot =
+          nextUtcSlotAfter(routine.cron, Math.max(nowMs, Date.parse(dueSlot))) ?? null;
+        scheduledSlots.set(routine.id, nextSlot);
+        return {
+          routineId,
+          revision: routine.revision,
+          disposition: recorded.slot.disposition,
+          slot: dueSlot,
+          runId: null,
+          nextSlot,
+        };
+      }
+
+      if (deps.routines.hasActiveRun(routine.sessionId)) {
+        const skipped = await deps.routines.recordSlot({
+          routineId: routine.id,
+          slot: dueSlot,
+          revision: routine.revision,
+          disposition: "skipped_active_run",
+          runId: null,
+        });
+        const nextSlot =
+          nextUtcSlotAfter(routine.cron, Math.max(nowMs, Date.parse(dueSlot))) ?? null;
+        scheduledSlots.set(routine.id, nextSlot);
+        return {
+          routineId,
+          revision: routine.revision,
+          disposition: skipped.slot.disposition,
+          slot: dueSlot,
+          runId: null,
+          nextSlot,
+        };
+      }
+
+      const admitted = await deps.admitRun({
+        botId: routine.botId,
+        sessionId: routine.sessionId,
+        engine: routine.engine,
+        routineId: routine.id,
+        routineSlot: dueSlot,
+        prompt: routine.prompt,
+      });
+      const recorded = await deps.routines.recordSlot({
+        routineId: routine.id,
+        slot: dueSlot,
+        revision: routine.revision,
+        disposition: "admitted",
+        runId: admitted.runId,
+      });
+      const nextSlot = nextUtcSlotAfter(routine.cron, Math.max(nowMs, Date.parse(dueSlot))) ?? null;
+      scheduledSlots.set(routine.id, nextSlot);
+      return {
+        routineId,
+        revision: routine.revision,
+        disposition: recorded.slot.disposition,
+        slot: dueSlot,
+        runId: recorded.slot.runId,
+        nextSlot,
+      };
+    },
+
+    async inspect(routineId: RoutineId) {
+      const routine = deps.routines.getRoutine(routineId);
+      return {
+        revision: routine?.revision ?? null,
+        scheduledSlot: scheduledSlots.get(routineId) ?? null,
+      };
+    },
+  };
+}

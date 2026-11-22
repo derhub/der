@@ -1,0 +1,52 @@
+# syntax=docker/dockerfile:1.7
+
+FROM node:22-bookworm-slim@sha256:e9f565d32859f0cbfb52125eafe8be39390f24dac302dc3cdf566e8ba3ab21ee AS der-engine-base
+
+RUN mkdir -p /home/engine /workspace \
+  && chown -R 1000:1000 /home/engine /workspace
+
+ENV HOME=/home/engine \
+    NPM_CONFIG_UPDATE_NOTIFIER=false \
+    NPM_CONFIG_FUND=false
+
+WORKDIR /workspace
+
+FROM der-engine-base AS der-engine-codex
+ARG CODEX_CLI_VERSION=0.171.0
+RUN npm install -g "@openai/codex@${CODEX_CLI_VERSION}" \
+  && mkdir -p /home/engine/.codex \
+  && chown -R 1000:1000 /home/engine \
+  && codex --version
+ENV HOME=/home/engine \
+    CODEX_HOME=/home/engine/.codex
+USER 1000:1000
+WORKDIR /workspace
+
+FROM der-engine-base AS der-engine-claude-code
+ARG CLAUDE_CODE_VERSION=2.1.330
+RUN npm install -g "@anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}" \
+  && mkdir -p /home/engine/.claude \
+  && chown -R 1000:1000 /home/engine \
+  && claude --version
+ENV HOME=/home/engine \
+    CLAUDE_CONFIG_DIR=/home/engine/.claude
+USER 1000:1000
+WORKDIR /workspace
+
+FROM der-engine-base AS der-engine-antigravity
+ARG AGY_CLI_URL=""
+ARG AGY_CLI_SHA256=""
+RUN mkdir -p /home/engine/.config /home/engine/.local/share /home/engine/.antigravity /home/engine/.gemini \
+  && if [ -n "${AGY_CLI_URL}" ]; then \
+       test -n "${AGY_CLI_SHA256}"; \
+       node -e 'import("node:fs/promises").then(async (fs) => { const res = await fetch(process.env.AGY_CLI_URL); if (!res.ok) throw new Error(`HTTP ${res.status}`); await fs.writeFile("/usr/local/bin/agy", Buffer.from(await res.arrayBuffer())); });'; \
+       echo "${AGY_CLI_SHA256}  /usr/local/bin/agy" | sha256sum -c -; \
+       chmod 0755 /usr/local/bin/agy; \
+       agy --version; \
+     fi \
+  && chown -R 1000:1000 /home/engine
+ENV HOME=/home/engine \
+    XDG_CONFIG_HOME=/home/engine/.config \
+    XDG_DATA_HOME=/home/engine/.local/share
+USER 1000:1000
+WORKDIR /workspace

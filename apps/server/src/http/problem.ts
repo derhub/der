@@ -35,6 +35,14 @@ export function jsonResponse(body: unknown, status = 200): Response {
   });
 }
 
+function originFromReferer(referer: string): string | null {
+  try {
+    return new URL(referer).origin;
+  } catch {
+    return null;
+  }
+}
+
 export function enforceSameOrigin(
   request: Request,
   allowedOrigins: readonly string[],
@@ -43,20 +51,63 @@ export function enforceSameOrigin(
   if (request.method === "GET" || request.method === "HEAD") {
     return undefined;
   }
+
   const origin = request.headers.get("origin");
-  if (origin === null) {
-    return undefined;
+  if (origin !== null) {
+    if (!allowedOrigins.includes(origin)) {
+      return problemResponse({
+        type: "https://der.invalid/problems/origin-forbidden",
+        title: "Origin not allowed",
+        status: 403,
+        detail: `Origin "${origin}" is not permitted for mutating requests.`,
+        instance,
+        code: "http.origin_forbidden",
+      });
+    }
+  } else {
+    const referer = request.headers.get("referer");
+    if (referer !== null) {
+      const refOrigin = originFromReferer(referer);
+      if (refOrigin === null || !allowedOrigins.includes(refOrigin)) {
+        return problemResponse({
+          type: "https://der.invalid/problems/origin-forbidden",
+          title: "Origin not allowed",
+          status: 403,
+          detail: `Referer origin "${refOrigin ?? referer}" is not permitted for mutating requests.`,
+          instance,
+          code: "http.origin_forbidden",
+        });
+      }
+    }
+
+    const fetchSite = request.headers.get("sec-fetch-site")?.trim().toLowerCase();
+    if (fetchSite === "cross-site") {
+      return problemResponse({
+        type: "https://der.invalid/problems/origin-forbidden",
+        title: "Origin not allowed",
+        status: 403,
+        detail: "Cross-site mutating requests are not permitted.",
+        instance,
+        code: "http.origin_forbidden",
+      });
+    }
   }
-  if (!allowedOrigins.includes(origin)) {
-    return problemResponse({
-      type: "https://der.invalid/problems/origin-forbidden",
-      title: "Origin not allowed",
-      status: 403,
-      detail: `Origin "${origin}" is not permitted for mutating requests.`,
-      instance,
-      code: "http.origin_forbidden",
-    });
+
+  if (request.method === "POST" || request.method === "PUT" || request.method === "PATCH") {
+    const contentType = request.headers.get("content-type");
+    const mediaType = contentType?.split(";")[0]?.trim().toLowerCase();
+    if (mediaType !== "application/json") {
+      return problemResponse({
+        type: "https://der.invalid/problems/unsupported-media-type",
+        title: "Unsupported media type",
+        status: 415,
+        detail: "Mutating JSON endpoints require Content-Type: application/json.",
+        instance,
+        code: "http.unsupported_media_type",
+      });
+    }
   }
+
   return undefined;
 }
 

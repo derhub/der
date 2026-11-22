@@ -17,6 +17,25 @@ export {
   type RunWorkflowDefinition,
 } from "./restate-workflows";
 export {
+  checkUnattendedEligibility,
+  createDirectRoutineScheduleClient,
+  createRoutineScheduleClient,
+  createRoutineScheduleObject,
+  nextUtcSlotAfter,
+  parseUtcCron,
+  resolveLatestDueUtcSlot,
+  type ConfigureRoutineInput,
+  type ConfigureRoutineResult,
+  type DirectRoutineScheduleDeps,
+  type RoutineScheduleClient,
+  type RoutineScheduleDeps,
+  type RoutineScheduleObjectDefinition,
+  type RoutineTickDisposition,
+  type RoutineTickInput,
+  type RoutineTickResult,
+  type UnattendedEligibilityResult,
+} from "./routine-schedule";
+export {
   executeApprovedEffectStep,
   executeEnginePreApprovalStage,
   finalizeCompletedWithEffectStep,
