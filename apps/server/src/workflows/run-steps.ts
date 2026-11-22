@@ -64,6 +64,11 @@ export type PreApprovalStageResult =
       readonly finalMessageParts?: readonly MessagePart[];
     }
   | {
+      readonly kind: "interrupted";
+      readonly effectId?: EffectId;
+      readonly detail: string;
+    }
+  | {
       readonly kind: "failed";
       readonly code: string;
       readonly detail: string;
@@ -139,49 +144,107 @@ export async function executeEnginePreApprovalStage(
     readonly isTerminal?: boolean;
   }[] = [];
 
+  const readInterruptedStage = (fallbackDetail?: string): PreApprovalStageResult | undefined => {
+    const currentRun = deps.store.getRun(run.id);
+    if (currentRun?.status !== "interrupted") {
+      return undefined;
+    }
+    const checkpoint =
+      currentRun.checkpoint !== null &&
+      typeof currentRun.checkpoint === "object" &&
+      !Array.isArray(currentRun.checkpoint)
+        ? (currentRun.checkpoint as Record<string, unknown>)
+        : undefined;
+    const effectId =
+      typeof checkpoint?.["interruptedEffectId"] === "string"
+        ? checkpoint["interruptedEffectId"]
+        : undefined;
+    return {
+      kind: "interrupted",
+      ...(effectId !== undefined ? { effectId } : {}),
+      detail: fallbackDetail ?? "Run interrupted due to uncertain host-tool effect outcome.",
+    };
+  };
+
   const flush = async () => {
     if (pendingChunks.length === 0) {
+      return;
+    }
+    if (deps.store.getRun(run.id)?.status === "interrupted") {
+      pendingChunks.length = 0;
       return;
     }
     const batch = pendingChunks.splice(0, pendingChunks.length);
     await deps.store.appendRunEvents(run.id, batch);
   };
 
-  for await (const event of engine.run(run)) {
-    if (event.type === "chunk") {
-      pendingChunks.push({
-        chunkKey: event.chunkKey,
-        chunk: event.chunk,
-        ...(event.isTerminal !== undefined ? { isTerminal: event.isTerminal } : {}),
-      });
-      if (pendingChunks.length >= batchSize) {
-        await flush();
+  try {
+    for await (const event of engine.run(run)) {
+      const interrupted = readInterruptedStage();
+      if (interrupted) {
+        return interrupted;
       }
-      continue;
-    }
 
-    await flush();
+      if (event.type === "chunk") {
+        pendingChunks.push({
+          chunkKey: event.chunkKey,
+          chunk: event.chunk,
+          ...(event.isTerminal !== undefined ? { isTerminal: event.isTerminal } : {}),
+        });
+        if (pendingChunks.length >= batchSize) {
+          await flush();
+        }
+        continue;
+      }
 
-    if (event.type === "approval_required") {
+      await flush();
+
+      if (event.type === "approval_required") {
+        return {
+          kind: "approval_required",
+          effect: event.effect,
+          prompt: event.prompt,
+        };
+      }
+
+      if (event.type === "completed") {
+        const postInterrupted = readInterruptedStage();
+        if (postInterrupted) {
+          return postInterrupted;
+        }
+        return {
+          kind: "completed",
+          ...(event.finalMessage ? { finalMessageParts: event.finalMessage.parts } : {}),
+        };
+      }
+
+      const failInterrupted = readInterruptedStage(event.detail);
+      if (failInterrupted) {
+        return failInterrupted;
+      }
       return {
-        kind: "approval_required",
-        effect: event.effect,
-        prompt: event.prompt,
+        kind: "failed",
+        code: event.code,
+        detail: event.detail,
       };
     }
-
-    if (event.type === "completed") {
+  } catch (error) {
+    const interrupted = readInterruptedStage(error instanceof Error ? error.message : undefined);
+    if (interrupted) {
+      return interrupted;
+    }
+    if (error instanceof UncertainEffectError) {
       return {
-        kind: "completed",
-        ...(event.finalMessage ? { finalMessageParts: event.finalMessage.parts } : {}),
+        kind: "interrupted",
+        detail: error.message,
       };
     }
+    throw error;
+  }
 
-    return {
-      kind: "failed",
-      code: event.code,
-      detail: event.detail,
-    };
+  const endInterrupted = readInterruptedStage();
+  if (endInterrupted) {
+    return endInterrupted;
   }
 
   await flush();
@@ -281,7 +344,7 @@ function toolResultToJson(result: ToolResult): JsonValue {
 }
 
 export async function executeApprovedEffectStep(
-  deps: WorkflowDeps,
+  deps: Pick<WorkflowDeps, "store" | "tools" | "reconcileEffect">,
   input: {
     readonly run: Run;
     readonly approvalId: ApprovalId;
@@ -464,7 +527,7 @@ export async function finalizeRejectedApprovalStep(
 }
 
 export async function finalizeInterruptedUncertainStep(
-  deps: WorkflowDeps,
+  deps: Pick<WorkflowDeps, "store">,
   input: {
     readonly run: Run;
     readonly effectId: EffectId;
@@ -501,6 +564,38 @@ export async function finalizeDirectRunStep(
     readonly outcome: Exclude<PreApprovalStageResult, { readonly kind: "approval_required" }>;
   },
 ): Promise<Run> {
+  const current = deps.store.getRun(input.run.id);
+  if (current?.status === "interrupted") {
+    return current;
+  }
+
+  if (input.outcome.kind === "interrupted") {
+    const finished = await deps.store.finishRun({
+      runId: input.run.id,
+      status: "interrupted",
+      terminalEvent: {
+        chunkKey: `${input.run.id}:terminal`,
+        chunk: {
+          type: "RUN_ERROR",
+          message: input.outcome.detail,
+          code: "effect.outcome_uncertain",
+          runId: input.run.id,
+          threadId: input.run.sessionId,
+        },
+      },
+      detail: input.outcome.detail,
+      ...(input.outcome.effectId !== undefined
+        ? {
+            checkpoint: {
+              interruptedEffectId: input.outcome.effectId,
+              recordedAt: formatUtcTimestamp(deps.store.database.now()),
+            },
+          }
+        : {}),
+    });
+    return finished.run;
+  }
+
   if (input.outcome.kind === "completed") {
     const finished = await deps.store.finishRun({
       runId: input.run.id,

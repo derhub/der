@@ -102,6 +102,9 @@ import {
   createRestateWorkflowClient,
   createRoutineScheduleClient,
   createRoutineScheduleObject,
+  executeApprovedEffectStep,
+  finalizeInterruptedUncertainStep,
+  UncertainEffectError,
   type AnyRestateService,
   type ConfigureRoutineInput,
   type ConfigureRoutineResult,
@@ -414,12 +417,14 @@ function createShadowHomeAuthProbe(
   };
 }
 
-async function buildEngineHostTools(
-  run: Run,
-  tools: Tools,
-  approvalBroker: ApprovalBroker,
-): Promise<Array<AnyTool>> {
-  const descriptors = tools.list ? await tools.list() : [];
+export async function buildEngineHostTools(input: {
+  readonly run: Run;
+  readonly store: SqliteStore;
+  readonly tools: Tools;
+  readonly approvalBroker: ApprovalBroker;
+  readonly reconcileEffect?: (effect: EffectIdentity) => Promise<ToolResult | undefined>;
+}): Promise<Array<AnyTool>> {
+  const descriptors = input.tools.list ? await input.tools.list() : [];
   let toolCallSeq = 0;
 
   return descriptors.map((descriptor): AnyTool => ({
@@ -436,15 +441,15 @@ async function buildEngineHostTools(
         toolCallSeq,
       });
       const effect: EffectIdentity = {
-        runId: run.id,
+        runId: input.run.id,
         operationKind: descriptor.kind,
         operationId: descriptor.id,
         canonicalArguments,
-        attemptId: `${run.id}:tool:${toolCallSeq}:${fingerprint}`,
+        attemptId: `${input.run.id}:tool:${toolCallSeq}:${fingerprint}`,
       };
 
       if (descriptor.requiresApproval) {
-        const decision = await approvalBroker.requestApproval({
+        const decision = await input.approvalBroker.requestApproval({
           effect,
           prompt: `Approve host tool ${descriptor.id}?`,
           signal: ctx?.signal ?? new AbortController().signal,
@@ -457,9 +462,34 @@ async function buildEngineHostTools(
               : `Operator denied host tool "${descriptor.id}".`,
           );
         }
+
+        const stepOutcome = await executeApprovedEffectStep(
+          {
+            store: input.store,
+            tools: input.tools,
+            ...(input.reconcileEffect ? { reconcileEffect: input.reconcileEffect } : {}),
+          },
+          {
+            run: input.run,
+            approvalId: decision.approvalId,
+            effect,
+          },
+        );
+        if (stepOutcome.kind === "uncertain") {
+          await finalizeInterruptedUncertainStep(
+            { store: input.store },
+            {
+              run: input.run,
+              effectId: stepOutcome.effectId,
+              detail: stepOutcome.detail,
+            },
+          );
+          throw new UncertainEffectError(stepOutcome.detail);
+        }
+        return stepOutcome.toolResult;
       }
 
-      return tools.invoke({ effect });
+      return input.tools.invoke({ effect });
     },
   }));
 }
@@ -470,6 +500,7 @@ function createContextLoader(input: {
   readonly skills: SkillCatalog;
   readonly getTools: () => Tools;
   readonly getWorkflow: () => DurableWorkflow;
+  readonly reconcileEffect?: (effect: EffectIdentity) => Promise<ToolResult | undefined>;
   readonly maxTokens: number;
 }): LoadEngineRunInput {
   return async (run: Run) => {
@@ -513,7 +544,13 @@ function createContextLoader(input: {
       },
     };
 
-    const hostTools = await buildEngineHostTools(run, input.getTools(), approvalBroker);
+    const hostTools = await buildEngineHostTools({
+      run,
+      store: input.store,
+      tools: input.getTools(),
+      approvalBroker,
+      ...(input.reconcileEffect ? { reconcileEffect: input.reconcileEffect } : {}),
+    });
 
     return {
       messages: [...built.messages],
@@ -534,11 +571,13 @@ function buildOfficialEngine(input: {
 }): Engine {
   const shadowHome = DEFAULT_ENGINE_SHADOW_HOMES[input.kind];
   const network: DockerNetworkPolicy =
-    input.config.dockerEgressNetwork !== undefined
+    input.config.dockerEgressNetwork !== undefined &&
+    input.config.dockerEgressProxyUrl !== undefined
       ? {
           mode: "scoped_egress",
           networkName: input.config.dockerEgressNetwork,
           allowedHosts: APPROVED_VENDOR_EGRESS[input.kind],
+          egressProxyUrl: input.config.dockerEgressProxyUrl,
         }
       : { mode: "none" };
 
@@ -682,6 +721,7 @@ export function startServer(options: CreateServerOptions = {}): RunningServer {
     skills,
     getTools: () => tools,
     getWorkflow: () => workflow,
+    ...(options.reconcileEffect ? { reconcileEffect: options.reconcileEffect } : {}),
     maxTokens: config.contextMaxTokens,
   });
 
@@ -734,11 +774,12 @@ export function startServer(options: CreateServerOptions = {}): RunningServer {
       workspaceHostPath,
       allowedWorkspaceRoots: [workspaceHostPath],
       shadowHome: DEFAULT_ENGINE_SHADOW_HOMES.codex,
-      ...(config.dockerEgressNetwork !== undefined
+      ...(config.dockerEgressNetwork !== undefined && config.dockerEgressProxyUrl !== undefined
         ? {
             egressNetwork: {
               networkName: config.dockerEgressNetwork,
               allowedHosts: APPROVED_VENDOR_EGRESS.codex,
+              egressProxyUrl: config.dockerEgressProxyUrl,
             },
           }
         : {}),

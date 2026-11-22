@@ -281,17 +281,33 @@ export function createCommandsService(deps: WorkflowDeps, runWorkflow: RunWorkfl
 
         const persisted = await ctx.run("persist-engine-approval", async () => {
           try {
-            return await persistPendingApprovalStep(deps, {
+            const result = await persistPendingApprovalStep(deps, {
               run: input.run,
               effect: input.effect,
               prompt: input.prompt,
               awakeable: awakeable.id,
               deadline,
             });
+            const existing = deps.store.getApproval(result.approvalId);
+            return {
+              ...result,
+              existingStatus:
+                existing && existing.decision.status !== "pending"
+                  ? existing.decision.status
+                  : undefined,
+            };
           } catch (error) {
             toRestateTerminalError(error);
           }
         });
+
+        if (persisted.existingStatus !== undefined) {
+          return {
+            status: persisted.existingStatus,
+            approvalId: persisted.approvalId,
+            effect: input.effect,
+          };
+        }
 
         let decisionStatus: "approved" | "denied" | "expired";
         try {

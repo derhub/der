@@ -1,4 +1,6 @@
-import { describe, expect, it } from "bun:test";
+import { afterEach, describe, expect, it } from "bun:test";
+import { mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync } from "node:fs";
+import { join } from "node:path";
 import {
   buildDockerRunArgs,
   createDockerSandbox,
@@ -14,6 +16,17 @@ import {
   type CommandSpawnHandle,
   type DockerContainerSpec,
 } from "../../src/sandbox/index";
+
+const tempDirs: string[] = [];
+
+afterEach(() => {
+  while (tempDirs.length > 0) {
+    const dir = tempDirs.pop();
+    if (dir) {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }
+});
 
 interface RecordedCommand {
   readonly command: string;
@@ -104,6 +117,8 @@ function createFakeSpawnHandle(input: {
   };
 }
 
+const identityRealPath = (path: string): string => path;
+
 function validContainerSpec(overrides?: Partial<DockerContainerSpec>): DockerContainerSpec {
   return {
     containerName: "der-codex-run-1",
@@ -123,6 +138,7 @@ function validContainerSpec(overrides?: Partial<DockerContainerSpec>): DockerCon
       pidsLimit: 256,
     },
     dockerHost: "unix:///run/user/1000/docker.sock",
+    resolveRealPath: identityRealPath,
     ...overrides,
   };
 }
@@ -162,7 +178,7 @@ describe("validate and build hardened Docker launch controls", () => {
     ]);
   });
 
-  it("supports scoped egress using an explicit isolated egress network and approved vendor endpoints", () => {
+  it("supports scoped egress using an explicit isolated egress network, egress proxy URL, and approved vendor endpoints", () => {
     const spec = validContainerSpec({
       engine: "claude-code",
       shadowHome: DEFAULT_ENGINE_SHADOW_HOMES["claude-code"],
@@ -170,6 +186,7 @@ describe("validate and build hardened Docker launch controls", () => {
         mode: "scoped_egress",
         networkName: "der-egress-claude",
         allowedHosts: ["api.anthropic.com"],
+        egressProxyUrl: "http://egress-proxy:3128",
       },
     });
     const args = buildDockerRunArgs(spec, { detach: true, command: ["sleep", "infinity"] });
@@ -177,6 +194,8 @@ describe("validate and build hardened Docker launch controls", () => {
     expect(args).toContain("--network=der-egress-claude");
     expect(args).toContain("type=volume,source=der-home-claude-code,target=/home/engine");
     expect(args).toContain("CLAUDE_CONFIG_DIR=/home/engine/.claude");
+    expect(args).toContain("HTTP_PROXY=http://egress-proxy:3128");
+    expect(args).toContain("HTTPS_PROXY=http://egress-proxy:3128");
   });
 
   it("assigns distinct named shadow-home volumes to codex, claude-code, and antigravity", () => {
@@ -245,7 +264,12 @@ describe("validate and build hardened Docker launch controls", () => {
     {
       name: "host network mode in scoped egress",
       spec: validContainerSpec({
-        network: { mode: "scoped_egress", networkName: "host", allowedHosts: ["api.openai.com"] },
+        network: {
+          mode: "scoped_egress",
+          networkName: "host",
+          allowedHosts: ["api.openai.com"],
+          egressProxyUrl: "http://egress-proxy:3128",
+        },
       }),
       expectedCode: "docker.host_network_forbidden",
     },
@@ -256,6 +280,7 @@ describe("validate and build hardened Docker launch controls", () => {
           mode: "scoped_egress",
           networkName: "default",
           allowedHosts: ["api.openai.com"],
+          egressProxyUrl: "http://egress-proxy:3128",
         },
       }),
       expectedCode: "docker.host_network_forbidden",
@@ -267,9 +292,34 @@ describe("validate and build hardened Docker launch controls", () => {
           mode: "scoped_egress",
           networkName: "container:other",
           allowedHosts: ["api.openai.com"],
+          egressProxyUrl: "http://egress-proxy:3128",
         },
       }),
       expectedCode: "docker.host_network_forbidden",
+    },
+    {
+      name: "missing egressProxyUrl in scoped egress",
+      spec: validContainerSpec({
+        network: {
+          mode: "scoped_egress",
+          networkName: "der-egress-codex",
+          allowedHosts: ["api.openai.com"],
+          egressProxyUrl: "",
+        },
+      }),
+      expectedCode: "docker.egress_network_unverified",
+    },
+    {
+      name: "non-http egressProxyUrl in scoped egress",
+      spec: validContainerSpec({
+        network: {
+          mode: "scoped_egress",
+          networkName: "der-egress-codex",
+          allowedHosts: ["api.openai.com"],
+          egressProxyUrl: "file:///etc/passwd",
+        },
+      }),
+      expectedCode: "docker.egress_network_unverified",
     },
     {
       name: "empty allowedHosts in scoped egress",
@@ -278,6 +328,7 @@ describe("validate and build hardened Docker launch controls", () => {
           mode: "scoped_egress",
           networkName: "der-egress-codex",
           allowedHosts: [],
+          egressProxyUrl: "http://egress-proxy:3128",
         },
       }),
       expectedCode: "docker.egress_host_not_approved",
@@ -315,6 +366,7 @@ describe("validate and build hardened Docker launch controls", () => {
           mode: "scoped_egress",
           networkName: "der-egress-codex",
           allowedHosts: ["evil.example.com"],
+          egressProxyUrl: "http://egress-proxy:3128",
         },
       }),
       expectedCode: "docker.egress_host_not_approved",
@@ -446,6 +498,7 @@ describe("provide a hardened @tanstack/ai-sandbox handle and @der/domain Sandbox
       network: { mode: "none" },
       limits: { cpus: 2, memoryMb: 1024, pidsLimit: 256 },
       runner,
+      resolveRealPath: identityRealPath,
     });
 
     expect(provider.capabilities()).toMatchObject({
@@ -499,6 +552,7 @@ describe("provide a hardened @tanstack/ai-sandbox handle and @der/domain Sandbox
       network: { mode: "none" },
       limits: { cpus: 2, memoryMb: 1024, pidsLimit: 256 },
       runner,
+      resolveRealPath: identityRealPath,
     });
 
     let caught: unknown;
@@ -543,6 +597,7 @@ describe("provide a hardened @tanstack/ai-sandbox handle and @der/domain Sandbox
       limits: { cpus: 1, memoryMb: 512, pidsLimit: 128 },
       runner,
       now: () => 1000,
+      resolveRealPath: identityRealPath,
     });
 
     const result = await sandbox.execute({
@@ -596,6 +651,7 @@ describe("provide a hardened @tanstack/ai-sandbox handle and @der/domain Sandbox
       shadowHome: DEFAULT_ENGINE_SHADOW_HOMES.codex,
       limits: { cpus: 1, memoryMb: 512, pidsLimit: 128 },
       runner,
+      resolveRealPath: identityRealPath,
     });
 
     let caughtOutside: unknown;
@@ -665,10 +721,13 @@ describe("provide a hardened @tanstack/ai-sandbox handle and @der/domain Sandbox
     const badReport = await probeDockerEgressNetwork({
       dockerHost: "unix:///run/user/1000/docker.sock",
       networkName: "der-egress-codex",
+      engine: "codex",
+      allowedHosts: ["api.openai.com"],
       runner: unisolatedRunner,
     });
     expect(badReport.verified).toBe(false);
     expect(badReport.reasons.join("\n")).toContain("Internal=true");
+    expect(badReport.reasons.join("\n")).toContain("der.egress.allowed_hosts");
 
     const blockedSandbox = createDockerSandbox({
       dockerHost: "unix:///run/user/1000/docker.sock",
@@ -680,9 +739,11 @@ describe("provide a hardened @tanstack/ai-sandbox handle and @der/domain Sandbox
       egressNetwork: {
         networkName: "der-egress-codex",
         allowedHosts: ["api.openai.com"],
+        egressProxyUrl: "http://egress-proxy:3128",
       },
       limits: { cpus: 1, memoryMb: 512, pidsLimit: 128 },
       runner: unisolatedRunner,
+      resolveRealPath: identityRealPath,
     });
 
     let caughtEgress: unknown;
@@ -722,6 +783,9 @@ describe("provide a hardened @tanstack/ai-sandbox handle and @der/domain Sandbox
               Driver: "bridge",
               Internal: true,
               Options: {},
+              Labels: {
+                "der.egress.allowed_hosts": "api.openai.com,auth.openai.com",
+              },
             }),
             stderr: "",
           };
@@ -740,10 +804,12 @@ describe("provide a hardened @tanstack/ai-sandbox handle and @der/domain Sandbox
       egressNetwork: {
         networkName: "der-egress-codex",
         allowedHosts: ["api.openai.com"],
+        egressProxyUrl: "http://egress-proxy:3128",
       },
       limits: { cpus: 1, memoryMb: 512, pidsLimit: 128 },
       runner: isolatedRunner,
       now: () => 1000,
+      resolveRealPath: identityRealPath,
     });
 
     const result = await allowedSandbox.execute({
@@ -756,8 +822,260 @@ describe("provide a hardened @tanstack/ai-sandbox handle and @der/domain Sandbox
     expect(
       isolatedCalls.some((call) => call.args[0] === "network" && call.args[1] === "inspect"),
     ).toBe(true);
-    expect(isolatedCalls.find((call) => call.args[0] === "run")?.args).toContain(
-      "--network=der-egress-codex",
+    const runArgs = isolatedCalls.find((call) => call.args[0] === "run")?.args;
+    expect(runArgs).toContain("--network=der-egress-codex");
+    expect(runArgs).toContain("HTTP_PROXY=http://egress-proxy:3128");
+    expect(runArgs).toContain("HTTPS_PROXY=http://egress-proxy:3128");
+  });
+
+  it.each([
+    {
+      name: "missing der.egress.allowed_hosts label",
+      labels: {},
+      allowedHosts: ["api.openai.com"],
+      expectedReason: /missing required label "der\.egress\.allowed_hosts"/,
+    },
+    {
+      name: "unapproved host in der.egress.allowed_hosts label",
+      labels: { "der.egress.allowed_hosts": "api.openai.com,evil.example.com" },
+      allowedHosts: ["api.openai.com"],
+      expectedReason: /permits unapproved host "evil\.example\.com"/,
+    },
+    {
+      name: "mismatched vendor host from another engine in label",
+      labels: { "der.egress.allowed_hosts": "api.openai.com,api.anthropic.com" },
+      allowedHosts: ["api.openai.com"],
+      expectedReason: /permits unapproved host "api\.anthropic\.com"/,
+    },
+    {
+      name: "label missing a requested approved host",
+      labels: { "der.egress.allowed_hosts": "api.openai.com" },
+      allowedHosts: ["api.openai.com", "chatgpt.com"],
+      expectedReason: /does not cover requested host "chatgpt\.com"/,
+    },
+  ])(
+    "fails closed when scoped egress network has $name",
+    async ({ labels, allowedHosts, expectedReason }) => {
+      const { runner, calls } = createFakeCommandRunner({
+        onExec: (_cmd, args) => {
+          if (args[0] === "info") {
+            return {
+              exitCode: 0,
+              stdout: JSON.stringify({
+                ServerVersion: "29.10.0",
+                SecurityOptions: ["name=rootless"],
+                MemoryLimit: true,
+                CpuCfsQuota: true,
+                PidsLimit: true,
+              }),
+              stderr: "",
+            };
+          }
+          if (args[0] === "network" && args[1] === "inspect") {
+            return {
+              exitCode: 0,
+              stdout: JSON.stringify({
+                Name: "der-egress-codex",
+                Driver: "bridge",
+                Internal: true,
+                Options: {},
+                Labels: labels,
+              }),
+              stderr: "",
+            };
+          }
+          return { exitCode: 0, stdout: "should-not-run", stderr: "" };
+        },
+      });
+
+      const report = await probeDockerEgressNetwork({
+        dockerHost: "unix:///run/user/1000/docker.sock",
+        networkName: "der-egress-codex",
+        engine: "codex",
+        allowedHosts,
+        runner,
+      });
+      expect(report.verified).toBe(false);
+      expect(report.reasons.join("\n")).toMatch(expectedReason);
+
+      const provider = createHardenedDockerProvider({
+        dockerHost: "unix:///run/user/1000/docker.sock",
+        image: "der-engine-codex:pinned",
+        engine: "codex",
+        user: "1000:1000",
+        workspaceHostPath: "/srv/der/workspaces/sess-1",
+        shadowHome: DEFAULT_ENGINE_SHADOW_HOMES.codex,
+        network: {
+          mode: "scoped_egress",
+          networkName: "der-egress-codex",
+          allowedHosts,
+          egressProxyUrl: "http://egress-proxy:3128",
+        },
+        limits: { cpus: 1, memoryMb: 512, pidsLimit: 128 },
+        runner,
+        resolveRealPath: identityRealPath,
+      });
+
+      let caught: unknown;
+      try {
+        await provider.create({ id: "sess-egress-blocked" });
+      } catch (error) {
+        caught = error;
+      }
+      expect(caught).toBeInstanceOf(SandboxControlError);
+      expect((caught as SandboxControlError).code).toBe("docker.egress_network_unverified");
+      expect(calls.some((call) => call.args[0] === "run")).toBe(false);
+    },
+  );
+
+  it("rejects a symlink inside an allowed root pointing outside the allowed root in Docker launcher and sandbox", async () => {
+    const baseDir = mkdtempSync("/tmp/der-docker-symlink-");
+    tempDirs.push(baseDir);
+    const allowedRoot = join(baseDir, "allowed");
+    const outsideDir = join(baseDir, "outside");
+    const internalSubdir = join(allowedRoot, "real-sub");
+    mkdirSync(internalSubdir, { recursive: true });
+    mkdirSync(outsideDir, { recursive: true });
+
+    const escapeLink = join(allowedRoot, "escape-link");
+    symlinkSync(outsideDir, escapeLink);
+    const internalLink = join(allowedRoot, "internal-link");
+    symlinkSync(internalSubdir, internalLink);
+
+    const { runner, calls } = createFakeCommandRunner({
+      onExec: (_cmd, args) => {
+        if (args[0] === "info") {
+          return {
+            exitCode: 0,
+            stdout: JSON.stringify({
+              ServerVersion: "29.10.0",
+              SecurityOptions: ["name=rootless"],
+              MemoryLimit: true,
+              CpuCfsQuota: true,
+              PidsLimit: true,
+            }),
+            stderr: "",
+          };
+        }
+        return { exitCode: 0, stdout: "ok", stderr: "" };
+      },
+    });
+
+    let caughtBuild: unknown;
+    try {
+      buildDockerRunArgs({
+        containerName: "der-codex-symlink",
+        image: "der-engine-codex:pinned",
+        engine: "codex",
+        user: "1000:1000",
+        workspaceMount: { source: allowedRoot, target: "/workspace", readonly: false },
+        allowedWorkspaceRoots: [allowedRoot],
+        extraMounts: [{ type: "bind", source: escapeLink, target: "/mnt/ro-0", readonly: true }],
+        shadowHome: DEFAULT_ENGINE_SHADOW_HOMES.codex,
+        network: { mode: "none" },
+        limits: { cpus: 1, memoryMb: 512, pidsLimit: 128 },
+        dockerHost: "unix:///run/user/1000/docker.sock",
+      });
+    } catch (error) {
+      caughtBuild = error;
+    }
+    expect(caughtBuild).toBeInstanceOf(SandboxControlError);
+    expect((caughtBuild as SandboxControlError).code).toBe("docker.bind_path_outside_root");
+
+    const sandbox = createDockerSandbox({
+      dockerHost: "unix:///run/user/1000/docker.sock",
+      image: "der-engine-codex:pinned",
+      engine: "codex",
+      user: "1000:1000",
+      workspaceHostPath: allowedRoot,
+      allowedWorkspaceRoots: [allowedRoot],
+      shadowHome: DEFAULT_ENGINE_SHADOW_HOMES.codex,
+      limits: { cpus: 1, memoryMb: 512, pidsLimit: 128 },
+      runner,
+      now: () => 1000,
+    });
+
+    let caughtSandbox: unknown;
+    try {
+      await sandbox.execute({
+        command: "ls",
+        args: ["/mnt/ro-0"],
+        readonlyPaths: [escapeLink],
+        timeoutMs: 2000,
+        network: "none",
+      });
+    } catch (error) {
+      caughtSandbox = error;
+    }
+    expect(caughtSandbox).toBeInstanceOf(SandboxControlError);
+    expect((caughtSandbox as SandboxControlError).code).toBe("docker.bind_path_outside_root");
+
+    const provider = createHardenedDockerProvider({
+      dockerHost: "unix:///run/user/1000/docker.sock",
+      image: "der-engine-codex:pinned",
+      engine: "codex",
+      user: "1000:1000",
+      workspaceHostPath: escapeLink,
+      allowedWorkspaceRoots: [allowedRoot],
+      shadowHome: DEFAULT_ENGINE_SHADOW_HOMES.codex,
+      network: { mode: "none" },
+      limits: { cpus: 1, memoryMb: 512, pidsLimit: 128 },
+      runner,
+    });
+
+    let caughtProvider: unknown;
+    try {
+      await provider.create({ id: "sess-symlink-escape" });
+    } catch (error) {
+      caughtProvider = error;
+    }
+    expect(caughtProvider).toBeInstanceOf(SandboxControlError);
+    expect((caughtProvider as SandboxControlError).code).toBe("docker.bind_path_outside_root");
+
+    let caughtMissing: unknown;
+    try {
+      buildDockerRunArgs({
+        containerName: "der-codex-missing",
+        image: "der-engine-codex:pinned",
+        engine: "codex",
+        user: "1000:1000",
+        workspaceMount: { source: allowedRoot, target: "/workspace", readonly: false },
+        allowedWorkspaceRoots: [allowedRoot],
+        extraMounts: [
+          {
+            type: "bind",
+            source: join(allowedRoot, "does-not-exist"),
+            target: "/mnt/ro-0",
+            readonly: true,
+          },
+        ],
+        shadowHome: DEFAULT_ENGINE_SHADOW_HOMES.codex,
+        network: { mode: "none" },
+        limits: { cpus: 1, memoryMb: 512, pidsLimit: 128 },
+        dockerHost: "unix:///run/user/1000/docker.sock",
+      });
+    } catch (error) {
+      caughtMissing = error;
+    }
+    expect(caughtMissing).toBeInstanceOf(SandboxControlError);
+    expect((caughtMissing as SandboxControlError).code).toBe("docker.invalid_workspace_mount");
+    expect(calls.some((call) => call.args[0] === "run")).toBe(false);
+
+    const internalArgs = buildDockerRunArgs({
+      containerName: "der-codex-internal-link",
+      image: "der-engine-codex:pinned",
+      engine: "codex",
+      user: "1000:1000",
+      workspaceMount: { source: allowedRoot, target: "/workspace", readonly: false },
+      allowedWorkspaceRoots: [allowedRoot],
+      extraMounts: [{ type: "bind", source: internalLink, target: "/mnt/ro-0", readonly: true }],
+      shadowHome: DEFAULT_ENGINE_SHADOW_HOMES.codex,
+      network: { mode: "none" },
+      limits: { cpus: 1, memoryMb: 512, pidsLimit: 128 },
+      dockerHost: "unix:///run/user/1000/docker.sock",
+    });
+    expect(internalArgs).toContain(
+      `type=bind,source=${realpathSync(internalSubdir)},target=/mnt/ro-0,readonly`,
     );
   });
 });

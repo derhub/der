@@ -26,6 +26,7 @@ import {
   type DockerResourceLimits,
   type EngineShadowHomeSpec,
   type OfficialEngineKind,
+  type RealPathResolver,
 } from "./docker-policy";
 import { SandboxControlError } from "./errors";
 import { bunCommandRunner, type CommandRunner } from "./process-runner";
@@ -65,6 +66,7 @@ export interface HardenedDockerProviderConfig {
   readonly readOnlyRootfs?: boolean;
   readonly runner?: CommandRunner;
   readonly verifyIsolationOnCreate?: boolean;
+  readonly resolveRealPath?: RealPathResolver;
 }
 
 const HARDENED_DOCKER_CAPABILITIES: SandboxCapabilities = {
@@ -301,42 +303,24 @@ export function createHardenedDockerProvider(
   const workspaceRoot = config.workspaceContainerPath ?? "/workspace";
   const hostEnv = { DOCKER_HOST: config.dockerHost };
 
+  const lockedProxyEnv: Readonly<Record<string, string>> =
+    config.network.mode === "scoped_egress" &&
+    typeof config.network.egressProxyUrl === "string" &&
+    config.network.egressProxyUrl.trim().length > 0
+      ? {
+          HTTP_PROXY: config.network.egressProxyUrl.trim(),
+          HTTPS_PROXY: config.network.egressProxyUrl.trim(),
+          http_proxy: config.network.egressProxyUrl.trim(),
+          https_proxy: config.network.egressProxyUrl.trim(),
+        }
+      : {};
+
   return {
     name: "docker",
     capabilities(): SandboxCapabilities {
       return { ...HARDENED_DOCKER_CAPABILITIES };
     },
     async create(input: SandboxCreateInput): Promise<SandboxHandle> {
-      if (config.verifyIsolationOnCreate !== false) {
-        const probe = await probeDockerIsolation({
-          dockerHost: config.dockerHost,
-          dockerBinary,
-          runner,
-          ...(input.signal !== undefined ? { signal: input.signal } : {}),
-        });
-        if (!probe.isolationVerified) {
-          throw new SandboxControlError(
-            "docker.isolation_unverified",
-            `Hardened Docker isolation check failed: ${probe.reasons.join("; ")}`,
-          );
-        }
-        if (config.network.mode === "scoped_egress") {
-          const egressProbe = await probeDockerEgressNetwork({
-            dockerHost: config.dockerHost,
-            networkName: config.network.networkName,
-            dockerBinary,
-            runner,
-            ...(input.signal !== undefined ? { signal: input.signal } : {}),
-          });
-          if (!egressProbe.verified) {
-            throw new SandboxControlError(
-              "docker.egress_network_unverified",
-              `Hardened Docker egress network check failed: ${egressProbe.reasons.join("; ")}`,
-            );
-          }
-        }
-      }
-
       const containerName = `der-${config.engine}-${sanitizeContainerSegment(
         input.id ?? crypto.randomUUID(),
       )}`;
@@ -362,12 +346,47 @@ export function createHardenedDockerProvider(
         env: mergedEnv,
         ...(config.extraMounts !== undefined ? { extraMounts: config.extraMounts } : {}),
         ...(config.readOnlyRootfs !== undefined ? { readOnlyRootfs: config.readOnlyRootfs } : {}),
+        ...(config.resolveRealPath !== undefined
+          ? { resolveRealPath: config.resolveRealPath }
+          : {}),
       };
 
       const runArgs = buildDockerRunArgs(spec, {
         detach: true,
         command: ["sleep", "infinity"],
       });
+
+      if (config.verifyIsolationOnCreate !== false) {
+        const probe = await probeDockerIsolation({
+          dockerHost: config.dockerHost,
+          dockerBinary,
+          runner,
+          ...(input.signal !== undefined ? { signal: input.signal } : {}),
+        });
+        if (!probe.isolationVerified) {
+          throw new SandboxControlError(
+            "docker.isolation_unverified",
+            `Hardened Docker isolation check failed: ${probe.reasons.join("; ")}`,
+          );
+        }
+        if (config.network.mode === "scoped_egress") {
+          const egressProbe = await probeDockerEgressNetwork({
+            dockerHost: config.dockerHost,
+            networkName: config.network.networkName,
+            engine: config.engine,
+            allowedHosts: config.network.allowedHosts,
+            dockerBinary,
+            runner,
+            ...(input.signal !== undefined ? { signal: input.signal } : {}),
+          });
+          if (!egressProbe.verified) {
+            throw new SandboxControlError(
+              "docker.egress_network_unverified",
+              `Hardened Docker egress network check failed: ${egressProbe.reasons.join("; ")}`,
+            );
+          }
+        }
+      }
 
       const started = await runner.exec(dockerBinary, runArgs, {
         env: hostEnv,
@@ -390,6 +409,7 @@ export function createHardenedDockerProvider(
         initialEnv: {
           ...config.shadowHome.envOverrides,
           ...mergedEnv,
+          ...lockedProxyEnv,
         },
       });
     },
@@ -415,6 +435,7 @@ export function createHardenedDockerProvider(
         initialEnv: {
           ...config.shadowHome.envOverrides,
           ...config.env,
+          ...lockedProxyEnv,
         },
       });
     },
@@ -440,10 +461,12 @@ export interface DockerSandboxConfig {
   readonly egressNetwork?: {
     readonly networkName: string;
     readonly allowedHosts: readonly string[];
+    readonly egressProxyUrl: string;
   };
   readonly limits: DockerResourceLimits;
   readonly runner?: CommandRunner;
   readonly now?: () => number;
+  readonly resolveRealPath?: RealPathResolver;
 }
 
 export function createDockerSandbox(config: DockerSandboxConfig): Sandbox {
@@ -475,6 +498,7 @@ export function createDockerSandbox(config: DockerSandboxConfig): Sandbox {
                 mode: "scoped_egress",
                 networkName: config.egressNetwork.networkName,
                 allowedHosts: config.egressNetwork.allowedHosts,
+                egressProxyUrl: config.egressNetwork.egressProxyUrl,
               }
             : (() => {
                 throw new SandboxControlError(
@@ -518,6 +542,9 @@ export function createDockerSandbox(config: DockerSandboxConfig): Sandbox {
           ...(request.env !== undefined ? { env: request.env } : {}),
           ...(extraMounts.length > 0 ? { extraMounts } : {}),
           readOnlyRootfs: true,
+          ...(config.resolveRealPath !== undefined
+            ? { resolveRealPath: config.resolveRealPath }
+            : {}),
         },
         {
           removeOnExit: true,
@@ -529,6 +556,8 @@ export function createDockerSandbox(config: DockerSandboxConfig): Sandbox {
         const egressProbe = await probeDockerEgressNetwork({
           dockerHost: config.dockerHost,
           networkName: network.networkName,
+          engine: config.engine,
+          allowedHosts: network.allowedHosts,
           dockerBinary,
           runner,
         });

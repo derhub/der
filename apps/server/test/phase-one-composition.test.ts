@@ -5,6 +5,8 @@ import {
   PROBLEM_DETAILS_MEDIA_TYPE,
   type Approval,
   type Bot,
+  type EffectIdentity,
+  type Engine,
   type EngineReadiness,
   type MemoryRecord,
   type Routine,
@@ -12,11 +14,14 @@ import {
   type RunAdmission,
   type Skill,
   type ToolDescriptor,
+  type ToolResult,
+  type Tools,
 } from "@der/domain";
 import { compiledParsers } from "@der/domain/compiled";
 import type { CommandExecOptions, CommandRunner, CommandSpawnHandle } from "@der/runtime/sandbox";
 import { parseServerConfig } from "../src/config";
-import { startServer } from "../src/main";
+import { buildEngineHostTools, startServer } from "../src/main";
+import { createDirectWorkflow, UncertainEffectError } from "../src/workflows/index";
 import { createTempDatabase, waitUntil } from "./fixtures/restate-harness";
 
 const cleanups: (() => Promise<void> | void)[] = [];
@@ -62,6 +67,19 @@ describe("validate Phase 1 startup configuration", () => {
       name: "bridge docker egress network",
       env: { DER_DOCKER_EGRESS_NETWORK: "bridge" },
       message: /host|bridge/i,
+    },
+    {
+      name: "docker egress network without proxy URL",
+      env: { DER_DOCKER_EGRESS_NETWORK: "der-egress-codex" },
+      message: /DER_DOCKER_EGRESS_PROXY_URL/,
+    },
+    {
+      name: "malformed docker egress proxy URL",
+      env: {
+        DER_DOCKER_EGRESS_NETWORK: "der-egress-codex",
+        DER_DOCKER_EGRESS_PROXY_URL: "not-a-url",
+      },
+      message: /proxy URL/i,
     },
     {
       name: "malformed allowed origin",
@@ -786,5 +804,246 @@ describe("serve Phase 1 memory, skills, routines, engines, tools, and shared com
     expect(wasmerContainerCall?.args).toContain("--read-only");
     expect(wasmerContainerCall?.args).toContain("--cap-drop=ALL");
     expect(wasmerContainerCall?.args).toContain("--security-opt=no-new-privileges:true");
+  });
+
+  it("reuses recorded outcome on replay of a completed approved engine host-tool call and interrupts without re-execution on a crashed started effect", async () => {
+    const tempDb = createTempDatabase("der-host-tool-replay-");
+    const server = startServer({
+      config: {
+        host: "127.0.0.1",
+        port: 0,
+        restateHost: "127.0.0.1",
+        restateListen: 0,
+        restateMode: "direct",
+        databasePath: tempDb.dbPath,
+        memoryProjectionDir: join(tempDb.dir, "memory"),
+        skillsRootDir: join(tempDb.dir, "skills"),
+        workspaceRootDir: join(tempDb.dir, "workspaces"),
+        enabledEngines: ["fixture"],
+        seedFixture: true,
+      },
+    });
+    cleanups.push(async () => {
+      await server.close();
+      tempDb.cleanup();
+    });
+
+    const bot = server.seededFixture!.bot;
+    const session = server.seededFixture!.session;
+
+    let completedInvokeCount = 0;
+    const recordingTools: Tools = {
+      async list(): Promise<readonly ToolDescriptor[]> {
+        return [
+          {
+            kind: "mcp",
+            id: "mcp.side_effect",
+            name: "Side Effect Tool",
+            description: "Applies an external side effect.",
+            requiresApproval: true,
+            inputSchema: { type: "object" },
+          },
+        ];
+      },
+      async invoke(operation): Promise<ToolResult> {
+        completedInvokeCount += 1;
+        return {
+          ok: true,
+          isError: false,
+          outcome: {
+            applied: true,
+            invocation: completedInvokeCount,
+            args: operation.effect.canonicalArguments,
+          },
+        };
+      },
+    };
+
+    const replayAdmission = await server.store.admit({
+      botId: bot.id,
+      sessionId: session.id,
+      origin: "http",
+      idempotencyKey: "host-tool-replay-completed",
+      engine: "fixture",
+      input: { parts: [{ type: "text", text: "apply lamp" }] },
+    });
+    const replayRun = await server.store.markRunRunning(replayAdmission.run.id);
+
+    const directWf = createDirectWorkflow({
+      store: server.store,
+      engines: new Map(),
+      tools: recordingTools,
+      approvalTimeoutMs: 10_000,
+    });
+    cleanups.push(() => directWf.close());
+
+    const makeBroker = (run: Run) => ({
+      async requestApproval(req: {
+        readonly effect: EffectIdentity;
+        readonly prompt: string;
+        readonly signal: AbortSignal;
+      }) {
+        return directWf.awaitApproval!({ run, effect: req.effect, prompt: req.prompt }, req.signal);
+      },
+    });
+
+    const attempt1Tools = await buildEngineHostTools({
+      run: replayRun,
+      store: server.store,
+      tools: recordingTools,
+      approvalBroker: makeBroker(replayRun),
+    });
+    const firstCallPromise = attempt1Tools[0]!.execute!({ target: "lamp-1" });
+
+    const pendingApproval = await waitUntil(async () => {
+      const latest = server.store.getLatestApprovalForRun(replayRun.id);
+      return latest && latest.decision.status === "pending" ? latest : false;
+    });
+    await directWf.decide({
+      approvalId: pendingApproval.id,
+      botId: bot.id,
+      sessionId: session.id,
+      runId: replayRun.id,
+      status: "approved",
+      actor: "operator",
+      decidedAt: "2026-11-22T00:00:00.000Z",
+    });
+
+    const firstResult = (await firstCallPromise) as ToolResult;
+    expect(firstResult).toEqual({
+      ok: true,
+      isError: false,
+      outcome: { applied: true, invocation: 1, args: { target: "lamp-1" } },
+    });
+    expect(completedInvokeCount).toBe(1);
+    expect(server.store.getEffect(pendingApproval.effect)?.status).toBe("completed");
+
+    const attempt2Tools = await buildEngineHostTools({
+      run: replayRun,
+      store: server.store,
+      tools: recordingTools,
+      approvalBroker: makeBroker(replayRun),
+    });
+    const replayedResult = (await attempt2Tools[0]!.execute!({ target: "lamp-1" })) as ToolResult;
+    expect(replayedResult).toEqual(firstResult);
+    expect(completedInvokeCount).toBe(1);
+
+    await server.store.finishRun({
+      runId: replayRun.id,
+      status: "completed",
+      terminalEvent: {
+        chunkKey: `${replayRun.id}:terminal`,
+        chunk: { type: "RUN_FINISHED", threadId: session.id, runId: replayRun.id },
+      },
+    });
+
+    let crashedInvokeCount = 0;
+    const crashedTools: Tools = {
+      async list(): Promise<readonly ToolDescriptor[]> {
+        return recordingTools.list!();
+      },
+      async invoke(): Promise<ToolResult> {
+        crashedInvokeCount += 1;
+        return { ok: true, isError: false, outcome: { shouldNeverRun: true } };
+      },
+    };
+
+    let caughtEngineToolError: unknown;
+    const replayEngine: Engine = {
+      kind: "fixture",
+      async *run(run) {
+        const hostTools = await buildEngineHostTools({
+          run,
+          store: server.store,
+          tools: crashedTools,
+          approvalBroker: makeBroker(run),
+        });
+        try {
+          await hostTools[0]!.execute!({ target: "lamp-crashed" });
+        } catch (error) {
+          caughtEngineToolError = error;
+        }
+        yield {
+          type: "completed",
+          finalMessage: { parts: [{ type: "text", text: "should not overwrite interrupted" }] },
+        };
+      },
+    };
+
+    const crashWf = createDirectWorkflow({
+      store: server.store,
+      engines: new Map<Engine["kind"], Engine>([["fixture", replayEngine]]),
+      tools: crashedTools,
+      approvalTimeoutMs: 10_000,
+    });
+    cleanups.push(() => crashWf.close());
+
+    const crashedAdmission = await server.store.admit({
+      botId: bot.id,
+      sessionId: session.id,
+      origin: "http",
+      idempotencyKey: "host-tool-replay-crashed-started",
+      engine: "fixture",
+      input: { parts: [{ type: "text", text: "apply crashed lamp" }] },
+    });
+    const crashedRun = crashedAdmission.run;
+
+    const probeTools = await buildEngineHostTools({
+      run: crashedRun,
+      store: server.store,
+      tools: crashedTools,
+      approvalBroker: {
+        async requestApproval(req) {
+          const requested = await server.store.requestApproval({
+            botId: bot.id,
+            sessionId: session.id,
+            runId: crashedRun.id,
+            effect: req.effect,
+            prompt: req.prompt,
+            awakeable: "awk-crashed-started",
+            deadline: "2099-01-01T00:00:00.000Z",
+          });
+          await server.store.decide({
+            approvalId: requested.approval.id,
+            botId: bot.id,
+            sessionId: session.id,
+            runId: crashedRun.id,
+            status: "approved",
+            actor: "operator",
+            decidedAt: "2026-11-22T00:00:00.000Z",
+          });
+          const begun = await server.store.beginEffect(req.effect, {
+            approvalId: requested.approval.id,
+          });
+          expect(begun.kind).toBe("started");
+          return {
+            status: "denied",
+            approvalId: requested.approval.id,
+            effect: req.effect,
+          };
+        },
+      },
+    });
+    await probeTools[0]!.execute!({ target: "lamp-crashed" });
+    const seededApproval = server.store.getLatestApprovalForRun(crashedRun.id)!;
+    expect(server.store.getEffect(seededApproval.effect)?.status).toBe("started");
+
+    await crashWf.admit({
+      botId: bot.id,
+      sessionId: session.id,
+      origin: "http",
+      idempotencyKey: "host-tool-replay-crashed-started",
+      engine: "fixture",
+      input: { parts: [{ type: "text", text: "apply crashed lamp" }] },
+    });
+
+    const interruptedRun = await waitUntil(async () => {
+      const current = server.store.getRun(crashedRun.id);
+      return current && current.status === "interrupted" ? current : false;
+    });
+    expect(interruptedRun.status).toBe("interrupted");
+    expect(caughtEngineToolError).toBeInstanceOf(UncertainEffectError);
+    expect(crashedInvokeCount).toBe(0);
+    expect(server.store.getEffect(seededApproval.effect)?.status).toBe("unknown");
   });
 });

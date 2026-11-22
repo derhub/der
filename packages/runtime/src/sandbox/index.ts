@@ -2,6 +2,7 @@ export {
   APPROVED_VENDOR_EGRESS,
   buildDockerRunArgs,
   DEFAULT_ENGINE_SHADOW_HOMES,
+  DOCKER_EGRESS_ALLOWED_HOSTS_LABEL,
   probeDockerEgressNetwork,
   probeDockerIsolation,
   validateDockerContainerSpec,
@@ -17,6 +18,7 @@ export {
   type OfficialEngineKind,
   type ProbeDockerEgressNetworkOptions,
   type ProbeDockerIsolationOptions,
+  type RealPathResolver,
 } from "./docker-policy";
 export {
   createDockerSandbox,
@@ -42,6 +44,7 @@ export {
   type WasmerGrantPolicy,
   type WasmerGuestKind,
   type WasmerGuestPin,
+  type WasmerRealPathResolver,
   type WasmerRunnerContract,
 } from "./wasmer-contract";
 export {

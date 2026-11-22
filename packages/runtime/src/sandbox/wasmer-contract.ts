@@ -1,5 +1,9 @@
+import { realpathSync } from "node:fs";
+import { posix } from "node:path";
 import type { ToolDescriptor } from "@der/domain";
 import { SandboxControlError } from "./errors";
+
+export type WasmerRealPathResolver = (path: string) => string;
 
 export type WasmerGuestKind = "bash" | "python";
 
@@ -90,6 +94,7 @@ export interface WasmerDirectoryGrant {
 
 export interface WasmerGrantPolicy {
   readonly allowedHostRoots: readonly string[];
+  readonly resolveRealPath?: WasmerRealPathResolver;
 }
 
 export function validateWasmerGuestPin(pin: WasmerGuestPin): void {
@@ -121,49 +126,106 @@ export function validateWasmerGuestPin(pin: WasmerGuestPin): void {
 }
 
 function normalizeRoot(root: string): string {
-  return root.length > 1 && root.endsWith("/") ? root.slice(0, -1) : root;
+  const resolved = posix.resolve(root);
+  return resolved.length > 1 && resolved.endsWith("/") ? resolved.slice(0, -1) : resolved;
 }
 
-function validateHostGrantPath(hostPath: string, allowedRoots: readonly string[]): string {
-  const trimmed = hostPath.trim();
+function assertCleanAbsoluteGrantPath(rawPath: string, label: string): string {
+  const trimmed = rawPath.trim();
   if (trimmed.length === 0 || !trimmed.startsWith("/") || trimmed.includes("\0")) {
     throw new SandboxControlError(
       "wasmer.invalid_directory_grant",
-      `Directory grant "${hostPath}" must be a clean absolute path.`,
+      `${label} "${rawPath}" must be a clean absolute path.`,
     );
   }
-
   const segments = trimmed.split("/");
   if (segments.includes("..") || segments.includes(".")) {
     throw new SandboxControlError(
       "wasmer.invalid_directory_grant",
-      `Directory grant "${hostPath}" cannot contain relative path segments.`,
+      `${label} "${rawPath}" cannot contain relative path segments.`,
     );
   }
+  return normalizeRoot(trimmed);
+}
 
+function assertNotForbiddenGrantPath(rawPath: string, candidatePath: string): void {
   for (const pattern of FORBIDDEN_GRANT_PATTERNS) {
-    if (pattern.test(trimmed)) {
+    if (pattern.test(candidatePath)) {
       throw new SandboxControlError(
         "wasmer.forbidden_path",
-        `Directory grant "${hostPath}" targets a forbidden host home, credential, or daemon socket path.`,
+        `Directory grant "${rawPath}" targets a forbidden host home, credential, or daemon socket path.`,
       );
     }
   }
+}
 
-  const normalized = normalizeRoot(trimmed);
-  const inAllowedRoot = allowedRoots.some((root) => {
-    const normRoot = normalizeRoot(root);
-    return normalized === normRoot || normalized.startsWith(`${normRoot}/`);
+function resolveCanonicalGrantPath(
+  normalizedPath: string,
+  rawPath: string,
+  label: string,
+  resolveRealPath: WasmerRealPathResolver,
+): string {
+  let resolved: string;
+  try {
+    resolved = resolveRealPath(normalizedPath);
+  } catch (error) {
+    throw new SandboxControlError(
+      "wasmer.invalid_directory_grant",
+      `${label} "${rawPath}" could not be resolved on the host filesystem.`,
+      { cause: error },
+    );
+  }
+  return assertCleanAbsoluteGrantPath(resolved, label);
+}
+
+function resolveAllowedHostRoots(
+  allowedRoots: readonly string[],
+  resolveRealPath: WasmerRealPathResolver,
+): string[] {
+  return allowedRoots.map((root) => {
+    const normalized = assertCleanAbsoluteGrantPath(root, "Allowed host root");
+    assertNotForbiddenGrantPath(root, normalized);
+    const resolved = resolveCanonicalGrantPath(
+      normalized,
+      root,
+      "Allowed host root",
+      resolveRealPath,
+    );
+    assertNotForbiddenGrantPath(root, resolved);
+    return resolved;
+  });
+}
+
+function validateHostGrantPath(
+  hostPath: string,
+  resolvedAllowedRoots: readonly string[],
+  resolveRealPath: WasmerRealPathResolver,
+): string {
+  const normalized = assertCleanAbsoluteGrantPath(hostPath, "Directory grant");
+  assertNotForbiddenGrantPath(hostPath, normalized);
+  const resolved = resolveCanonicalGrantPath(
+    normalized,
+    hostPath,
+    "Directory grant",
+    resolveRealPath,
+  );
+  assertNotForbiddenGrantPath(hostPath, resolved);
+
+  const inAllowedRoot = resolvedAllowedRoots.some((normRoot) => {
+    if (normRoot === "/") {
+      return resolved.startsWith("/");
+    }
+    return resolved === normRoot || resolved.startsWith(`${normRoot}/`);
   });
 
   if (!inAllowedRoot) {
     throw new SandboxControlError(
       "wasmer.directory_outside_root",
-      `Directory grant "${hostPath}" is outside allowed host roots.`,
+      `Directory grant "${hostPath}" resolves to "${resolved}", which is outside allowed host roots.`,
     );
   }
 
-  return normalized;
+  return resolved;
 }
 
 export function validateWasmerDirectoryGrants(
@@ -177,12 +239,19 @@ export function validateWasmerDirectoryGrants(
   const readonlyPaths = input.readonlyPaths ?? [];
   const writablePaths = input.writablePaths ?? [];
 
+  if (readonlyPaths.length === 0 && writablePaths.length === 0) {
+    return grants;
+  }
+
+  const resolveRealPath = policy.resolveRealPath ?? realpathSync;
+  const resolvedAllowedRoots = resolveAllowedHostRoots(policy.allowedHostRoots, resolveRealPath);
+
   for (let i = 0; i < readonlyPaths.length; i += 1) {
     const rawPath = readonlyPaths[i];
     if (rawPath === undefined) {
       continue;
     }
-    const hostPath = validateHostGrantPath(rawPath, policy.allowedHostRoots);
+    const hostPath = validateHostGrantPath(rawPath, resolvedAllowedRoots, resolveRealPath);
     grants.push({
       hostPath,
       guestPath: `/workspace/mnt/ro-${i}`,
@@ -195,7 +264,7 @@ export function validateWasmerDirectoryGrants(
     if (rawPath === undefined) {
       continue;
     }
-    const hostPath = validateHostGrantPath(rawPath, policy.allowedHostRoots);
+    const hostPath = validateHostGrantPath(rawPath, resolvedAllowedRoots, resolveRealPath);
     grants.push({
       hostPath,
       guestPath: `/workspace/mnt/rw-${i}`,

@@ -14,6 +14,7 @@ import {
   type WasmerDirectoryGrant,
   type WasmerGuestKind,
   type WasmerGuestPin,
+  type WasmerRealPathResolver,
 } from "./wasmer-contract";
 
 export interface WasmerLaunchConfig {
@@ -54,6 +55,7 @@ export interface WasmerSandboxConfig {
   readonly maxTimeoutMs?: number;
   readonly maxOutputBytes?: number;
   readonly now?: () => number;
+  readonly resolveRealPath?: WasmerRealPathResolver;
 }
 
 export interface DockerWasmerSandboxConfig {
@@ -68,6 +70,7 @@ export interface DockerWasmerSandboxConfig {
   readonly maxOutputBytes?: number;
   readonly runner?: CommandRunner;
   readonly now?: () => number;
+  readonly resolveRealPath?: WasmerRealPathResolver;
 }
 
 export interface ManagedWasmerSandbox extends Sandbox {
@@ -289,7 +292,12 @@ export function createWasmerSandbox(config: WasmerSandboxConfig): ManagedWasmerS
           ...(request.readonlyPaths !== undefined ? { readonlyPaths: request.readonlyPaths } : {}),
           ...(request.writablePaths !== undefined ? { writablePaths: request.writablePaths } : {}),
         },
-        { allowedHostRoots: config.allowedHostRoots },
+        {
+          allowedHostRoots: config.allowedHostRoots,
+          ...(config.resolveRealPath !== undefined
+            ? { resolveRealPath: config.resolveRealPath }
+            : {}),
+        },
       );
 
       const boundedTimeoutMs = Math.min(request.timeoutMs, maxTimeoutMs);
@@ -382,7 +390,12 @@ export function createDockerWasmerSandbox(config: DockerWasmerSandboxConfig): Sa
           ...(request.readonlyPaths !== undefined ? { readonlyPaths: request.readonlyPaths } : {}),
           ...(request.writablePaths !== undefined ? { writablePaths: request.writablePaths } : {}),
         },
-        { allowedHostRoots: config.allowedHostRoots },
+        {
+          allowedHostRoots: config.allowedHostRoots,
+          ...(config.resolveRealPath !== undefined
+            ? { resolveRealPath: config.resolveRealPath }
+            : {}),
+        },
       );
 
       const probe = await probeDockerIsolation({

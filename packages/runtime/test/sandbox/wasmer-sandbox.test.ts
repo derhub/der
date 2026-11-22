@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it } from "bun:test";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -21,6 +21,7 @@ import {
 } from "../../src/sandbox/index";
 
 const tempDirs: string[] = [];
+const identityRealPath = (path: string): string => path;
 
 afterEach(() => {
   while (tempDirs.length > 0) {
@@ -146,7 +147,7 @@ describe("validate explicit Wasmer directory grants", () => {
         readonlyPaths: ["/srv/der/workspaces/sess-1/input"],
         writablePaths: ["/srv/der/workspaces/sess-1/out"],
       },
-      { allowedHostRoots: ["/srv/der/workspaces"] },
+      { allowedHostRoots: ["/srv/der/workspaces"], resolveRealPath: identityRealPath },
     );
 
     expect(grants).toEqual([
@@ -187,7 +188,10 @@ describe("validate explicit Wasmer directory grants", () => {
   ])("rejects unsafe directory grant: $name", ({ paths, expectedCode }) => {
     let caught: unknown;
     try {
-      validateWasmerDirectoryGrants(paths, { allowedHostRoots: ["/srv/der/workspaces"] });
+      validateWasmerDirectoryGrants(paths, {
+        allowedHostRoots: ["/srv/der/workspaces"],
+        resolveRealPath: identityRealPath,
+      });
     } catch (error) {
       caught = error;
     }
@@ -211,6 +215,7 @@ describe("run pinned Bash and Python WASI/WASIX guests in a short-lived Wasmer s
       maxTimeoutMs: 10_000,
       maxOutputBytes: 4096,
       now: () => 5000,
+      resolveRealPath: identityRealPath,
     });
 
     const bashResult = await sandbox.execute({
@@ -452,6 +457,7 @@ describe("run pinned Bash and Python WASI/WASIX guests in a short-lived Wasmer s
       maxTimeoutMs: 5000,
       runner: fakeRunner,
       now: () => 1000,
+      resolveRealPath: identityRealPath,
     });
 
     const result = await sandbox.execute({
@@ -496,5 +502,141 @@ describe("run pinned Bash and Python WASI/WASIX guests in a short-lived Wasmer s
       timeoutMs: 3000,
       network: "none",
     });
+  });
+
+  it("rejects a symlink inside an allowed host root pointing outside the root in Wasmer contract, runner, and Docker Wasmer sandbox", async () => {
+    const baseDir = mkdtempSync("/tmp/der-wasmer-symlink-");
+    tempDirs.push(baseDir);
+    const allowedRoot = join(baseDir, "allowed");
+    const outsideDir = join(baseDir, "outside");
+    const internalSubdir = join(allowedRoot, "safe");
+    mkdirSync(internalSubdir, { recursive: true });
+    mkdirSync(outsideDir, { recursive: true });
+
+    const escapeLink = join(allowedRoot, "escape-link");
+    symlinkSync(outsideDir, escapeLink);
+    const internalLink = join(allowedRoot, "internal-link");
+    symlinkSync(internalSubdir, internalLink);
+
+    let caughtGrant: unknown;
+    try {
+      validateWasmerDirectoryGrants(
+        { readonlyPaths: [escapeLink] },
+        { allowedHostRoots: [allowedRoot] },
+      );
+    } catch (error) {
+      caughtGrant = error;
+    }
+    expect(caughtGrant).toBeInstanceOf(SandboxControlError);
+    expect((caughtGrant as SandboxControlError).code).toBe("wasmer.directory_outside_root");
+
+    const { driver, launches } = createFakeWasmerDriver(() => ({
+      exitCode: 0,
+      stdout: "ok",
+      stderr: "",
+      timedOut: false,
+    }));
+    const wasmerSandbox = createWasmerSandbox({
+      driver,
+      allowedHostRoots: [allowedRoot],
+    });
+
+    let caughtWasmer: unknown;
+    try {
+      await wasmerSandbox.execute({
+        command: "bash",
+        args: ["-c", "ls"],
+        writablePaths: [escapeLink],
+        timeoutMs: 2000,
+        network: "none",
+      });
+    } catch (error) {
+      caughtWasmer = error;
+    }
+    expect(caughtWasmer).toBeInstanceOf(SandboxControlError);
+    expect((caughtWasmer as SandboxControlError).code).toBe("wasmer.directory_outside_root");
+    expect(launches).toHaveLength(0);
+
+    const recorded: string[][] = [];
+    const fakeRunner: CommandRunner = {
+      async exec(_command, args): Promise<CommandExecResult> {
+        recorded.push([...args]);
+        if (args[0] === "info") {
+          return {
+            exitCode: 0,
+            stdout: JSON.stringify({
+              ServerVersion: "29.10.0",
+              SecurityOptions: ["name=rootless"],
+              MemoryLimit: true,
+              CpuCfsQuota: true,
+              PidsLimit: true,
+            }),
+            stderr: "",
+          };
+        }
+        return {
+          exitCode: 0,
+          stdout: JSON.stringify({
+            exitCode: 0,
+            stdout: "ok",
+            stderr: "",
+            timedOut: false,
+            durationMs: 1,
+          }),
+          stderr: "",
+        };
+      },
+      async spawn() {
+        throw new Error("spawn not expected");
+      },
+    };
+
+    const dockerWasmer = createDockerWasmerSandbox({
+      dockerHost: "unix:///run/user/1000/docker.sock",
+      user: "1000:1000",
+      limits: { cpus: 1, memoryMb: 512, pidsLimit: 128 },
+      allowedHostRoots: [allowedRoot],
+      runner: fakeRunner,
+    });
+
+    let caughtDockerWasmer: unknown;
+    try {
+      await dockerWasmer.execute({
+        command: "bash",
+        args: ["-c", "ls"],
+        readonlyPaths: [escapeLink],
+        timeoutMs: 2000,
+        network: "none",
+      });
+    } catch (error) {
+      caughtDockerWasmer = error;
+    }
+    expect(caughtDockerWasmer).toBeInstanceOf(SandboxControlError);
+    expect((caughtDockerWasmer as SandboxControlError).code).toBe("wasmer.directory_outside_root");
+
+    let caughtMissing: unknown;
+    try {
+      validateWasmerDirectoryGrants(
+        { readonlyPaths: [join(allowedRoot, "does-not-exist")] },
+        { allowedHostRoots: [allowedRoot] },
+      );
+    } catch (error) {
+      caughtMissing = error;
+    }
+    expect(caughtMissing).toBeInstanceOf(SandboxControlError);
+    expect((caughtMissing as SandboxControlError).code).toBe("wasmer.invalid_directory_grant");
+    expect(recorded.some((args) => args[0] === "run")).toBe(false);
+
+    await dockerWasmer.execute({
+      command: "bash",
+      args: ["-c", "ls"],
+      readonlyPaths: [internalLink],
+      timeoutMs: 2000,
+      network: "none",
+    });
+    const runCall = recorded.find((args) => args[0] === "run");
+    expect(runCall).toContain(
+      `type=bind,source=${realpathSync(internalSubdir)},target=/work/ro-0,readonly`,
+    );
   });
 });

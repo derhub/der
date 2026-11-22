@@ -54,6 +54,27 @@ const egressNetworkName = z
     },
   );
 
+const egressProxyUrl = z
+  .string()
+  .min(1)
+  .refine(
+    (value) => {
+      try {
+        const parsed = new URL(value.trim());
+        return (
+          (parsed.protocol === "http:" || parsed.protocol === "https:") &&
+          parsed.hostname.length > 0
+        );
+      } catch {
+        return false;
+      }
+    },
+    {
+      message:
+        "Docker egress proxy URL must be a valid http(s) URL reachable on the internal egress network.",
+    },
+  );
+
 const mcpTransportSchema = z.discriminatedUnion("kind", [
   z.object({
     kind: z.literal("stdio"),
@@ -122,58 +143,70 @@ const engineModelsSchema = z.object({
   antigravity: z.string().min(1).default("default"),
 });
 
-const serverConfigSchema = z.object({
-  host: z.string().min(1).default("127.0.0.1"),
-  port: z.number().int().min(0).max(65535).default(3000),
-  restateHost: z.string().min(1).default("127.0.0.1"),
-  restateListen: z.number().int().min(0).max(65535).default(9080),
-  restateIngressUrl: z.string().url().default("http://127.0.0.1:8080"),
-  restateAdminUrl: z.string().url().default("http://127.0.0.1:9070"),
-  restateDeploymentUrl: z.string().url().optional(),
-  restateAutoRegister: z.boolean().default(false),
-  restateMode: z.enum(["restate", "direct"]).default("restate"),
-  databasePath: z.string().min(1).default("./data/der.sqlite"),
-  memoryProjectionDir: z.string().min(1).default("./data/memory"),
-  skillsRootDir: z.string().min(1).default("./data/skills"),
-  workspaceRootDir: z.string().min(1).default("./data/workspaces"),
-  contextMaxTokens: z.number().int().positive().default(32_000),
-  allowedOrigins: z
-    .array(originString)
-    .default([
-      "http://127.0.0.1:3000",
-      "http://localhost:3000",
-      "http://127.0.0.1:5173",
-      "http://localhost:5173",
-    ]),
-  approvalTimeoutMs: z.number().int().positive().default(300_000),
-  ssePollIntervalMs: z.number().int().positive().default(25),
-  sseKeepAliveMs: z.number().int().positive().default(15_000),
-  seedFixture: z.boolean().default(false),
-  enabledEngines: z.array(engineKind).min(1).default(["codex", "claude-code", "antigravity"]),
-  dockerHost: z.string().default(""),
-  dockerBinary: z.string().min(1).default("docker"),
-  dockerUser: nonRootDockerUser.default("1000:1000"),
-  dockerCpus: z.number().positive().default(2),
-  dockerMemoryMb: z.number().int().min(64).default(2048),
-  dockerPidsLimit: z.number().int().min(16).default(256),
-  dockerEgressNetwork: egressNetworkName.optional(),
-  engineImages: engineImagesSchema.default({
-    codex: "der-engine-codex:latest",
-    claudeCode: "der-engine-claude-code:latest",
-    antigravity: "der-engine-antigravity:latest",
-  }),
-  engineModels: engineModelsSchema.default({
-    codex: "gpt-5-codex",
-    claudeCode: "claude-sonnet-4-5",
-    antigravity: "default",
-  }),
-  wasmerRunnerImage: z.string().min(1).default("der-wasmer-runner:latest"),
-  wasmerAllowedRoots: z.array(z.string().min(1)).default([]),
-  wasmerMaxTimeoutMs: z.number().int().positive().default(30_000),
-  mcpServers: z.array(mcpServerConfigSchema).default([]),
-  homeAssistant: homeAssistantConfigSchema.optional(),
-  telegram: telegramConfigSchema.optional(),
-});
+const serverConfigSchema = z
+  .object({
+    host: z.string().min(1).default("127.0.0.1"),
+    port: z.number().int().min(0).max(65535).default(3000),
+    restateHost: z.string().min(1).default("127.0.0.1"),
+    restateListen: z.number().int().min(0).max(65535).default(9080),
+    restateIngressUrl: z.string().url().default("http://127.0.0.1:8080"),
+    restateAdminUrl: z.string().url().default("http://127.0.0.1:9070"),
+    restateDeploymentUrl: z.string().url().optional(),
+    restateAutoRegister: z.boolean().default(false),
+    restateMode: z.enum(["restate", "direct"]).default("restate"),
+    databasePath: z.string().min(1).default("./data/der.sqlite"),
+    memoryProjectionDir: z.string().min(1).default("./data/memory"),
+    skillsRootDir: z.string().min(1).default("./data/skills"),
+    workspaceRootDir: z.string().min(1).default("./data/workspaces"),
+    contextMaxTokens: z.number().int().positive().default(32_000),
+    allowedOrigins: z
+      .array(originString)
+      .default([
+        "http://127.0.0.1:3000",
+        "http://localhost:3000",
+        "http://127.0.0.1:5173",
+        "http://localhost:5173",
+      ]),
+    approvalTimeoutMs: z.number().int().positive().default(300_000),
+    ssePollIntervalMs: z.number().int().positive().default(25),
+    sseKeepAliveMs: z.number().int().positive().default(15_000),
+    seedFixture: z.boolean().default(false),
+    enabledEngines: z.array(engineKind).min(1).default(["codex", "claude-code", "antigravity"]),
+    dockerHost: z.string().default(""),
+    dockerBinary: z.string().min(1).default("docker"),
+    dockerUser: nonRootDockerUser.default("1000:1000"),
+    dockerCpus: z.number().positive().default(2),
+    dockerMemoryMb: z.number().int().min(64).default(2048),
+    dockerPidsLimit: z.number().int().min(16).default(256),
+    dockerEgressNetwork: egressNetworkName.optional(),
+    dockerEgressProxyUrl: egressProxyUrl.optional(),
+    engineImages: engineImagesSchema.default({
+      codex: "der-engine-codex:latest",
+      claudeCode: "der-engine-claude-code:latest",
+      antigravity: "der-engine-antigravity:latest",
+    }),
+    engineModels: engineModelsSchema.default({
+      codex: "gpt-5-codex",
+      claudeCode: "claude-sonnet-4-5",
+      antigravity: "default",
+    }),
+    wasmerRunnerImage: z.string().min(1).default("der-wasmer-runner:latest"),
+    wasmerAllowedRoots: z.array(z.string().min(1)).default([]),
+    wasmerMaxTimeoutMs: z.number().int().positive().default(30_000),
+    mcpServers: z.array(mcpServerConfigSchema).default([]),
+    homeAssistant: homeAssistantConfigSchema.optional(),
+    telegram: telegramConfigSchema.optional(),
+  })
+  .superRefine((value, ctx) => {
+    if (value.dockerEgressNetwork !== undefined && value.dockerEgressProxyUrl === undefined) {
+      ctx.addIssue({
+        code: "custom",
+        path: ["dockerEgressProxyUrl"],
+        message:
+          "DER_DOCKER_EGRESS_PROXY_URL is required when DER_DOCKER_EGRESS_NETWORK is configured.",
+      });
+    }
+  });
 
 export type ServerConfig = z.infer<typeof serverConfigSchema>;
 export type ParsedMcpServerConfig = McpServerConfig;
@@ -450,6 +483,9 @@ export function parseServerConfig(
     ...(dockerPidsLimit !== undefined ? { dockerPidsLimit } : {}),
     ...(env["DER_DOCKER_EGRESS_NETWORK"]
       ? { dockerEgressNetwork: env["DER_DOCKER_EGRESS_NETWORK"].trim() }
+      : {}),
+    ...(env["DER_DOCKER_EGRESS_PROXY_URL"]?.trim()
+      ? { dockerEgressProxyUrl: env["DER_DOCKER_EGRESS_PROXY_URL"].trim() }
       : {}),
     ...(Object.keys(engineImagesFromEnv).length > 0
       ? {

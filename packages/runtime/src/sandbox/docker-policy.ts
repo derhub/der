@@ -1,9 +1,12 @@
+import { realpathSync } from "node:fs";
 import { posix } from "node:path";
 import type { EngineKind } from "@der/domain";
 import { SandboxControlError } from "./errors";
 import { bunCommandRunner, type CommandRunner } from "./process-runner";
 
 export type OfficialEngineKind = Exclude<EngineKind, "fixture">;
+export type RealPathResolver = (path: string) => string;
+export const DOCKER_EGRESS_ALLOWED_HOSTS_LABEL = "der.egress.allowed_hosts";
 
 export interface EngineShadowHomeSpec {
   readonly engine: OfficialEngineKind;
@@ -68,6 +71,7 @@ export type DockerNetworkPolicy =
       readonly mode: "scoped_egress";
       readonly networkName: string;
       readonly allowedHosts: readonly string[];
+      readonly egressProxyUrl: string;
     };
 
 export interface DockerMountSpec {
@@ -97,6 +101,7 @@ export interface DockerContainerSpec {
   readonly env?: Readonly<Record<string, string>>;
   readonly extraMounts?: readonly DockerMountSpec[];
   readonly readOnlyRootfs?: boolean;
+  readonly resolveRealPath?: RealPathResolver;
 }
 
 export interface DockerRunArgOptions {
@@ -117,6 +122,8 @@ export interface ProbeDockerIsolationOptions {
   readonly dockerHost: string;
   readonly dockerBinary?: string;
   readonly egressNetworkName?: string;
+  readonly egressEngine?: OfficialEngineKind;
+  readonly egressAllowedHosts?: readonly string[];
   readonly runner?: CommandRunner;
   readonly signal?: AbortSignal;
 }
@@ -126,12 +133,15 @@ export interface DockerEgressNetworkReport {
   readonly networkName: string;
   readonly driver: string | null;
   readonly internal: boolean;
+  readonly allowedHosts: readonly string[];
   readonly reasons: readonly string[];
 }
 
 export interface ProbeDockerEgressNetworkOptions {
   readonly dockerHost: string;
   readonly networkName: string;
+  readonly engine?: OfficialEngineKind;
+  readonly allowedHosts?: readonly string[];
   readonly dockerBinary?: string;
   readonly runner?: CommandRunner;
   readonly signal?: AbortSignal;
@@ -233,9 +243,29 @@ function assertNotForbiddenHostPath(
   }
 }
 
+function resolveCanonicalHostPath(
+  normalizedPath: string,
+  rawPath: string,
+  label: string,
+  resolveRealPath: RealPathResolver,
+): string {
+  let resolved: string;
+  try {
+    resolved = resolveRealPath(normalizedPath);
+  } catch (error) {
+    throw new SandboxControlError(
+      "docker.invalid_workspace_mount",
+      `${label} "${rawPath}" could not be resolved on the host filesystem.`,
+      { cause: error },
+    );
+  }
+  return normalizeCleanAbsolutePath(resolved, label);
+}
+
 function validateAllowedWorkspaceRoots(
   roots: readonly string[],
   daemonSocketPath: string | null,
+  resolveRealPath: RealPathResolver,
 ): string[] {
   if (roots.length === 0) {
     throw new SandboxControlError(
@@ -246,13 +276,21 @@ function validateAllowedWorkspaceRoots(
   return roots.map((root) => {
     const normalized = normalizeCleanAbsolutePath(root, "Allowed workspace root");
     assertNotForbiddenHostPath(root, normalized, "/workspace", daemonSocketPath, true);
-    return normalized;
+    const resolved = resolveCanonicalHostPath(
+      normalized,
+      root,
+      "Allowed workspace root",
+      resolveRealPath,
+    );
+    assertNotForbiddenHostPath(root, resolved, "/workspace", daemonSocketPath, true);
+    return resolved;
   });
 }
 
 function assertMountSafe(
   mount: { readonly source: string; readonly target: string; readonly type: "bind" | "volume" },
   daemonSocketPath: string | null,
+  resolveRealPath: RealPathResolver,
   allowedBindRoots?: readonly string[],
 ): string {
   const source = mount.source.trim();
@@ -276,15 +314,22 @@ function assertMountSafe(
 
   const normalizedSource = normalizeCleanAbsolutePath(source, "Docker bind mount source");
   assertNotForbiddenHostPath(source, normalizedSource, target, daemonSocketPath, true);
+  const resolvedSource = resolveCanonicalHostPath(
+    normalizedSource,
+    source,
+    "Docker bind mount source",
+    resolveRealPath,
+  );
+  assertNotForbiddenHostPath(source, resolvedSource, target, daemonSocketPath, true);
 
-  if (allowedBindRoots !== undefined && !isWithinAllowedRoots(normalizedSource, allowedBindRoots)) {
+  if (allowedBindRoots !== undefined && !isWithinAllowedRoots(resolvedSource, allowedBindRoots)) {
     throw new SandboxControlError(
       "docker.bind_path_outside_root",
-      `Host bind mount "${source}" resolves to "${normalizedSource}", which is outside allowed workspace roots.`,
+      `Host bind mount "${source}" resolves to "${resolvedSource}", which is outside allowed workspace roots.`,
     );
   }
 
-  return normalizedSource;
+  return resolvedSource;
 }
 
 function validateEgressNetworkName(rawName: string): string {
@@ -304,7 +349,48 @@ function validateEgressNetworkName(rawName: string): string {
   return netName;
 }
 
-export function validateDockerContainerSpec(spec: DockerContainerSpec): void {
+function validateEgressProxyUrl(rawUrl: unknown): string {
+  if (typeof rawUrl !== "string" || rawUrl.trim().length === 0) {
+    throw new SandboxControlError(
+      "docker.egress_network_unverified",
+      "Scoped egress requires an explicit egressProxyUrl reachable on the internal Docker network.",
+    );
+  }
+  const trimmed = rawUrl.trim();
+  if (/[\r\n\0]/.test(trimmed)) {
+    throw new SandboxControlError(
+      "docker.egress_network_unverified",
+      `Scoped egress proxy URL "${rawUrl}" contains invalid control characters.`,
+    );
+  }
+  let parsed: URL;
+  try {
+    parsed = new URL(trimmed);
+  } catch {
+    throw new SandboxControlError(
+      "docker.egress_network_unverified",
+      `Scoped egress proxy URL "${rawUrl}" must be a valid http(s) URL.`,
+    );
+  }
+  if (
+    (parsed.protocol !== "http:" && parsed.protocol !== "https:") ||
+    parsed.hostname.length === 0
+  ) {
+    throw new SandboxControlError(
+      "docker.egress_network_unverified",
+      `Scoped egress proxy URL "${rawUrl}" must use http:// or https:// with a valid host.`,
+    );
+  }
+  return trimmed;
+}
+
+interface ValidatedDockerMounts {
+  readonly workspaceSource: string;
+  readonly extraMounts: readonly DockerMountSpec[];
+  readonly egressProxyUrl?: string;
+}
+
+function resolveAndValidateDockerSpec(spec: DockerContainerSpec): ValidatedDockerMounts {
   if (isRootUserSpec(spec.user)) {
     throw new SandboxControlError(
       "docker.root_user_forbidden",
@@ -352,8 +438,12 @@ export function validateDockerContainerSpec(spec: DockerContainerSpec): void {
     );
   }
 
+  let egressProxyUrl: string | undefined;
   if (spec.network.mode === "scoped_egress") {
     validateEgressNetworkName(spec.network.networkName);
+    egressProxyUrl = validateEgressProxyUrl(
+      (spec.network as { readonly egressProxyUrl?: unknown }).egressProxyUrl,
+    );
     if (spec.network.allowedHosts.length === 0) {
       throw new SandboxControlError(
         "docker.egress_host_not_approved",
@@ -371,19 +461,21 @@ export function validateDockerContainerSpec(spec: DockerContainerSpec): void {
     }
   }
 
+  const resolveRealPath = spec.resolveRealPath ?? realpathSync;
   const daemonSocketPath = extractUnixSocketPath(spec.dockerHost);
   const explicitAllowedRoots =
     spec.allowedWorkspaceRoots !== undefined
-      ? validateAllowedWorkspaceRoots(spec.allowedWorkspaceRoots, daemonSocketPath)
+      ? validateAllowedWorkspaceRoots(spec.allowedWorkspaceRoots, daemonSocketPath, resolveRealPath)
       : undefined;
 
-  const normalizedWorkspaceSource = assertMountSafe(
+  const resolvedWorkspaceSource = assertMountSafe(
     {
       type: "bind",
       source: spec.workspaceMount.source,
       target: spec.workspaceMount.target,
     },
     daemonSocketPath,
+    resolveRealPath,
     explicitAllowedRoots,
   );
   assertMountSafe(
@@ -393,12 +485,33 @@ export function validateDockerContainerSpec(spec: DockerContainerSpec): void {
       target: spec.shadowHome.containerHomePath,
     },
     daemonSocketPath,
+    resolveRealPath,
   );
 
-  const effectiveBindRoots = explicitAllowedRoots ?? [normalizedWorkspaceSource];
+  const effectiveBindRoots = explicitAllowedRoots ?? [resolvedWorkspaceSource];
+  const resolvedExtraMounts: DockerMountSpec[] = [];
   for (const extra of spec.extraMounts ?? []) {
-    assertMountSafe(extra, daemonSocketPath, effectiveBindRoots);
+    const resolvedSource = assertMountSafe(
+      extra,
+      daemonSocketPath,
+      resolveRealPath,
+      effectiveBindRoots,
+    );
+    resolvedExtraMounts.push({
+      ...extra,
+      source: resolvedSource,
+    });
   }
+
+  return {
+    workspaceSource: resolvedWorkspaceSource,
+    extraMounts: resolvedExtraMounts,
+    ...(egressProxyUrl !== undefined ? { egressProxyUrl } : {}),
+  };
+}
+
+export function validateDockerContainerSpec(spec: DockerContainerSpec): void {
+  resolveAndValidateDockerSpec(spec);
 }
 
 function formatMountArg(mount: DockerMountSpec): string {
@@ -411,7 +524,7 @@ export function buildDockerRunArgs(
   spec: DockerContainerSpec,
   options?: DockerRunArgOptions,
 ): string[] {
-  validateDockerContainerSpec(spec);
+  const validated = resolveAndValidateDockerSpec(spec);
 
   const args: string[] = ["run"];
   if (options?.detach) {
@@ -445,7 +558,7 @@ export function buildDockerRunArgs(
     "--mount",
     formatMountArg({
       type: "bind",
-      source: spec.workspaceMount.source,
+      source: validated.workspaceSource,
       target: spec.workspaceMount.target,
       readonly: spec.workspaceMount.readonly,
     }),
@@ -460,7 +573,7 @@ export function buildDockerRunArgs(
     }),
   );
 
-  for (const extra of spec.extraMounts ?? []) {
+  for (const extra of validated.extraMounts) {
     args.push("--mount", formatMountArg(extra));
   }
 
@@ -469,6 +582,14 @@ export function buildDockerRunArgs(
   const mergedEnv: Record<string, string> = {
     ...spec.shadowHome.envOverrides,
     ...spec.env,
+    ...(validated.egressProxyUrl !== undefined
+      ? {
+          HTTP_PROXY: validated.egressProxyUrl,
+          HTTPS_PROXY: validated.egressProxyUrl,
+          http_proxy: validated.egressProxyUrl,
+          https_proxy: validated.egressProxyUrl,
+        }
+      : {}),
   };
   for (const [key, value] of Object.entries(mergedEnv)) {
     if (key === "DOCKER_HOST") {
@@ -497,6 +618,28 @@ interface DockerNetworkInspectPayload {
   readonly Driver?: unknown;
   readonly Internal?: unknown;
   readonly Options?: unknown;
+  readonly Labels?: unknown;
+}
+
+function parseEgressAllowedHostsLabel(
+  rawLabel: unknown,
+  netName: string,
+  reasons: string[],
+): string[] {
+  if (typeof rawLabel !== "string" || rawLabel.trim().length === 0) {
+    reasons.push(
+      `Egress network "${netName}" is missing required label "${DOCKER_EGRESS_ALLOWED_HOSTS_LABEL}".`,
+    );
+    return [];
+  }
+  const parts = rawLabel.split(",").map((entry) => entry.trim());
+  if (parts.length === 0 || parts.some((entry) => entry.length === 0)) {
+    reasons.push(
+      `Egress network "${netName}" label "${DOCKER_EGRESS_ALLOWED_HOSTS_LABEL}" must be a non-empty comma-separated host allowlist.`,
+    );
+    return [];
+  }
+  return [...new Set(parts)];
 }
 
 export async function probeDockerEgressNetwork(
@@ -515,6 +658,7 @@ export async function probeDockerEgressNetwork(
       networkName: netName,
       driver: null,
       internal: false,
+      allowedHosts: [],
       reasons: [error instanceof Error ? error.message : String(error)],
     };
   }
@@ -525,6 +669,7 @@ export async function probeDockerEgressNetwork(
       networkName: netName,
       driver: null,
       internal: false,
+      allowedHosts: [],
       reasons: ["Dedicated rootless DOCKER_HOST is not configured."],
     };
   }
@@ -545,6 +690,7 @@ export async function probeDockerEgressNetwork(
       networkName: netName,
       driver: null,
       internal: false,
+      allowedHosts: [],
       reasons: [
         `Docker egress network probe failed for "${netName}": ${
           error instanceof Error ? error.message : String(error)
@@ -559,6 +705,7 @@ export async function probeDockerEgressNetwork(
       networkName: netName,
       driver: null,
       internal: false,
+      allowedHosts: [],
       reasons: [
         `Configured scoped egress network "${netName}" does not exist or cannot be inspected (exit ${execResult.exitCode}).`,
       ],
@@ -579,6 +726,7 @@ export async function probeDockerEgressNetwork(
       networkName: netName,
       driver: null,
       internal: false,
+      allowedHosts: [],
       reasons: [`Docker daemon returned malformed JSON when inspecting network "${netName}".`],
     };
   }
@@ -589,6 +737,10 @@ export async function probeDockerEgressNetwork(
   const networkOptions =
     parsed.Options !== null && typeof parsed.Options === "object" && !Array.isArray(parsed.Options)
       ? (parsed.Options as Record<string, unknown>)
+      : {};
+  const networkLabels =
+    parsed.Labels !== null && typeof parsed.Labels === "object" && !Array.isArray(parsed.Labels)
+      ? (parsed.Labels as Record<string, unknown>)
       : {};
 
   if (FORBIDDEN_NETWORK_NAMES.has(inspectedName.toLowerCase())) {
@@ -606,11 +758,47 @@ export async function probeDockerEgressNetwork(
     );
   }
 
+  const labelHosts = parseEgressAllowedHostsLabel(
+    networkLabels[DOCKER_EGRESS_ALLOWED_HOSTS_LABEL],
+    netName,
+    reasons,
+  );
+  const approvedVendorHosts = new Set(
+    options.engine !== undefined
+      ? APPROVED_VENDOR_EGRESS[options.engine]
+      : Object.values(APPROVED_VENDOR_EGRESS).flat(),
+  );
+  for (const host of labelHosts) {
+    if (!approvedVendorHosts.has(host)) {
+      reasons.push(
+        `Egress network "${netName}" label "${DOCKER_EGRESS_ALLOWED_HOSTS_LABEL}" permits unapproved host "${host}".`,
+      );
+    }
+  }
+  if (options.allowedHosts !== undefined) {
+    if (options.allowedHosts.length === 0) {
+      reasons.push(
+        `Scoped egress probe for network "${netName}" requires at least one requested approved host.`,
+      );
+    }
+    const labelHostSet = new Set(labelHosts);
+    for (const requestedHost of options.allowedHosts) {
+      if (!approvedVendorHosts.has(requestedHost)) {
+        reasons.push(`Requested egress host "${requestedHost}" is not an approved vendor host.`);
+      } else if (!labelHostSet.has(requestedHost)) {
+        reasons.push(
+          `Egress network "${netName}" label "${DOCKER_EGRESS_ALLOWED_HOSTS_LABEL}" does not cover requested host "${requestedHost}".`,
+        );
+      }
+    }
+  }
+
   return {
     verified: reasons.length === 0,
     networkName: inspectedName,
     driver,
     internal,
+    allowedHosts: labelHosts,
     reasons,
   };
 }
@@ -702,6 +890,10 @@ export async function probeDockerIsolation(
     const egressReport = await probeDockerEgressNetwork({
       dockerHost: options.dockerHost,
       networkName: options.egressNetworkName,
+      ...(options.egressEngine !== undefined ? { engine: options.egressEngine } : {}),
+      ...(options.egressAllowedHosts !== undefined
+        ? { allowedHosts: options.egressAllowedHosts }
+        : {}),
       dockerBinary,
       runner,
       ...(options.signal !== undefined ? { signal: options.signal } : {}),
