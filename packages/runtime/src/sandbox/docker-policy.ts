@@ -124,6 +124,7 @@ export interface ProbeDockerIsolationOptions {
   readonly egressNetworkName?: string;
   readonly egressEngine?: OfficialEngineKind;
   readonly egressAllowedHosts?: readonly string[];
+  readonly egressProxyUrl?: string;
   readonly runner?: CommandRunner;
   readonly signal?: AbortSignal;
 }
@@ -142,6 +143,7 @@ export interface ProbeDockerEgressNetworkOptions {
   readonly networkName: string;
   readonly engine?: OfficialEngineKind;
   readonly allowedHosts?: readonly string[];
+  readonly egressProxyUrl?: string;
   readonly dockerBinary?: string;
   readonly runner?: CommandRunner;
   readonly signal?: AbortSignal;
@@ -349,7 +351,64 @@ function validateEgressNetworkName(rawName: string): string {
   return netName;
 }
 
-function validateEgressProxyUrl(rawUrl: unknown): string {
+function normalizeUrlHost(hostname: string): string {
+  const stripped =
+    hostname.startsWith("[") && hostname.endsWith("]") ? hostname.slice(1, -1) : hostname;
+  return stripped.trim().toLowerCase().replace(/\.+$/, "");
+}
+
+function isLoopbackOrLinkLocalIpv4(host: string): boolean {
+  const match = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(host);
+  if (!match) {
+    return false;
+  }
+  const a = Number(match[1]);
+  const b = Number(match[2]);
+  const c = Number(match[3]);
+  const d = Number(match[4]);
+  if (a > 255 || b > 255 || c > 255 || d > 255) {
+    return false;
+  }
+  return a === 127 || a === 0 || (a === 169 && b === 254);
+}
+
+function isLoopbackOrLinkLocalHost(rawHostname: string): boolean {
+  const host = normalizeUrlHost(rawHostname);
+  if (
+    host === "localhost" ||
+    host.endsWith(".localhost") ||
+    host === "localhost.localdomain" ||
+    host.endsWith(".localhost.localdomain")
+  ) {
+    return true;
+  }
+  if (isLoopbackOrLinkLocalIpv4(host)) {
+    return true;
+  }
+  if (host === "::1" || host === "::" || host === "0:0:0:0:0:0:0:1" || host === "0:0:0:0:0:0:0:0") {
+    return true;
+  }
+  if (/^fe[89ab][0-9a-f]:/.test(host)) {
+    return true;
+  }
+  const mappedDotted = /^::ffff:(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})$/.exec(host);
+  if (mappedDotted?.[1] !== undefined) {
+    return isLoopbackOrLinkLocalIpv4(mappedDotted[1]);
+  }
+  const mappedHex = /^::ffff:([0-9a-f]{1,4}):([0-9a-f]{1,4})$/.exec(host);
+  if (mappedHex?.[1] !== undefined && mappedHex[2] !== undefined) {
+    const hi = Number.parseInt(mappedHex[1], 16);
+    const lo = Number.parseInt(mappedHex[2], 16);
+    const ipv4 = `${(hi >> 8) & 0xff}.${hi & 0xff}.${(lo >> 8) & 0xff}.${lo & 0xff}`;
+    return isLoopbackOrLinkLocalIpv4(ipv4);
+  }
+  return false;
+}
+
+function parseValidatedEgressProxy(rawUrl: unknown): {
+  readonly url: string;
+  readonly host: string;
+} {
   if (typeof rawUrl !== "string" || rawUrl.trim().length === 0) {
     throw new SandboxControlError(
       "docker.egress_network_unverified",
@@ -381,7 +440,18 @@ function validateEgressProxyUrl(rawUrl: unknown): string {
       `Scoped egress proxy URL "${rawUrl}" must use http:// or https:// with a valid host.`,
     );
   }
-  return trimmed;
+  const host = normalizeUrlHost(parsed.hostname);
+  if (host.length === 0 || isLoopbackOrLinkLocalHost(host)) {
+    throw new SandboxControlError(
+      "docker.egress_network_unverified",
+      `Scoped egress proxy URL "${rawUrl}" must use a non-loopback, non-link-local host reachable on the internal Docker network.`,
+    );
+  }
+  return { url: trimmed, host };
+}
+
+function validateEgressProxyUrl(rawUrl: unknown): string {
+  return parseValidatedEgressProxy(rawUrl).url;
 }
 
 interface ValidatedDockerMounts {
@@ -613,12 +683,19 @@ interface DockerInfoPayload {
   readonly PidsLimit?: unknown;
 }
 
+interface DockerNetworkEndpointPayload {
+  readonly Name?: unknown;
+  readonly IPv4Address?: unknown;
+  readonly IPv6Address?: unknown;
+}
+
 interface DockerNetworkInspectPayload {
   readonly Name?: unknown;
   readonly Driver?: unknown;
   readonly Internal?: unknown;
   readonly Options?: unknown;
   readonly Labels?: unknown;
+  readonly Containers?: unknown;
 }
 
 function parseEgressAllowedHostsLabel(
@@ -793,6 +870,64 @@ export async function probeDockerEgressNetwork(
     }
   }
 
+  let proxyHost: string | undefined;
+  if (options.egressProxyUrl !== undefined) {
+    try {
+      proxyHost = parseValidatedEgressProxy(options.egressProxyUrl).host;
+    } catch (error) {
+      reasons.push(error instanceof Error ? error.message : String(error));
+    }
+  }
+
+  if (parsed.Containers !== undefined) {
+    const containersMap =
+      parsed.Containers !== null &&
+      typeof parsed.Containers === "object" &&
+      !Array.isArray(parsed.Containers)
+        ? (parsed.Containers as Record<string, unknown>)
+        : null;
+    if (containersMap === null) {
+      reasons.push(`Egress network "${netName}" reported malformed Containers metadata.`);
+    } else {
+      const attachedContainers = Object.values(containersMap).filter(
+        (entry): entry is DockerNetworkEndpointPayload =>
+          entry !== null && typeof entry === "object" && !Array.isArray(entry),
+      );
+      if (attachedContainers.length === 0) {
+        reasons.push(
+          `Egress network "${netName}" has no containers attached to serve scoped egress proxy traffic.`,
+        );
+      } else if (proxyHost !== undefined) {
+        const inspectedLower = inspectedName.toLowerCase();
+        const proxyAttached = attachedContainers.some((endpoint) => {
+          const name =
+            typeof endpoint.Name === "string"
+              ? endpoint.Name.trim().replace(/^\/+/, "").toLowerCase()
+              : "";
+          const ipv4 =
+            typeof endpoint.IPv4Address === "string"
+              ? (endpoint.IPv4Address.trim().split("/")[0]?.toLowerCase() ?? "")
+              : "";
+          const ipv6 =
+            typeof endpoint.IPv6Address === "string"
+              ? normalizeUrlHost(endpoint.IPv6Address.trim().split("/")[0] ?? "")
+              : "";
+          return (
+            (name.length > 0 &&
+              (name === proxyHost || `${name}.${inspectedLower}` === proxyHost)) ||
+            (ipv4.length > 0 && ipv4 === proxyHost) ||
+            (ipv6.length > 0 && ipv6 === proxyHost)
+          );
+        });
+        if (!proxyAttached) {
+          reasons.push(
+            `Egress proxy host "${proxyHost}" is not attached to internal egress network "${netName}".`,
+          );
+        }
+      }
+    }
+  }
+
   return {
     verified: reasons.length === 0,
     networkName: inspectedName,
@@ -894,6 +1029,7 @@ export async function probeDockerIsolation(
       ...(options.egressAllowedHosts !== undefined
         ? { allowedHosts: options.egressAllowedHosts }
         : {}),
+      ...(options.egressProxyUrl !== undefined ? { egressProxyUrl: options.egressProxyUrl } : {}),
       dockerBinary,
       runner,
       ...(options.signal !== undefined ? { signal: options.signal } : {}),

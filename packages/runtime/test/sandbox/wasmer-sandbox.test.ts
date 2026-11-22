@@ -639,4 +639,74 @@ describe("run pinned Bash and Python WASI/WASIX guests in a short-lived Wasmer s
       `type=bind,source=${realpathSync(internalSubdir)},target=/work/ro-0,readonly`,
     );
   });
+
+  it("revalidates canonical Wasmer directory grants immediately before docker run after the awaited isolation probe", async () => {
+    const baseDir = mkdtempSync("/tmp/der-wasmer-toctou-");
+    tempDirs.push(baseDir);
+    const allowedRoot = join(baseDir, "allowed");
+    const outsideDir = join(baseDir, "outside");
+    const swappedDir = join(allowedRoot, "swapped");
+    mkdirSync(swappedDir, { recursive: true });
+    mkdirSync(outsideDir, { recursive: true });
+
+    const recorded: string[][] = [];
+    const fakeRunner: CommandRunner = {
+      async exec(_command, args): Promise<CommandExecResult> {
+        recorded.push([...args]);
+        if (args[0] === "info") {
+          rmSync(swappedDir, { recursive: true, force: true });
+          symlinkSync(outsideDir, swappedDir);
+          return {
+            exitCode: 0,
+            stdout: JSON.stringify({
+              ServerVersion: "29.10.0",
+              SecurityOptions: ["name=rootless"],
+              MemoryLimit: true,
+              CpuCfsQuota: true,
+              PidsLimit: true,
+            }),
+            stderr: "",
+          };
+        }
+        return {
+          exitCode: 0,
+          stdout: JSON.stringify({
+            exitCode: 0,
+            stdout: "should-not-run",
+            stderr: "",
+            timedOut: false,
+            durationMs: 1,
+          }),
+          stderr: "",
+        };
+      },
+      async spawn() {
+        throw new Error("spawn not expected");
+      },
+    };
+
+    const dockerWasmer = createDockerWasmerSandbox({
+      dockerHost: "unix:///run/user/1000/docker.sock",
+      user: "1000:1000",
+      limits: { cpus: 1, memoryMb: 512, pidsLimit: 128 },
+      allowedHostRoots: [allowedRoot],
+      runner: fakeRunner,
+    });
+
+    let caught: unknown;
+    try {
+      await dockerWasmer.execute({
+        command: "bash",
+        args: ["-c", "ls"],
+        readonlyPaths: [swappedDir],
+        timeoutMs: 2000,
+        network: "none",
+      });
+    } catch (error) {
+      caught = error;
+    }
+    expect(caught).toBeInstanceOf(SandboxControlError);
+    expect((caught as SandboxControlError).code).toBe("wasmer.directory_outside_root");
+    expect(recorded.some((args) => args[0] === "run")).toBe(false);
+  });
 });

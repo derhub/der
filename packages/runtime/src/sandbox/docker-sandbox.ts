@@ -328,6 +328,40 @@ export function createHardenedDockerProvider(
         ...config.env,
         ...input.env,
       };
+      if (config.verifyIsolationOnCreate !== false) {
+        const probe = await probeDockerIsolation({
+          dockerHost: config.dockerHost,
+          dockerBinary,
+          runner,
+          ...(input.signal !== undefined ? { signal: input.signal } : {}),
+        });
+        if (!probe.isolationVerified) {
+          throw new SandboxControlError(
+            "docker.isolation_unverified",
+            `Hardened Docker isolation check failed: ${probe.reasons.join("; ")}`,
+          );
+        }
+      }
+
+      if (config.network.mode === "scoped_egress") {
+        const egressProbe = await probeDockerEgressNetwork({
+          dockerHost: config.dockerHost,
+          networkName: config.network.networkName,
+          engine: config.engine,
+          allowedHosts: config.network.allowedHosts,
+          egressProxyUrl: config.network.egressProxyUrl,
+          dockerBinary,
+          runner,
+          ...(input.signal !== undefined ? { signal: input.signal } : {}),
+        });
+        if (!egressProbe.verified) {
+          throw new SandboxControlError(
+            "docker.egress_network_unverified",
+            `Hardened Docker egress network check failed: ${egressProbe.reasons.join("; ")}`,
+          );
+        }
+      }
+
       const spec: DockerContainerSpec = {
         containerName,
         image: config.image,
@@ -355,38 +389,6 @@ export function createHardenedDockerProvider(
         detach: true,
         command: ["sleep", "infinity"],
       });
-
-      if (config.verifyIsolationOnCreate !== false) {
-        const probe = await probeDockerIsolation({
-          dockerHost: config.dockerHost,
-          dockerBinary,
-          runner,
-          ...(input.signal !== undefined ? { signal: input.signal } : {}),
-        });
-        if (!probe.isolationVerified) {
-          throw new SandboxControlError(
-            "docker.isolation_unverified",
-            `Hardened Docker isolation check failed: ${probe.reasons.join("; ")}`,
-          );
-        }
-        if (config.network.mode === "scoped_egress") {
-          const egressProbe = await probeDockerEgressNetwork({
-            dockerHost: config.dockerHost,
-            networkName: config.network.networkName,
-            engine: config.engine,
-            allowedHosts: config.network.allowedHosts,
-            dockerBinary,
-            runner,
-            ...(input.signal !== undefined ? { signal: input.signal } : {}),
-          });
-          if (!egressProbe.verified) {
-            throw new SandboxControlError(
-              "docker.egress_network_unverified",
-              `Hardened Docker egress network check failed: ${egressProbe.reasons.join("; ")}`,
-            );
-          }
-        }
-      }
 
       const started = await runner.exec(dockerBinary, runArgs, {
         env: hostEnv,
@@ -507,6 +509,24 @@ export function createDockerSandbox(config: DockerSandboxConfig): Sandbox {
                 );
               })();
 
+      if (network.mode === "scoped_egress") {
+        const egressProbe = await probeDockerEgressNetwork({
+          dockerHost: config.dockerHost,
+          networkName: network.networkName,
+          engine: config.engine,
+          allowedHosts: network.allowedHosts,
+          egressProxyUrl: network.egressProxyUrl,
+          dockerBinary,
+          runner,
+        });
+        if (!egressProbe.verified) {
+          throw new SandboxControlError(
+            "docker.egress_network_unverified",
+            `Hardened Docker egress network check failed: ${egressProbe.reasons.join("; ")}`,
+          );
+        }
+      }
+
       const extraMounts: DockerMountSpec[] = [
         ...(request.readonlyPaths ?? []).map((hostPath, idx): DockerMountSpec => ({
           type: "bind",
@@ -551,23 +571,6 @@ export function createDockerSandbox(config: DockerSandboxConfig): Sandbox {
           command: [request.command, ...request.args],
         },
       );
-
-      if (network.mode === "scoped_egress") {
-        const egressProbe = await probeDockerEgressNetwork({
-          dockerHost: config.dockerHost,
-          networkName: network.networkName,
-          engine: config.engine,
-          allowedHosts: network.allowedHosts,
-          dockerBinary,
-          runner,
-        });
-        if (!egressProbe.verified) {
-          throw new SandboxControlError(
-            "docker.egress_network_unverified",
-            `Hardened Docker egress network check failed: ${egressProbe.reasons.join("; ")}`,
-          );
-        }
-      }
 
       const startedAt = now();
       const result = await runner.exec(dockerBinary, args, {

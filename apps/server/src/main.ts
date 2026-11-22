@@ -425,7 +425,6 @@ export async function buildEngineHostTools(input: {
   readonly reconcileEffect?: (effect: EffectIdentity) => Promise<ToolResult | undefined>;
 }): Promise<Array<AnyTool>> {
   const descriptors = input.tools.list ? await input.tools.list() : [];
-  let toolCallSeq = 0;
 
   return descriptors.map((descriptor): AnyTool => ({
     name: descriptor.id,
@@ -433,19 +432,20 @@ export async function buildEngineHostTools(input: {
     inputSchema: descriptor.inputSchema as AnyTool["inputSchema"],
     metadata: { requiresApproval: descriptor.requiresApproval },
     execute: async (rawArgs: unknown, ctx?: { readonly signal?: AbortSignal }) => {
-      toolCallSeq += 1;
       const canonicalArguments = normalizeToJsonValue(rawArgs ?? {});
-      const fingerprint = await digestJson({
+      const canonicalArgsDigest = await digestJson(canonicalArguments);
+      const effectDigest = await digestJson({
+        runId: input.run.id,
+        operationKind: descriptor.kind,
         operationId: descriptor.id,
-        canonicalArguments,
-        toolCallSeq,
+        canonicalArgsDigest,
       });
       const effect: EffectIdentity = {
         runId: input.run.id,
         operationKind: descriptor.kind,
         operationId: descriptor.id,
         canonicalArguments,
-        attemptId: `${input.run.id}:tool:${toolCallSeq}:${fingerprint}`,
+        attemptId: `${input.run.id}:tool:${effectDigest}`,
       };
 
       if (descriptor.requiresApproval) {

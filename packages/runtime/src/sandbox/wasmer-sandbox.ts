@@ -385,19 +385,6 @@ export function createDockerWasmerSandbox(config: DockerWasmerSandboxConfig): Sa
       const guestPin = guestPins[guestKind];
       validateWasmerGuestPin(guestPin);
 
-      const directoryGrants = validateWasmerDirectoryGrants(
-        {
-          ...(request.readonlyPaths !== undefined ? { readonlyPaths: request.readonlyPaths } : {}),
-          ...(request.writablePaths !== undefined ? { writablePaths: request.writablePaths } : {}),
-        },
-        {
-          allowedHostRoots: config.allowedHostRoots,
-          ...(config.resolveRealPath !== undefined
-            ? { resolveRealPath: config.resolveRealPath }
-            : {}),
-        },
-      );
-
       const probe = await probeDockerIsolation({
         dockerHost: config.dockerHost,
         dockerBinary,
@@ -431,6 +418,19 @@ export function createDockerWasmerSandbox(config: DockerWasmerSandboxConfig): Sa
         `--memory-swap=${config.limits.memoryMb}m`,
         `--pids-limit=${config.limits.pidsLimit}`,
       ];
+
+      const directoryGrants = validateWasmerDirectoryGrants(
+        {
+          ...(request.readonlyPaths !== undefined ? { readonlyPaths: request.readonlyPaths } : {}),
+          ...(request.writablePaths !== undefined ? { writablePaths: request.writablePaths } : {}),
+        },
+        {
+          allowedHostRoots: config.allowedHostRoots,
+          ...(config.resolveRealPath !== undefined
+            ? { resolveRealPath: config.resolveRealPath }
+            : {}),
+        },
+      );
 
       const containerReadonlyPaths: string[] = [];
       const containerWritablePaths: string[] = [];

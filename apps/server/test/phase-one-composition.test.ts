@@ -1046,4 +1046,269 @@ describe("serve Phase 1 memory, skills, routines, engines, tools, and shared com
     expect(crashedInvokeCount).toBe(0);
     expect(server.store.getEffect(seededApproval.effect)?.status).toBe("unknown");
   });
+
+  it("derives order-independent race-free effect identity so concurrent or reordered replays reuse completed outcomes and interrupt on ambiguous effects", async () => {
+    const tempDb = createTempDatabase("der-host-tool-order-");
+    const server = startServer({
+      config: {
+        host: "127.0.0.1",
+        port: 0,
+        restateHost: "127.0.0.1",
+        restateListen: 0,
+        restateMode: "direct",
+        databasePath: tempDb.dbPath,
+        memoryProjectionDir: join(tempDb.dir, "memory"),
+        skillsRootDir: join(tempDb.dir, "skills"),
+        workspaceRootDir: join(tempDb.dir, "workspaces"),
+        enabledEngines: ["fixture"],
+        seedFixture: true,
+      },
+    });
+    cleanups.push(async () => {
+      await server.close();
+      tempDb.cleanup();
+    });
+
+    const bot = server.seededFixture!.bot;
+    const session = server.seededFixture!.session;
+
+    let invokeCount = 0;
+    const observedEffectIds: EffectIdentity[] = [];
+    const multiTools: Tools = {
+      async list(): Promise<readonly ToolDescriptor[]> {
+        return [
+          {
+            kind: "mcp",
+            id: "mcp.alpha",
+            name: "Alpha Tool",
+            description: "Applies alpha side effect.",
+            requiresApproval: true,
+            inputSchema: { type: "object" },
+          },
+          {
+            kind: "mcp",
+            id: "mcp.beta",
+            name: "Beta Tool",
+            description: "Applies beta side effect.",
+            requiresApproval: true,
+            inputSchema: { type: "object" },
+          },
+        ];
+      },
+      async invoke(operation): Promise<ToolResult> {
+        invokeCount += 1;
+        observedEffectIds.push(operation.effect);
+        return {
+          ok: true,
+          isError: false,
+          outcome: {
+            op: operation.effect.operationId,
+            invocation: invokeCount,
+            args: operation.effect.canonicalArguments,
+          },
+        };
+      },
+    };
+
+    const admission = await server.store.admit({
+      botId: bot.id,
+      sessionId: session.id,
+      origin: "http",
+      idempotencyKey: "host-tool-order-independent",
+      engine: "fixture",
+      input: { parts: [{ type: "text", text: "apply alpha and beta" }] },
+    });
+    const run = await server.store.markRunRunning(admission.run.id);
+
+    const autoApproveBroker = {
+      async requestApproval(req: {
+        readonly effect: EffectIdentity;
+        readonly prompt: string;
+        readonly signal: AbortSignal;
+      }) {
+        const requested = await server.store.requestApproval({
+          botId: bot.id,
+          sessionId: session.id,
+          runId: run.id,
+          effect: req.effect,
+          prompt: req.prompt,
+          awakeable: `awk-${req.effect.attemptId}`,
+          deadline: "2099-01-01T00:00:00.000Z",
+        });
+        if (requested.approval.decision.status === "pending") {
+          await server.store.decide({
+            approvalId: requested.approval.id,
+            botId: bot.id,
+            sessionId: session.id,
+            runId: run.id,
+            status: "approved",
+            actor: "operator",
+            decidedAt: "2026-11-22T00:00:00.000Z",
+          });
+        }
+        return {
+          status: "approved" as const,
+          approvalId: requested.approval.id,
+          effect: req.effect,
+        };
+      },
+    };
+
+    const attempt1 = await buildEngineHostTools({
+      run,
+      store: server.store,
+      tools: multiTools,
+      approvalBroker: autoApproveBroker,
+    });
+    const [alphaFirst, betaFirst] = (await Promise.all([
+      attempt1[0]!.execute!({ target: "lamp-a", level: 1 }),
+      attempt1[1]!.execute!({ target: "lamp-b", level: 2 }),
+    ])) as [ToolResult, ToolResult];
+
+    expect(invokeCount).toBe(2);
+    expect(observedEffectIds).toHaveLength(2);
+    expect(observedEffectIds[0]!.attemptId).not.toBe(observedEffectIds[1]!.attemptId);
+
+    const attempt2 = await buildEngineHostTools({
+      run,
+      store: server.store,
+      tools: multiTools,
+      approvalBroker: autoApproveBroker,
+    });
+    const betaReplayed = (await attempt2[1]!.execute!({
+      level: 2,
+      target: "lamp-b",
+    })) as ToolResult;
+    const alphaReplayed = (await attempt2[0]!.execute!({
+      level: 1,
+      target: "lamp-a",
+    })) as ToolResult;
+    expect(betaReplayed).toEqual(betaFirst);
+    expect(alphaReplayed).toEqual(alphaFirst);
+    expect(invokeCount).toBe(2);
+
+    await server.store.finishRun({
+      runId: run.id,
+      status: "completed",
+      terminalEvent: {
+        chunkKey: `${run.id}:terminal`,
+        chunk: { type: "RUN_FINISHED", threadId: session.id, runId: run.id },
+      },
+    });
+
+    const crashAdmission = await server.store.admit({
+      botId: bot.id,
+      sessionId: session.id,
+      origin: "http",
+      idempotencyKey: "host-tool-order-ambiguous",
+      engine: "fixture",
+      input: { parts: [{ type: "text", text: "ambiguous out-of-order replay" }] },
+    });
+    const crashRun = await server.store.markRunRunning(crashAdmission.run.id);
+
+    let seededAmbiguousEffect: EffectIdentity | undefined;
+    const seederTools = await buildEngineHostTools({
+      run: crashRun,
+      store: server.store,
+      tools: multiTools,
+      approvalBroker: {
+        async requestApproval(req) {
+          seededAmbiguousEffect = req.effect;
+          const requested = await server.store.requestApproval({
+            botId: bot.id,
+            sessionId: session.id,
+            runId: crashRun.id,
+            effect: req.effect,
+            prompt: req.prompt,
+            awakeable: `awk-seed-${req.effect.attemptId}`,
+            deadline: "2099-01-01T00:00:00.000Z",
+          });
+          await server.store.decide({
+            approvalId: requested.approval.id,
+            botId: bot.id,
+            sessionId: session.id,
+            runId: crashRun.id,
+            status: "approved",
+            actor: "operator",
+            decidedAt: "2026-11-22T00:00:00.000Z",
+          });
+          const begun = await server.store.beginEffect(req.effect, {
+            approvalId: requested.approval.id,
+          });
+          expect(begun.kind).toBe("started");
+          return {
+            status: "denied",
+            approvalId: requested.approval.id,
+            effect: req.effect,
+          };
+        },
+      },
+    });
+    await seederTools[0]!.execute!({ target: "ambiguous-lamp" });
+    expect(seededAmbiguousEffect).toBeDefined();
+
+    let ambiguousInvokeCount = 0;
+    const replayAmbiguousTools: Tools = {
+      async list() {
+        return multiTools.list!();
+      },
+      async invoke(operation): Promise<ToolResult> {
+        ambiguousInvokeCount += 1;
+        return {
+          ok: true,
+          isError: false,
+          outcome: { op: operation.effect.operationId },
+        };
+      },
+    };
+
+    const reorderedAttempt = await buildEngineHostTools({
+      run: crashRun,
+      store: server.store,
+      tools: replayAmbiguousTools,
+      approvalBroker: {
+        async requestApproval(req) {
+          const requested = await server.store.requestApproval({
+            botId: bot.id,
+            sessionId: session.id,
+            runId: crashRun.id,
+            effect: req.effect,
+            prompt: req.prompt,
+            awakeable: `awk-replay-${req.effect.attemptId}`,
+            deadline: "2099-01-01T00:00:00.000Z",
+          });
+          if (requested.approval.decision.status === "pending") {
+            await server.store.decide({
+              approvalId: requested.approval.id,
+              botId: bot.id,
+              sessionId: session.id,
+              runId: crashRun.id,
+              status: "approved",
+              actor: "operator",
+              decidedAt: "2026-11-22T00:00:00.000Z",
+            });
+          }
+          return {
+            status: "approved",
+            approvalId: requested.approval.id,
+            effect: req.effect,
+          };
+        },
+      },
+    });
+
+    await reorderedAttempt[1]!.execute!({ target: "other-lamp" });
+    expect(ambiguousInvokeCount).toBe(1);
+
+    let caughtAmbiguous: unknown;
+    try {
+      await reorderedAttempt[0]!.execute!({ target: "ambiguous-lamp" });
+    } catch (error) {
+      caughtAmbiguous = error;
+    }
+    expect(caughtAmbiguous).toBeInstanceOf(UncertainEffectError);
+    expect(ambiguousInvokeCount).toBe(1);
+    expect(server.store.getRun(crashRun.id)?.status).toBe("interrupted");
+    expect(server.store.getEffect(seededAmbiguousEffect!)?.status).toBe("unknown");
+  });
 });
