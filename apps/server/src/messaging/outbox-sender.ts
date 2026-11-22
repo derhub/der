@@ -1,13 +1,12 @@
 import {
   formatUtcTimestamp,
-  type ChannelBinding,
-  type ChannelIntegration,
   type DeliveryResult,
-  type Messaging,
+  type MaybePromise,
+  type OutboxDestination,
   type OutboxEvent,
+  type OutboxSink,
+  type OutboxStore,
 } from "@der/domain";
-import type { SqliteStore } from "@der/storage";
-import { redactTelegramSecret } from "@der/telegram";
 
 const DEFAULT_POLL_INTERVAL_MS = 500;
 const DEFAULT_INITIAL_BACKOFF_MS = 1_000;
@@ -15,8 +14,9 @@ const DEFAULT_MAX_BACKOFF_MS = 60_000;
 const DEFAULT_BATCH_LIMIT = 50;
 
 export interface OutboxSenderOptions {
-  readonly store: SqliteStore;
-  readonly adapters: ReadonlyMap<ChannelIntegration, Messaging>;
+  readonly store: OutboxStore;
+  readonly listDestinations: () => MaybePromise<readonly OutboxDestination[]>;
+  readonly sinks: ReadonlyMap<string, OutboxSink>;
   readonly pollIntervalMs?: number;
   readonly initialBackoffMs?: number;
   readonly maxBackoffMs?: number;
@@ -54,7 +54,7 @@ export function createOutboxSender(options: OutboxSenderOptions): OutboxSender {
   const initialBackoffMs = options.initialBackoffMs ?? DEFAULT_INITIAL_BACKOFF_MS;
   const maxBackoffMs = options.maxBackoffMs ?? DEFAULT_MAX_BACKOFF_MS;
   const batchLimit = options.batchLimit ?? DEFAULT_BATCH_LIMIT;
-  const nowFn = options.now ?? (() => options.store.database.now());
+  const nowFn = options.now ?? (() => new Date());
 
   let running = false;
   let timer: ReturnType<typeof setTimeout> | null = null;
@@ -69,35 +69,41 @@ export function createOutboxSender(options: OutboxSenderOptions): OutboxSender {
     const nowMs = nowDate.getTime();
     const nowUtc = formatUtcTimestamp(nowDate);
 
-    if (options.adapters.size === 0) {
-      const retained = options.store.listDueOutboxEvents(nowUtc, batchLimit).length;
-      return { attempted: 0, delivered: 0, retrying: 0, failed: 0, retained };
+    if (options.sinks.size === 0) {
+      const due = await options.store.listDueOutboxEvents(nowUtc, batchLimit);
+      return { attempted: 0, delivered: 0, retrying: 0, failed: 0, retained: due.length };
     }
 
-    const allBindings = options.store.listChannelBindings();
-    const bindingsById = new Map<string, ChannelBinding>();
-    const activeBindings: ChannelBinding[] = [];
-    for (const binding of allBindings) {
-      bindingsById.set(binding.id, binding);
-      if (binding.enabled && options.adapters.has(binding.integration)) {
-        activeBindings.push(binding);
+    const allDestinations = await options.listDestinations();
+    const destinationsById = new Map<string, OutboxDestination>();
+    const activeDestinations: OutboxDestination[] = [];
+    for (const destination of allDestinations) {
+      destinationsById.set(destination.id, destination);
+      if (destination.enabled && options.sinks.has(destination.kind)) {
+        activeDestinations.push(destination);
       }
     }
 
     let retained = 0;
-    for (const due of options.store.listDueOutboxEvents(nowUtc, batchLimit)) {
-      const binding = bindingsById.get(due.bindingId);
-      if (binding === undefined || !binding.enabled || !options.adapters.has(binding.integration)) {
+    const dueEvents = await options.store.listDueOutboxEvents(nowUtc, batchLimit);
+    for (const due of dueEvents) {
+      const destination = destinationsById.get(due.bindingId);
+      if (
+        destination === undefined ||
+        !destination.enabled ||
+        !options.sinks.has(destination.kind)
+      ) {
         retained += 1;
       }
     }
 
-    const candidates: { readonly binding: ChannelBinding; readonly event: OutboxEvent }[] = [];
-    for (const binding of activeBindings) {
-      const bindingRows = options.store.listOutboxEvents({ bindingId: binding.id });
-      for (const row of bindingRows) {
+    const candidates: { readonly destination: OutboxDestination; readonly event: OutboxEvent }[] =
+      [];
+    for (const destination of activeDestinations) {
+      const rows = await options.store.listOutboxEvents({ bindingId: destination.id });
+      for (const row of rows) {
         if (isOutboxDue(row, nowMs)) {
-          candidates.push({ binding, event: row });
+          candidates.push({ destination, event: row });
         }
       }
     }
@@ -115,9 +121,9 @@ export function createOutboxSender(options: OutboxSenderOptions): OutboxSender {
     let retrying = 0;
     let failed = 0;
 
-    for (const { binding, event } of batch) {
-      const adapter = options.adapters.get(binding.integration);
-      if (adapter === undefined) {
+    for (const { destination, event } of batch) {
+      const sink = options.sinks.get(destination.kind);
+      if (sink === undefined) {
         retained += 1;
         continue;
       }
@@ -125,9 +131,9 @@ export function createOutboxSender(options: OutboxSenderOptions): OutboxSender {
       attempted += 1;
       let result: DeliveryResult;
       try {
-        result = await adapter.deliver(binding, event);
+        result = await sink.deliver(destination, event.envelope);
       } catch (error) {
-        const detail = redactTelegramSecret(error instanceof Error ? error.message : String(error));
+        const detail = error instanceof Error ? error.message : String(error);
         result = {
           status: "retryable",
           retryAfterMs: computeRetryBackoff(event.attempts),

@@ -1,4 +1,16 @@
-export { createDirectWorkflow } from "./direct-workflow";
+export {
+  createRunCoordinator,
+  type AwakeableHandle,
+  type CoordinatorDriver,
+  type RunCoordinator,
+  type RunCoordinatorOptions,
+} from "./coordinator";
+export {
+  createDirectWorkflow,
+  createDirectWorkflowDriver,
+  type DirectWorkflowDriver,
+  type DirectWorkflowDriverOptions,
+} from "./direct-workflow";
 export {
   createFixtureEngine,
   createFixtureTools,
@@ -9,7 +21,9 @@ export {
 export {
   createCommandsService,
   createRestateFetchHandler,
+  createRestateStepDriver,
   createRestateWorkflowClient,
+  createRestateWorkflowDriver,
   createRunWorkflow,
   type AnyRestateService,
   type CommandsServiceDefinition,
@@ -30,6 +44,7 @@ export {
   type RoutineScheduleClient,
   type RoutineScheduleDeps,
   type RoutineScheduleObjectDefinition,
+  type RoutineScheduleStore,
   type RoutineTickDisposition,
   type RoutineTickInput,
   type RoutineTickResult,
@@ -52,4 +67,5 @@ export {
   type DurableWorkflow,
   type PreApprovalStageResult,
   type WorkflowDeps,
+  type WorkflowStore,
 } from "./run-steps";

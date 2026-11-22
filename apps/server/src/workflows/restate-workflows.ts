@@ -2,8 +2,8 @@ import * as restate from "@restatedev/restate-sdk/fetch";
 import * as clients from "@restatedev/restate-sdk-clients";
 import {
   DomainError,
-  formatUtcTimestamp,
   type Approval,
+  type ApprovalId,
   type ApprovalResolutionInput,
   type ChannelIntakeMetadata,
   type RunAdmission,
@@ -12,21 +12,12 @@ import {
 } from "@der/domain";
 import { compiledParsers } from "@der/domain/compiled";
 import { fingerprintJson } from "@der/storage";
-import {
-  executeApprovedEffectStep,
-  executeEnginePreApprovalStage,
-  finalizeCompletedWithEffectStep,
-  finalizeDirectRunStep,
-  finalizeInterruptedUncertainStep,
-  finalizeRejectedApprovalStep,
-  loadAndStartRunStep,
-  persistPendingApprovalStep,
-  reconcileApprovalExpiryStep,
-  type ApprovalDecisionPayload,
-  type AwaitApprovalInput,
-  type AwaitApprovalOutcome,
-  type DurableWorkflow,
-  type WorkflowDeps,
+import type { AwakeableHandle, CoordinatorDriver, RunCoordinator } from "./coordinator";
+import type {
+  ApprovalDecisionPayload,
+  AwaitApprovalInput,
+  AwaitApprovalOutcome,
+  DurableWorkflow,
 } from "./run-steps";
 
 const PROBLEM_MARKER = "__derProblem";
@@ -64,7 +55,6 @@ function tryExtractProblem(raw: string): DomainError | undefined {
         return new DomainError(validated.data);
       }
     } catch {
-      // Try extracting balanced JSON object around marker.
       if (markerIndex !== -1) {
         const start = candidate.lastIndexOf("{", markerIndex);
         const end = candidate.lastIndexOf("}");
@@ -123,103 +113,74 @@ export interface DecideCommandInput {
   readonly channelIntake?: ChannelIntakeMetadata;
 }
 
-export function createRunWorkflow(deps: WorkflowDeps) {
+export function createRestateStepDriver(
+  ctx: restate.Context | restate.WorkflowContext,
+  options?: { readonly wrapTerminalErrors?: boolean },
+): CoordinatorDriver {
+  const wrapErrors = options?.wrapTerminalErrors ?? false;
+
+  return {
+    runStep<T>(name: string, fn: () => Promise<T>): Promise<T> {
+      return ctx.run(name, async () => {
+        try {
+          return await fn();
+        } catch (error) {
+          if (wrapErrors) {
+            toRestateTerminalError(error);
+          }
+          throw error;
+        }
+      });
+    },
+
+    nowMs(): Promise<number> {
+      return ctx.date.now();
+    },
+
+    createAwakeable(): AwakeableHandle {
+      const awakeable = ctx.awakeable<ApprovalDecisionPayload>();
+      return {
+        id: awakeable.id,
+        async wait(remainingMs: number): Promise<ApprovalDecisionPayload | "timeout"> {
+          try {
+            return await awakeable.promise.orTimeout(Math.max(1, remainingMs));
+          } catch (error) {
+            if (error instanceof restate.TimeoutError) {
+              return "timeout";
+            }
+            throw error;
+          }
+        },
+      };
+    },
+
+    async awaitApproval(_approvalId: ApprovalId, _timeoutMs: number): Promise<Approval> {
+      throw new Error("Restate step driver uses createAwakeable() via RunCoordinator.");
+    },
+
+    async resolveApproval(_approvalId: ApprovalId, approval: Approval): Promise<void> {
+      if (approval.decision.status !== "pending") {
+        ctx.resolveAwakeable<ApprovalDecisionPayload>(approval.awakeable, {
+          approvalId: approval.id,
+          status: approval.decision.status,
+          ...(approval.decision.status === "approved" || approval.decision.status === "denied"
+            ? { actor: approval.decision.actor }
+            : {}),
+          decidedAt: approval.decision.decidedAt,
+        });
+      }
+    },
+  };
+}
+
+export function createRunWorkflow(coordinator: RunCoordinator) {
   return restate.workflow({
     name: "RunWorkflow",
     handlers: {
       run: async (ctx: restate.WorkflowContext, input: { readonly runId: RunId }) => {
-        const started = await ctx.run("load-and-start-run", () =>
-          loadAndStartRunStep(deps, input.runId),
-        );
-        if (started.alreadyTerminal) {
-          return { status: started.run.status };
-        }
-
-        const run = started.run;
-        const stage = await ctx.run("engine-pre-approval", () =>
-          executeEnginePreApprovalStage(deps, run),
-        );
-
-        if (stage.kind !== "approval_required") {
-          const finished = await ctx.run("finish-direct-run", () =>
-            finalizeDirectRunStep(deps, { run, outcome: stage }),
-          );
-          return { status: finished.status };
-        }
-
-        const awakeable = ctx.awakeable<ApprovalDecisionPayload>();
-        const nowMs = await ctx.date.now();
-        const deadlineMs = nowMs + deps.approvalTimeoutMs;
-        const deadline = formatUtcTimestamp(new Date(deadlineMs));
-
-        const persisted = await ctx.run("persist-approval", () =>
-          persistPendingApprovalStep(deps, {
-            run,
-            effect: stage.effect,
-            prompt: stage.prompt,
-            awakeable: awakeable.id,
-            deadline,
-          }),
-        );
-
-        let decisionStatus: "approved" | "denied" | "expired";
-        try {
-          const currentMs = await ctx.date.now();
-          const remainingMs = Math.max(1, Date.parse(persisted.deadline) - currentMs);
-          const resolved = await awakeable.promise.orTimeout(remainingMs);
-          decisionStatus = resolved.status;
-        } catch (error) {
-          if (error instanceof restate.TimeoutError) {
-            decisionStatus = await ctx.run("reconcile-approval-expiry", () =>
-              reconcileApprovalExpiryStep(deps, {
-                run,
-                approvalId: persisted.approvalId,
-                deadline: persisted.deadline,
-              }),
-            );
-          } else {
-            throw error;
-          }
-        }
-
-        if (decisionStatus !== "approved") {
-          const finished = await ctx.run("finish-rejected-approval", () =>
-            finalizeRejectedApprovalStep(deps, {
-              run,
-              approvalId: persisted.approvalId,
-              status: decisionStatus,
-            }),
-          );
-          return { status: finished.status };
-        }
-
-        const effectOutcome = await ctx.run("execute-approved-effect", () =>
-          executeApprovedEffectStep(deps, {
-            run,
-            approvalId: persisted.approvalId,
-            effect: stage.effect,
-          }),
-        );
-
-        if (effectOutcome.kind === "uncertain") {
-          const interrupted = await ctx.run("interrupt-uncertain-run", () =>
-            finalizeInterruptedUncertainStep(deps, {
-              run,
-              effectId: effectOutcome.effectId,
-              detail: effectOutcome.detail,
-            }),
-          );
-          return { status: interrupted.status };
-        }
-
-        const completed = await ctx.run("finish-completed-run", () =>
-          finalizeCompletedWithEffectStep(deps, {
-            run,
-            effect: stage.effect,
-            toolResult: effectOutcome.toolResult,
-          }),
-        );
-        return { status: completed.status };
+        const driver = createRestateStepDriver(ctx);
+        await coordinator.executeRun(input.runId, driver);
+        return { ok: true };
       },
     },
   });
@@ -227,14 +188,17 @@ export function createRunWorkflow(deps: WorkflowDeps) {
 
 export type RunWorkflowDefinition = ReturnType<typeof createRunWorkflow>;
 
-export function createCommandsService(deps: WorkflowDeps, runWorkflow: RunWorkflowDefinition) {
+export function createCommandsService(
+  coordinator: RunCoordinator,
+  runWorkflow: RunWorkflowDefinition,
+) {
   return restate.service({
     name: "Commands",
     handlers: {
       admit: async (ctx: restate.Context, request: RunRequest): Promise<RunAdmission> => {
         const admission = await ctx.run("admit-run", async () => {
           try {
-            return await deps.store.admit(request);
+            return await coordinator.admitOnly(request);
           } catch (error) {
             toRestateTerminalError(error);
           }
@@ -250,21 +214,14 @@ export function createCommandsService(deps: WorkflowDeps, runWorkflow: RunWorkfl
       decide: async (ctx: restate.Context, input: DecideCommandInput): Promise<Approval> => {
         const approval = await ctx.run("decide-approval", async () => {
           try {
-            return await deps.store.decide(input.decision, input.channelIntake);
+            return await coordinator.decideOnly(input.decision, input.channelIntake);
           } catch (error) {
             toRestateTerminalError(error);
           }
         });
 
         if (approval.decision.status !== "pending") {
-          ctx.resolveAwakeable<ApprovalDecisionPayload>(approval.awakeable, {
-            approvalId: approval.id,
-            status: approval.decision.status,
-            ...(approval.decision.status === "approved" || approval.decision.status === "denied"
-              ? { actor: approval.decision.actor }
-              : {}),
-            decidedAt: approval.decision.decidedAt,
-          });
+          await createRestateStepDriver(ctx).resolveApproval(approval.id, approval);
         }
 
         return approval;
@@ -274,66 +231,8 @@ export function createCommandsService(deps: WorkflowDeps, runWorkflow: RunWorkfl
         ctx: restate.Context,
         input: AwaitApprovalInput,
       ): Promise<AwaitApprovalOutcome> => {
-        const awakeable = ctx.awakeable<ApprovalDecisionPayload>();
-        const nowMs = await ctx.date.now();
-        const deadlineMs = nowMs + deps.approvalTimeoutMs;
-        const deadline = formatUtcTimestamp(new Date(deadlineMs));
-
-        const persisted = await ctx.run("persist-engine-approval", async () => {
-          try {
-            const result = await persistPendingApprovalStep(deps, {
-              run: input.run,
-              effect: input.effect,
-              prompt: input.prompt,
-              awakeable: awakeable.id,
-              deadline,
-            });
-            const existing = deps.store.getApproval(result.approvalId);
-            return {
-              ...result,
-              existingStatus:
-                existing && existing.decision.status !== "pending"
-                  ? existing.decision.status
-                  : undefined,
-            };
-          } catch (error) {
-            toRestateTerminalError(error);
-          }
-        });
-
-        if (persisted.existingStatus !== undefined) {
-          return {
-            status: persisted.existingStatus,
-            approvalId: persisted.approvalId,
-            effect: input.effect,
-          };
-        }
-
-        let decisionStatus: "approved" | "denied" | "expired";
-        try {
-          const currentMs = await ctx.date.now();
-          const remainingMs = Math.max(1, Date.parse(persisted.deadline) - currentMs);
-          const resolved = await awakeable.promise.orTimeout(remainingMs);
-          decisionStatus = resolved.status;
-        } catch (error) {
-          if (error instanceof restate.TimeoutError) {
-            decisionStatus = await ctx.run("reconcile-engine-approval-expiry", () =>
-              reconcileApprovalExpiryStep(deps, {
-                run: input.run,
-                approvalId: persisted.approvalId,
-                deadline: persisted.deadline,
-              }),
-            );
-          } else {
-            throw error;
-          }
-        }
-
-        return {
-          status: decisionStatus,
-          approvalId: persisted.approvalId,
-          effect: input.effect,
-        };
+        const driver = createRestateStepDriver(ctx, { wrapTerminalErrors: true });
+        return coordinator.awaitApprovalWithDriver(driver, input);
       },
     },
   });
@@ -344,11 +243,11 @@ export type CommandsServiceDefinition = ReturnType<typeof createCommandsService>
 export type AnyRestateService = restate.EndpointOptions["services"][number];
 
 export function createRestateFetchHandler(
-  deps: WorkflowDeps,
+  coordinator: RunCoordinator,
   extraServices: readonly AnyRestateService[] = [],
 ): (request: Request, ...extraArgs: unknown[]) => Promise<Response> {
-  const runWorkflow = createRunWorkflow(deps);
-  const commandsService = createCommandsService(deps, runWorkflow);
+  const runWorkflow = createRunWorkflow(coordinator);
+  const commandsService = createCommandsService(coordinator, runWorkflow);
   return restate.createEndpointHandler({
     services: [commandsService, runWorkflow, ...extraServices],
     bidirectional: false,
@@ -434,6 +333,24 @@ export function createRestateWorkflowClient(ingressUrl: string): DurableWorkflow
       } catch (error) {
         throw mapRestateIngressError(error, instance);
       }
+    },
+  };
+}
+
+export function createRestateWorkflowDriver(ingressUrl: string): CoordinatorDriver {
+  const client = createRestateWorkflowClient(ingressUrl);
+  return {
+    admit: (request) => client.admit(request),
+    decide: (decision, channelIntake) => client.decide(decision, channelIntake),
+    awaitApprovalCommand: (input, signal) => client.awaitApproval!(input, signal),
+    runStep<T>(_name: string, fn: () => Promise<T>): Promise<T> {
+      return fn();
+    },
+    async awaitApproval(_approvalId: ApprovalId, _timeoutMs: number): Promise<Approval> {
+      throw new Error("Restate ingress driver routes approvals through awaitApprovalCommand().");
+    },
+    async resolveApproval(): Promise<void> {
+      // Restate resolves awakeables inside Commands.decide.
     },
   };
 }

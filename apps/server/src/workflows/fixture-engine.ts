@@ -3,12 +3,12 @@ import type {
   EngineEvent,
   EngineReadiness,
   Run,
+  SessionStore,
   ToolDescriptor,
   ToolOperation,
   ToolResult,
   Tools,
 } from "@der/domain";
-import type { SqliteStore } from "@der/storage";
 
 export class UncertainEffectError extends Error {
   readonly code = "effect.outcome_uncertain";
@@ -30,7 +30,7 @@ export interface FixtureToolsOptions {
   readonly onInvoke?: (operation: ToolOperation) => void | Promise<void>;
 }
 
-export function createFixtureEngine(store: SqliteStore): Engine {
+export function createFixtureEngine(store: SessionStore): Engine {
   return {
     kind: "fixture",
     async diagnose(): Promise<EngineReadiness> {
@@ -43,7 +43,7 @@ export function createFixtureEngine(store: SqliteStore): Engine {
       };
     },
     async *run(run: Run): AsyncIterable<EngineEvent> {
-      const messages = store.listMessages(run.sessionId);
+      const messages = await store.listMessages(run.sessionId);
       const triggerMessage = messages.find((msg) => msg.runId === run.id && msg.role === "user");
       const firstText = triggerMessage?.parts.find((part) => part.type === "text")?.text ?? "";
       const messageId = `msg_stream_${run.id}`;

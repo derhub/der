@@ -12,7 +12,6 @@
     "@der/mcp": "workspace:*",
     "@der/runtime": "workspace:*",
     "@der/storage": "workspace:*",
-    "@der/telegram": "workspace:*",
     "@restatedev/restate-sdk": "1.18.4",
     "@restatedev/restate-sdk-clients": "1.18.4",
     "@tanstack/ai": "1.8.0",

@@ -2,6 +2,7 @@ import {
   DomainError,
   formatUtcTimestamp,
   type Approval,
+  type ApprovalEffectStore,
   type ApprovalId,
   type ApprovalResolutionInput,
   type ChannelIntakeMetadata,
@@ -15,12 +16,12 @@ import {
   type RunAdmission,
   type RunId,
   type RunRequest,
+  type RunStore,
   type ToolResult,
   type Tools,
   type UtcTimestamp,
   type Workflow,
 } from "@der/domain";
-import type { SqliteStore } from "@der/storage";
 import { UncertainEffectError } from "./fixture-engine";
 
 export interface AwaitApprovalInput {
@@ -44,12 +45,15 @@ export interface DurableWorkflow extends Workflow {
   awaitApproval?(input: AwaitApprovalInput, signal?: AbortSignal): Promise<AwaitApprovalOutcome>;
 }
 
+export type WorkflowStore = RunStore & ApprovalEffectStore;
+
 export interface WorkflowDeps {
-  readonly store: SqliteStore;
+  readonly store: WorkflowStore;
   readonly engines: ReadonlyMap<EngineKind, Engine>;
   readonly tools: Tools;
   readonly approvalTimeoutMs: number;
   readonly eventBatchSize?: number;
+  readonly now?: () => Date;
   readonly reconcileEffect?: (effect: EffectIdentity) => Promise<ToolResult | undefined>;
 }
 
@@ -99,7 +103,7 @@ export async function loadAndStartRunStep(
   deps: WorkflowDeps,
   runId: RunId,
 ): Promise<{ readonly run: Run; readonly alreadyTerminal: boolean }> {
-  const existing = deps.store.getRun(runId);
+  const existing = await deps.store.getRun(runId);
   if (!existing) {
     throw new DomainError({
       type: "https://der.invalid/problems/run-not-found",
@@ -144,8 +148,10 @@ export async function executeEnginePreApprovalStage(
     readonly isTerminal?: boolean;
   }[] = [];
 
-  const readInterruptedStage = (fallbackDetail?: string): PreApprovalStageResult | undefined => {
-    const currentRun = deps.store.getRun(run.id);
+  const readInterruptedStage = async (
+    fallbackDetail?: string,
+  ): Promise<PreApprovalStageResult | undefined> => {
+    const currentRun = await deps.store.getRun(run.id);
     if (currentRun?.status !== "interrupted") {
       return undefined;
     }
@@ -170,7 +176,7 @@ export async function executeEnginePreApprovalStage(
     if (pendingChunks.length === 0) {
       return;
     }
-    if (deps.store.getRun(run.id)?.status === "interrupted") {
+    if ((await deps.store.getRun(run.id))?.status === "interrupted") {
       pendingChunks.length = 0;
       return;
     }
@@ -180,7 +186,7 @@ export async function executeEnginePreApprovalStage(
 
   try {
     for await (const event of engine.run(run)) {
-      const interrupted = readInterruptedStage();
+      const interrupted = await readInterruptedStage();
       if (interrupted) {
         return interrupted;
       }
@@ -208,7 +214,7 @@ export async function executeEnginePreApprovalStage(
       }
 
       if (event.type === "completed") {
-        const postInterrupted = readInterruptedStage();
+        const postInterrupted = await readInterruptedStage();
         if (postInterrupted) {
           return postInterrupted;
         }
@@ -218,7 +224,7 @@ export async function executeEnginePreApprovalStage(
         };
       }
 
-      const failInterrupted = readInterruptedStage(event.detail);
+      const failInterrupted = await readInterruptedStage(event.detail);
       if (failInterrupted) {
         return failInterrupted;
       }
@@ -229,7 +235,9 @@ export async function executeEnginePreApprovalStage(
       };
     }
   } catch (error) {
-    const interrupted = readInterruptedStage(error instanceof Error ? error.message : undefined);
+    const interrupted = await readInterruptedStage(
+      error instanceof Error ? error.message : undefined,
+    );
     if (interrupted) {
       return interrupted;
     }
@@ -242,7 +250,7 @@ export async function executeEnginePreApprovalStage(
     throw error;
   }
 
-  const endInterrupted = readInterruptedStage();
+  const endInterrupted = await readInterruptedStage();
   if (endInterrupted) {
     return endInterrupted;
   }
@@ -321,7 +329,7 @@ export async function reconcileApprovalExpiryStep(
       error instanceof DomainError &&
       (error.code === "approval.expired" || error.code === "approval.decision_conflict")
     ) {
-      const current = deps.store.getApproval(input.approvalId);
+      const current = await deps.store.getApproval(input.approvalId);
       if (current) {
         return current.decision.status === "approved"
           ? "approved"
@@ -527,13 +535,14 @@ export async function finalizeRejectedApprovalStep(
 }
 
 export async function finalizeInterruptedUncertainStep(
-  deps: Pick<WorkflowDeps, "store">,
+  deps: Pick<WorkflowDeps, "store" | "now">,
   input: {
     readonly run: Run;
     readonly effectId: EffectId;
     readonly detail: string;
   },
 ): Promise<Run> {
+  const now = deps.now ? deps.now() : new Date();
   const finished = await deps.store.finishRun({
     runId: input.run.id,
     status: "interrupted",
@@ -550,7 +559,7 @@ export async function finalizeInterruptedUncertainStep(
     detail: input.detail,
     checkpoint: {
       interruptedEffectId: input.effectId,
-      recordedAt: formatUtcTimestamp(deps.store.database.now()),
+      recordedAt: formatUtcTimestamp(now),
     },
   });
 
@@ -564,12 +573,13 @@ export async function finalizeDirectRunStep(
     readonly outcome: Exclude<PreApprovalStageResult, { readonly kind: "approval_required" }>;
   },
 ): Promise<Run> {
-  const current = deps.store.getRun(input.run.id);
+  const current = await deps.store.getRun(input.run.id);
   if (current?.status === "interrupted") {
     return current;
   }
 
   if (input.outcome.kind === "interrupted") {
+    const now = deps.now ? deps.now() : new Date();
     const finished = await deps.store.finishRun({
       runId: input.run.id,
       status: "interrupted",
@@ -588,7 +598,7 @@ export async function finalizeDirectRunStep(
         ? {
             checkpoint: {
               interruptedEffectId: input.outcome.effectId,
-              recordedAt: formatUtcTimestamp(deps.store.database.now()),
+              recordedAt: formatUtcTimestamp(now),
             },
           }
         : {}),

@@ -47,7 +47,7 @@ describe("recover a pending approval across Bun deployment replacement with Rest
 
     const sharedRestateListen = await allocateLocalTcpNumber();
     const toolsFirst = createFixtureTools();
-    let serverFirst: RunningServer | undefined = startServer({
+    let serverFirst: RunningServer | undefined = await startServer({
       config: {
         host: "127.0.0.1",
         port: 0,
@@ -76,7 +76,7 @@ describe("recover a pending approval across Bun deployment replacement with Rest
       }
     });
 
-    await registerRestateDeployment(restate.adminUrl, serverFirst.restateUrl, { force: true });
+    await registerRestateDeployment(restate.adminUrl, serverFirst.restateUrl!, { force: true });
 
     const sessionId = serverFirst.seededFixture!.session.id;
     const botId = serverFirst.seededFixture!.bot.id;
@@ -148,7 +148,7 @@ describe("recover a pending approval across Bun deployment replacement with Rest
     await firstServerToClose.close();
 
     const toolsReplacement = createFixtureTools();
-    const serverReplacement = startServer({
+    const serverReplacement = await startServer({
       config: {
         host: "127.0.0.1",
         port: 0,
@@ -171,7 +171,7 @@ describe("recover a pending approval across Bun deployment replacement with Rest
     });
     cleanups.push(() => serverReplacement.close());
 
-    await registerRestateDeployment(restate.adminUrl, serverReplacement.restateUrl, {
+    await registerRestateDeployment(restate.adminUrl, serverReplacement.restateUrl!, {
       force: true,
     });
 
@@ -288,7 +288,7 @@ describe("recover a pending approval across Bun deployment replacement with Rest
     cleanups.push(() => tempDb.cleanup());
 
     const restateListen = await allocateLocalTcpNumber();
-    const server = startServer({
+    const server = await startServer({
       config: {
         host: "127.0.0.1",
         port: 0,
@@ -310,7 +310,7 @@ describe("recover a pending approval across Bun deployment replacement with Rest
     });
     cleanups.push(() => server.close());
 
-    await registerRestateDeployment(restate.adminUrl, server.restateUrl, { force: true });
+    await registerRestateDeployment(restate.adminUrl, server.restateUrl!, { force: true });
 
     const sessionId = server.seededFixture!.session.id;
     const botId = server.seededFixture!.bot.id;

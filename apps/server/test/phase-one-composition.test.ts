@@ -1,7 +1,12 @@
 import { afterEach, describe, expect, it } from "bun:test";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
+import * as z from "zod";
 import {
+  defineIntegration,
+  defineTool,
+  DomainError,
+  IntegrationRegistry,
   PROBLEM_DETAILS_MEDIA_TYPE,
   type Approval,
   type Bot,
@@ -22,7 +27,7 @@ import type { CommandExecOptions, CommandRunner, CommandSpawnHandle } from "@der
 import { parseServerConfig } from "../src/config";
 import { buildEngineHostTools, startServer } from "../src/main";
 import { createDirectWorkflow, UncertainEffectError } from "../src/workflows/index";
-import { createTempDatabase, waitUntil } from "./fixtures/restate-harness";
+import { allocateLocalTcpNumber, createTempDatabase, waitUntil } from "./fixtures/restate-harness";
 
 const cleanups: (() => Promise<void> | void)[] = [];
 
@@ -92,11 +97,6 @@ describe("validate Phase 1 startup configuration", () => {
       message: /DER_RESTATE_MODE/,
     },
     {
-      name: "home assistant URL without token",
-      env: { DER_HOME_ASSISTANT_URL: "http://127.0.0.1:8123" },
-      message: /DER_HOME_ASSISTANT_TOKEN/,
-    },
-    {
       name: "malformed MCP servers JSON",
       env: { DER_MCP_SERVERS_JSON: "{not-json" },
       message: /DER_MCP_SERVERS_JSON/,
@@ -152,7 +152,7 @@ describe("serve Phase 1 memory, skills, routines, engines, tools, and shared com
       },
     };
 
-    const server = startServer({
+    const server = await startServer({
       config: {
         host: "127.0.0.1",
         port: 0,
@@ -193,6 +193,7 @@ describe("serve Phase 1 memory, skills, routines, engines, tools, and shared com
       }
     }
 
+    expect(server.tools).toBeInstanceOf(IntegrationRegistry);
     const toolsRes = await fetch(`${server.url}/api/tools`);
     expect(toolsRes.status).toBe(200);
     const toolsPayload = (await toolsRes.json()) as { tools: ToolDescriptor[] };
@@ -202,6 +203,18 @@ describe("serve Phase 1 memory, skills, routines, engines, tools, and shared com
       "fixture.uncertain",
       "wasmer.execute",
     ]);
+
+    const invalidArgsTool = await server.tools.invoke({
+      effect: {
+        runId: "run_unapproved",
+        operationKind: "docker",
+        operationId: "docker.execute",
+        canonicalArguments: { command: "" },
+        attemptId: "att-invalid",
+      },
+    });
+    expect(invalidArgsTool.ok).toBe(false);
+    expect(invalidArgsTool.outcome).toEqual({ denied: true, code: "tool.invalid_arguments" });
 
     const deniedTool = await server.tools.invoke({
       effect: {
@@ -387,7 +400,7 @@ describe("serve Phase 1 memory, skills, routines, engines, tools, and shared com
 
   it("rejects cross-origin referer, cross-site fetch metadata, and non-JSON mutations with RFC 9457 Problem Details", async () => {
     const tempDb = createTempDatabase("der-csrf-");
-    const server = startServer({
+    const server = await startServer({
       config: {
         host: "127.0.0.1",
         port: 0,
@@ -662,7 +675,7 @@ describe("serve Phase 1 memory, skills, routines, engines, tools, and shared com
       },
     };
 
-    const server = startServer({
+    const server = await startServer({
       config: {
         host: "127.0.0.1",
         port: 0,
@@ -808,7 +821,7 @@ describe("serve Phase 1 memory, skills, routines, engines, tools, and shared com
 
   it("reuses recorded outcome on replay of a completed approved engine host-tool call and interrupts without re-execution on a crashed started effect", async () => {
     const tempDb = createTempDatabase("der-host-tool-replay-");
-    const server = startServer({
+    const server = await startServer({
       config: {
         host: "127.0.0.1",
         port: 0,
@@ -862,7 +875,7 @@ describe("serve Phase 1 memory, skills, routines, engines, tools, and shared com
     const replayAdmission = await server.store.admit({
       botId: bot.id,
       sessionId: session.id,
-      origin: "http",
+      origin: "web",
       idempotencyKey: "host-tool-replay-completed",
       engine: "fixture",
       input: { parts: [{ type: "text", text: "apply lamp" }] },
@@ -981,7 +994,7 @@ describe("serve Phase 1 memory, skills, routines, engines, tools, and shared com
     const crashedAdmission = await server.store.admit({
       botId: bot.id,
       sessionId: session.id,
-      origin: "http",
+      origin: "web",
       idempotencyKey: "host-tool-replay-crashed-started",
       engine: "fixture",
       input: { parts: [{ type: "text", text: "apply crashed lamp" }] },
@@ -1031,7 +1044,7 @@ describe("serve Phase 1 memory, skills, routines, engines, tools, and shared com
     await crashWf.admit({
       botId: bot.id,
       sessionId: session.id,
-      origin: "http",
+      origin: "web",
       idempotencyKey: "host-tool-replay-crashed-started",
       engine: "fixture",
       input: { parts: [{ type: "text", text: "apply crashed lamp" }] },
@@ -1049,7 +1062,7 @@ describe("serve Phase 1 memory, skills, routines, engines, tools, and shared com
 
   it("derives order-independent race-free effect identity so concurrent or reordered replays reuse completed outcomes and interrupt on ambiguous effects", async () => {
     const tempDb = createTempDatabase("der-host-tool-order-");
-    const server = startServer({
+    const server = await startServer({
       config: {
         host: "127.0.0.1",
         port: 0,
@@ -1113,7 +1126,7 @@ describe("serve Phase 1 memory, skills, routines, engines, tools, and shared com
     const admission = await server.store.admit({
       botId: bot.id,
       sessionId: session.id,
-      origin: "http",
+      origin: "web",
       idempotencyKey: "host-tool-order-independent",
       engine: "fixture",
       input: { parts: [{ type: "text", text: "apply alpha and beta" }] },
@@ -1199,7 +1212,7 @@ describe("serve Phase 1 memory, skills, routines, engines, tools, and shared com
     const crashAdmission = await server.store.admit({
       botId: bot.id,
       sessionId: session.id,
-      origin: "http",
+      origin: "web",
       idempotencyKey: "host-tool-order-ambiguous",
       engine: "fixture",
       input: { parts: [{ type: "text", text: "ambiguous out-of-order replay" }] },
@@ -1310,5 +1323,173 @@ describe("serve Phase 1 memory, skills, routines, engines, tools, and shared com
     expect(ambiguousInvokeCount).toBe(1);
     expect(server.store.getRun(crashRun.id)?.status).toBe("interrupted");
     expect(server.store.getEffect(seededAmbiguousEffect!)?.status).toBe("unknown");
+  });
+
+  it("fails startServer() before opening listeners when an integration exposes a duplicate dynamic tool ID", async () => {
+    const tempDb = createTempDatabase("der-dup-dynamic-tool-");
+    cleanups.push(() => tempDb.cleanup());
+    const reservedPort = await allocateLocalTcpNumber();
+    let startCalled = false;
+
+    const duplicateDynamicIntegration = defineIntegration({
+      id: "duplicate-dynamic",
+      setup() {
+        return {
+          async start() {
+            startCalled = true;
+          },
+          async listTools() {
+            return [
+              defineTool({
+                id: "docker.execute",
+                operationKind: "mcp",
+                description: "Collides with built-in docker.execute tool.",
+                inputSchema: z.object({}),
+                approval: "none",
+                async execute() {
+                  return { ok: true, isError: false, outcome: null };
+                },
+              }),
+            ];
+          },
+        };
+      },
+    });
+
+    let caught: unknown;
+    try {
+      await startServer({
+        config: {
+          host: "127.0.0.1",
+          port: reservedPort,
+          restateMode: "direct",
+          databasePath: tempDb.dbPath,
+          memoryProjectionDir: join(tempDb.dir, "memory"),
+          skillsRootDir: join(tempDb.dir, "skills"),
+          workspaceRootDir: join(tempDb.dir, "workspaces"),
+          enabledEngines: ["fixture"],
+          seedFixture: false,
+        },
+        integrations: [duplicateDynamicIntegration],
+      });
+    } catch (error) {
+      caught = error;
+    }
+
+    expect(startCalled).toBe(true);
+    expect(caught).toBeInstanceOf(DomainError);
+    expect((caught as DomainError).status).toBe(409);
+    expect((caught as DomainError).code).toBe("integration.duplicate_tool_id");
+
+    await expect(fetch(`http://127.0.0.1:${reservedPort}/healthz`)).rejects.toThrow();
+  });
+
+  it("shuts down Restate listener, integrations, and store when HTTP port binding fails during startServer()", async () => {
+    const tempDb = createTempDatabase("der-occupied-http-port-");
+    cleanups.push(() => tempDb.cleanup());
+    const restatePort = await allocateLocalTcpNumber();
+    const blocker = Bun.serve({
+      hostname: "127.0.0.1",
+      port: 0,
+      fetch: () => new Response("occupied"),
+    });
+    cleanups.push(async () => {
+      await blocker.stop(true);
+    });
+
+    let integrationStopped = false;
+    const probeIntegration = defineIntegration({
+      id: "cleanup-probe",
+      setup() {
+        return {
+          async stop() {
+            integrationStopped = true;
+          },
+        };
+      },
+    });
+
+    await expect(
+      startServer({
+        config: {
+          host: "127.0.0.1",
+          port: blocker.port,
+          restateMode: "restate",
+          restateHost: "127.0.0.1",
+          restateListen: restatePort,
+          restateAutoRegister: false,
+          databasePath: tempDb.dbPath,
+          memoryProjectionDir: join(tempDb.dir, "memory"),
+          skillsRootDir: join(tempDb.dir, "skills"),
+          workspaceRootDir: join(tempDb.dir, "workspaces"),
+          enabledEngines: ["fixture"],
+          seedFixture: false,
+        },
+        integrations: [probeIntegration],
+      }),
+    ).rejects.toThrow();
+
+    expect(integrationStopped).toBe(true);
+    await expect(fetch(`http://127.0.0.1:${restatePort}/discover`)).rejects.toThrow();
+
+    const reboundRestate = Bun.serve({
+      hostname: "127.0.0.1",
+      port: restatePort,
+      fetch: () => new Response("rebound"),
+    });
+    await reboundRestate.stop(true);
+
+    expect(existsSync(`${tempDb.dbPath}-wal`)).toBe(false);
+    expect(existsSync(`${tempDb.dbPath}-shm`)).toBe(false);
+  });
+
+  it("closes HTTP listener, Restate listener, and owned store even when an integration stop hook throws during close()", async () => {
+    const tempDb = createTempDatabase("der-close-throwing-integration-");
+    cleanups.push(() => tempDb.cleanup());
+    const restatePort = await allocateLocalTcpNumber();
+
+    const failingStopIntegration = defineIntegration({
+      id: "failing-stop",
+      setup() {
+        return {
+          async stop() {
+            throw new Error("integration stop failed");
+          },
+        };
+      },
+    });
+
+    const server = await startServer({
+      config: {
+        host: "127.0.0.1",
+        port: 0,
+        restateMode: "restate",
+        restateHost: "127.0.0.1",
+        restateListen: restatePort,
+        restateAutoRegister: false,
+        databasePath: tempDb.dbPath,
+        memoryProjectionDir: join(tempDb.dir, "memory"),
+        skillsRootDir: join(tempDb.dir, "skills"),
+        workspaceRootDir: join(tempDb.dir, "workspaces"),
+        enabledEngines: ["fixture"],
+        seedFixture: false,
+      },
+      integrations: [failingStopIntegration],
+    });
+
+    await expect(server.close()).rejects.toThrow("integration stop failed");
+    await expect(fetch(`${server.url}/healthz`)).rejects.toThrow();
+    await expect(fetch(`http://127.0.0.1:${restatePort}/discover`)).rejects.toThrow();
+
+    const reboundRestate = Bun.serve({
+      hostname: "127.0.0.1",
+      port: restatePort,
+      fetch: () => new Response("rebound"),
+    });
+    await reboundRestate.stop(true);
+
+    expect(() => server.store.listBots()).toThrow();
+    expect(existsSync(`${tempDb.dbPath}-wal`)).toBe(false);
+    expect(existsSync(`${tempDb.dbPath}-shm`)).toBe(false);
   });
 });
