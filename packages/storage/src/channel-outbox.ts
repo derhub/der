@@ -4,14 +4,11 @@ import {
   type BotId,
   type ChannelBinding,
   type ChannelBindingId,
-  type ChannelCursor,
-  type ChannelIntakeMetadata,
   type ChannelIntegration,
-  type ChannelReceipt,
-  type ChannelReceiptDisposition,
   type CloudEvent,
   type DeliveryResult,
   type OutboxDeliveryState,
+  type OutboxDestination,
   type OutboxEvent,
   type OutboxEventId,
   type SessionId,
@@ -22,12 +19,8 @@ import type { SqliteDatabase } from "./database";
 import { notFoundError } from "./errors";
 import {
   mapChannelBindingRow,
-  mapChannelCursorRow,
-  mapChannelReceiptRow,
   mapOutboxEventRow,
   type ChannelBindingRow,
-  type ChannelCursorRow,
-  type ChannelReceiptRow,
   type OutboxEventRow,
 } from "./rows";
 
@@ -78,37 +71,6 @@ export function insertOutboxForBindings(
   }
 
   return inserted;
-}
-
-export function recordIntakeInTx(
-  db: Database,
-  intake: ChannelIntakeMetadata,
-  disposition: ChannelReceiptDisposition,
-  referenceId: string | null,
-  now: UtcTimestamp,
-): void {
-  db.query(
-    `INSERT OR IGNORE INTO channel_receipts
-      (integration, consumer, external_update_id, disposition, reference_id, recorded_at)
-     VALUES (?, ?, ?, ?, ?, ?)`,
-  ).run(
-    intake.integration,
-    intake.consumer,
-    intake.externalUpdateId,
-    disposition,
-    referenceId,
-    now,
-  );
-
-  if (intake.nextCursor !== undefined) {
-    db.query(
-      `INSERT INTO channel_cursors (integration, consumer, position, updated_at)
-       VALUES (?, ?, ?, ?)
-       ON CONFLICT (integration, consumer) DO UPDATE SET
-         position = excluded.position,
-         updated_at = excluded.updated_at`,
-    ).run(intake.integration, intake.consumer, intake.nextCursor, now);
-  }
 }
 
 export function upsertChannelBinding(
@@ -201,127 +163,55 @@ export function listChannelBindings(
   return rows.map(mapChannelBindingRow);
 }
 
-export function findChannelBinding(
+export function toOutboxDestination(binding: ChannelBinding): OutboxDestination {
+  return {
+    id: binding.id,
+    kind: binding.integration,
+    target: binding.externalChatId,
+    botId: binding.botId,
+    sessionId: binding.sessionId,
+    enabled: binding.enabled,
+    metadata: {
+      externalActorId: binding.externalActorId,
+    },
+    createdAt: binding.createdAt,
+    updatedAt: binding.updatedAt,
+  };
+}
+
+export function listOutboxDestinations(
   database: SqliteDatabase,
-  query: {
-    readonly integration: ChannelIntegration;
-    readonly externalChatId: string;
-    readonly externalActorId: string;
+  filter?: {
+    readonly botId?: BotId;
     readonly sessionId?: SessionId;
+    readonly kind?: string;
+    readonly enabledOnly?: boolean;
   },
-): ChannelBinding | undefined {
-  const row =
-    query.sessionId !== undefined
-      ? database.db
-          .query<ChannelBindingRow, [string, string, string, string]>(
-            `SELECT * FROM channel_bindings
-             WHERE integration = ? AND external_chat_id = ? AND external_actor_id = ? AND session_id = ? AND enabled = 1`,
-          )
-          .get(query.integration, query.externalChatId, query.externalActorId, query.sessionId)
-      : database.db
-          .query<ChannelBindingRow, [string, string, string]>(
-            `SELECT * FROM channel_bindings
-             WHERE integration = ? AND external_chat_id = ? AND external_actor_id = ? AND enabled = 1
-             ORDER BY created_at ASC, id ASC
-             LIMIT 1`,
-          )
-          .get(query.integration, query.externalChatId, query.externalActorId);
-  return row ? mapChannelBindingRow(row) : undefined;
-}
-
-export function getChannelReceipt(
-  database: SqliteDatabase,
-  integration: ChannelIntegration,
-  consumer: string,
-  externalUpdateId: string,
-): ChannelReceipt | undefined {
-  const row = database.db
-    .query<ChannelReceiptRow, [string, string, string]>(
-      `SELECT * FROM channel_receipts
-       WHERE integration = ? AND consumer = ? AND external_update_id = ?`,
+): OutboxDestination[] {
+  const clauses: string[] = [];
+  const params: (string | number)[] = [];
+  if (filter?.botId !== undefined) {
+    clauses.push("bot_id = ?");
+    params.push(filter.botId);
+  }
+  if (filter?.sessionId !== undefined) {
+    clauses.push("session_id = ?");
+    params.push(filter.sessionId);
+  }
+  if (filter?.kind !== undefined) {
+    clauses.push("integration = ?");
+    params.push(filter.kind);
+  }
+  if (filter?.enabledOnly) {
+    clauses.push("enabled = 1");
+  }
+  const where = clauses.length > 0 ? `WHERE ${clauses.join(" AND ")}` : "";
+  const rows = database.db
+    .query<ChannelBindingRow, (string | number)[]>(
+      `SELECT * FROM channel_bindings ${where} ORDER BY created_at ASC, id ASC`,
     )
-    .get(integration, consumer, externalUpdateId);
-  return row ? mapChannelReceiptRow(row) : undefined;
-}
-
-export async function recordChannelReceipt(
-  database: SqliteDatabase,
-  input: {
-    readonly integration: ChannelIntegration;
-    readonly consumer: string;
-    readonly externalUpdateId: string;
-    readonly disposition: ChannelReceiptDisposition;
-    readonly referenceId: string | null;
-    readonly nextCursor?: string;
-  },
-): Promise<ChannelReceipt> {
-  const now = formatUtcTimestamp(database.now());
-  return database.inTransactionWithRetry((db) => {
-    recordIntakeInTx(
-      db,
-      {
-        integration: input.integration,
-        consumer: input.consumer,
-        externalUpdateId: input.externalUpdateId,
-        ...(input.nextCursor !== undefined ? { nextCursor: input.nextCursor } : {}),
-      },
-      input.disposition,
-      input.referenceId,
-      now,
-    );
-
-    const row = db
-      .query<ChannelReceiptRow, [string, string, string]>(
-        `SELECT * FROM channel_receipts
-         WHERE integration = ? AND consumer = ? AND external_update_id = ?`,
-      )
-      .get(input.integration, input.consumer, input.externalUpdateId);
-    if (!row) {
-      throw new Error(`ChannelReceipt ${input.externalUpdateId} was not persisted`);
-    }
-    return mapChannelReceiptRow(row);
-  });
-}
-
-export function getChannelCursor(
-  database: SqliteDatabase,
-  integration: ChannelIntegration,
-  consumer: string,
-): ChannelCursor | undefined {
-  const row = database.db
-    .query<ChannelCursorRow, [string, string]>(
-      "SELECT * FROM channel_cursors WHERE integration = ? AND consumer = ?",
-    )
-    .get(integration, consumer);
-  return row ? mapChannelCursorRow(row) : undefined;
-}
-
-export async function setChannelCursor(
-  database: SqliteDatabase,
-  integration: ChannelIntegration,
-  consumer: string,
-  position: string,
-): Promise<ChannelCursor> {
-  const now = formatUtcTimestamp(database.now());
-  return database.inTransactionWithRetry((db) => {
-    db.query(
-      `INSERT INTO channel_cursors (integration, consumer, position, updated_at)
-       VALUES (?, ?, ?, ?)
-       ON CONFLICT (integration, consumer) DO UPDATE SET
-         position = excluded.position,
-         updated_at = excluded.updated_at`,
-    ).run(integration, consumer, position, now);
-
-    const row = db
-      .query<ChannelCursorRow, [string, string]>(
-        "SELECT * FROM channel_cursors WHERE integration = ? AND consumer = ?",
-      )
-      .get(integration, consumer);
-    if (!row) {
-      throw new Error(`ChannelCursor ${integration}:${consumer} was not persisted`);
-    }
-    return mapChannelCursorRow(row);
-  });
+    .all(...params);
+  return rows.map((row) => toOutboxDestination(mapChannelBindingRow(row)));
 }
 
 export function listOutboxEvents(

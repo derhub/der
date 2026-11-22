@@ -4,13 +4,22 @@ import { id, jsonValue } from "./common";
 
 export const effectOperationKind = z.enum([
   "mcp",
-  "home-assistant",
   "wasmer",
   "docker",
   "engine-permission",
   "fixture",
 ]);
 export type EffectOperationKind = z.infer<typeof effectOperationKind>;
+
+export const persistedEffectOperationKind = z.enum([
+  "mcp",
+  "wasmer",
+  "docker",
+  "engine-permission",
+  "fixture",
+  "legacy",
+]);
+export type PersistedEffectOperationKind = z.infer<typeof persistedEffectOperationKind>;
 
 export const effectIdentity = z.object({
   runId: id,
@@ -20,6 +29,15 @@ export const effectIdentity = z.object({
   attemptId: id,
 });
 export type EffectIdentity = z.infer<typeof effectIdentity>;
+
+export const persistedEffectIdentity = z.object({
+  runId: id,
+  operationKind: persistedEffectOperationKind,
+  operationId: z.string().min(1),
+  canonicalArguments: jsonValue,
+  attemptId: id,
+});
+export type PersistedEffectIdentity = z.infer<typeof persistedEffectIdentity>;
 
 export const approvalDecision = z.discriminatedUnion("status", [
   z.object({
@@ -79,7 +97,7 @@ export const approval = z.object({
   botId: id,
   sessionId: id,
   runId: id,
-  effect: effectIdentity,
+  effect: persistedEffectIdentity,
   prompt: z.string().min(1),
   awakeable: z.string().min(1),
   deadline: utcTimestamp,
@@ -94,7 +112,7 @@ export type EffectStatus = z.infer<typeof effectStatus>;
 
 export const effectRecord = z.object({
   id,
-  identity: effectIdentity,
+  identity: persistedEffectIdentity,
   status: effectStatus,
   outcome: jsonValue.nullable(),
   startedAt: utcTimestamp,

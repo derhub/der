@@ -3,8 +3,11 @@ import { utcTimestamp } from "../protocol/timestamp";
 import { engineKind, id, jsonValue } from "./common";
 import { message, messagePart } from "./message";
 
-export const runOrigin = z.enum(["http", "web", "telegram", "routine"]);
+export const runOrigin = z.enum(["http", "web", "routine"]);
 export type RunOrigin = z.infer<typeof runOrigin>;
+
+export const persistedRunOrigin = z.enum(["http", "web", "telegram", "routine"]);
+export type PersistedRunOrigin = z.infer<typeof persistedRunOrigin>;
 
 export const runStatus = z.enum([
   "queued",
@@ -32,7 +35,7 @@ export const run = z.object({
   id,
   botId: id,
   sessionId: id,
-  origin: runOrigin,
+  origin: persistedRunOrigin,
   engine: engineKind,
   status: runStatus,
   routineId: id.nullable(),
@@ -43,7 +46,7 @@ export const run = z.object({
 });
 export type Run = z.infer<typeof run>;
 
-export const runRequest = z.object({
+export const runRequest = z.strictObject({
   botId: id,
   sessionId: id,
   origin: runOrigin,
@@ -54,7 +57,6 @@ export const runRequest = z.object({
   }),
   routineId: id.optional(),
   routineSlot: utcTimestamp.optional(),
-  channelIntake: channelIntakeMetadata.optional(),
 });
 export type RunRequest = z.infer<typeof runRequest>;
 

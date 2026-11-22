@@ -1,12 +1,19 @@
 import { afterEach, describe, expect, it } from "bun:test";
-import type { EffectIdentity, ToolOperation } from "@der/domain";
+import {
+  defineIntegration,
+  defineTool,
+  DomainError,
+  IntegrationRegistry,
+  type EffectIdentity,
+  type ToolOperation,
+} from "@der/domain";
 import { compiledParsers } from "@der/domain/compiled";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import * as z from "zod";
 import {
   createExactApprovalVerifier,
-  createHostTools,
+  createMcpIntegration,
   createMcpTools,
   ToolEffectUncertainError,
 } from "../src/index";
@@ -174,8 +181,23 @@ describe("MCP tools adapter with typed descriptors, exact-operation approval, an
       code: "tool.unrecognized_operation",
     });
 
-    const hostTools = createHostTools([mcp]);
-    const wrongKind = await hostTools.invoke(
+    const registryFixture = await startFixtureMcpServer();
+    const registry = new IntegrationRegistry();
+    registry.registerSync(
+      createMcpIntegration({
+        servers: [
+          {
+            id: "notes",
+            transport: { kind: "custom", createTransport: () => registryFixture.clientTransport },
+            allowedTools: ["search_notes", "append_note"],
+            readOnlyTools: ["search_notes"],
+          },
+        ],
+        verifyApproval: createExactApprovalVerifier([approvedEffect]),
+      }),
+    );
+    closers.push(() => registry.stop());
+    const wrongKind = await registry.invoke(
       makeOperation({ operationKind: "docker", operationId: "docker.exec" }),
     );
     expect(wrongKind.ok).toBe(false);
@@ -293,5 +315,89 @@ describe("MCP tools adapter with typed descriptors, exact-operation approval, an
       denied: true,
       code: "tool.approval_required",
     });
+  });
+
+  it("registers MCP tools through defineIntegration and rejects duplicate tool IDs", async () => {
+    const fixture = await startFixtureMcpServer();
+    const registry = new IntegrationRegistry();
+
+    await registry.register(
+      createMcpIntegration({
+        servers: [
+          {
+            id: "notes",
+            transport: { kind: "custom", createTransport: () => fixture.clientTransport },
+            allowedTools: ["search_notes"],
+            readOnlyTools: ["search_notes"],
+          },
+        ],
+      }),
+    );
+    closers.push(() => registry.stop());
+
+    const descriptors = await registry.list();
+    expect(descriptors.map((d) => d.id)).toEqual(["notes.search_notes"]);
+
+    const searchResult = await registry.invoke(makeOperation({}));
+    expect(searchResult).toEqual({
+      ok: true,
+      isError: false,
+      outcome: { matches: ["note:uptime"] },
+    });
+
+    const invalidArgs = await registry.invoke(
+      makeOperation({ canonicalArguments: "not-an-object" }),
+    );
+    expect(invalidArgs.ok).toBe(false);
+    expect(invalidArgs.outcome).toEqual({
+      denied: true,
+      code: "tool.invalid_arguments",
+    });
+
+    const conflictingRegistry = new IntegrationRegistry();
+    conflictingRegistry.registerSync(
+      defineIntegration({
+        id: "static-conflict",
+        setup() {
+          return {
+            tools: [
+              defineTool({
+                id: "notes.search_notes",
+                operationKind: "mcp",
+                description: "Duplicate static tool.",
+                inputSchema: z.object({}),
+                approval: "none",
+                async execute() {
+                  return { ok: true, isError: false, outcome: null };
+                },
+              }),
+            ],
+          };
+        },
+      }),
+    );
+    const secondFixture = await startFixtureMcpServer();
+    conflictingRegistry.registerSync(
+      createMcpIntegration({
+        servers: [
+          {
+            id: "notes",
+            transport: { kind: "custom", createTransport: () => secondFixture.clientTransport },
+            allowedTools: ["search_notes"],
+            readOnlyTools: ["search_notes"],
+          },
+        ],
+      }),
+    );
+    closers.push(() => conflictingRegistry.stop());
+
+    let caught: unknown;
+    try {
+      await conflictingRegistry.list();
+    } catch (error) {
+      caught = error;
+    }
+    expect(caught).toBeInstanceOf(DomainError);
+    expect((caught as DomainError).code).toBe("integration.duplicate_tool_id");
   });
 });

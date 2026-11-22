@@ -17,7 +17,7 @@ import {
 } from "@der/domain";
 import { compiledParsers } from "@der/domain/compiled";
 import { fingerprintJson } from "./canonical";
-import { insertOutboxForBindings, recordIntakeInTx } from "./channel-outbox";
+import { insertOutboxForBindings } from "./channel-outbox";
 import type { SqliteDatabase } from "./database";
 import { conflictError, notFoundError, validationError } from "./errors";
 import {
@@ -167,10 +167,6 @@ export async function admitRun(
         throw new Error(`Corrupt run_request reference for key ${valid.idempotencyKey}`);
       }
 
-      if (valid.channelIntake) {
-        recordIntakeInTx(db, valid.channelIntake, "duplicate", existingRun.id, now);
-      }
-
       return compiledParsers.runAdmission.parse({
         run: mapRunRow(existingRun),
         initialMessage: mapMessageRow(existingMessage),
@@ -262,10 +258,6 @@ export async function admitRun(
       messageId,
       now,
     );
-
-    if (valid.channelIntake) {
-      recordIntakeInTx(db, valid.channelIntake, "admitted", runId, now);
-    }
 
     const createdRun = db.query<RunRow, [string]>("SELECT * FROM runs WHERE id = ?").get(runId);
     const createdMessage = db

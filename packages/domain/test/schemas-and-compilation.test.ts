@@ -3,17 +3,28 @@ import { join, resolve } from "node:path";
 import { describe, expect, it } from "vite-plus/test";
 import * as z from "zod";
 import { compiledParsers } from "../src/compiled/index";
-import type {
-  Engine,
-  Memory,
-  Messaging,
-  Sandbox,
-  Store,
-  Tools,
-  Workflow,
+import {
+  defineIntegration,
+  defineTool,
+  IntegrationRegistry,
+  type ApprovalEffectStore,
+  type BotStore,
+  type Engine,
+  type Memory,
+  type OutboxSink,
+  type OutboxStore,
+  type RoutineStore,
+  type RunCoordinator,
+  type RunStore,
+  type Sandbox,
+  type SessionStore,
+  type Store,
+  type Tools,
+  type Workflow,
+  type WorkflowDriver,
 } from "../src/interfaces/index";
 import type { Memory as MemoryCapability } from "../src/interfaces/memory";
-import { cloudEvent, problemDetails, utcTimestamp } from "../src/protocol/index";
+import { cloudEvent, DomainError, problemDetails, utcTimestamp } from "../src/protocol/index";
 import {
   approval,
   approvalDecision,
@@ -23,9 +34,11 @@ import {
   channelCursor,
   channelReceipt,
   channelUpdate,
+  effectOperationKind,
   effectRecord,
   memoryRecord,
   message,
+  outboxDestination,
   outboxEvent,
   routine,
   routineSlot,
@@ -82,7 +95,7 @@ const fixtures = {
   runRequest: {
     botId: "bot-1",
     sessionId: "sess-1",
-    origin: "http" as const,
+    origin: "web" as const,
     idempotencyKey: "key-1",
     input: {
       parts: [{ type: "text" as const, text: "Check lamp state" }],
@@ -98,9 +111,9 @@ const fixtures = {
   },
   effectIdentity: {
     runId: "run-1",
-    operationKind: "home-assistant" as const,
-    operationId: "light.turn_on",
-    canonicalArguments: { entity_id: "light.living_room" },
+    operationKind: "mcp" as const,
+    operationId: "notes.append_note",
+    canonicalArguments: { title: "Shift", body: "All green" },
     attemptId: "attempt-1",
   },
   routine: {
@@ -200,9 +213,9 @@ const cloudEventFixture = {
     sessionId: "sess-1",
     runId: "run-1",
     approvalId: "appr-1",
-    operationKind: "home-assistant" as const,
-    operationId: "light.turn_on",
-    prompt: "Turn on living room light?",
+    operationKind: "mcp" as const,
+    operationId: "notes.append_note",
+    prompt: "Append daily shift note?",
     deadline: "2026-11-22T15:05:00Z",
   },
 };
@@ -341,7 +354,19 @@ describe("keep Memory schema and capability entry points distinct", () => {
       },
     };
 
-    const storeCapability: Store = {
+    const botStore: BotStore = {
+      createBot: () => fixtures.bot,
+      getBot: () => fixtures.bot,
+      listBots: () => [fixtures.bot],
+      updateBot: () => fixtures.bot,
+    };
+    const sessionStore: SessionStore = {
+      createSession: () => fixtures.session,
+      getSession: () => fixtures.session,
+      listSessions: () => [fixtures.session],
+      listMessages: () => [fixtures.message],
+    };
+    const runStore: RunStore = {
       async admit() {
         return {
           run: fixtures.run,
@@ -350,12 +375,95 @@ describe("keep Memory schema and capability entry points distinct", () => {
           payloadFingerprint: "sha256:abc",
         };
       },
-      async decide() {
-        return approvalFixture;
-      },
+      getRun: () => fixtures.run,
+      markRunRunning: async () => fixtures.run,
+      appendRunEvents: async () => [fixtures.runEvent],
+      getRunStreamState: () => ({
+        highWaterMark: 1,
+        terminalSequence: undefined,
+        status: "running",
+      }),
+      readRunEventsAfter: () => [fixtures.runEvent],
       async *replay() {
         yield fixtures.runEvent;
       },
+      finishRun: async () => ({
+        run: fixtures.run,
+        terminalEvent: fixtures.runEvent,
+        outboxEvents: [],
+      }),
+    };
+    const approvalEffectStore: ApprovalEffectStore = {
+      requestApproval: async () => ({
+        approval: approvalFixture,
+        outboxEvents: [],
+        isDuplicate: false,
+      }),
+      getApproval: () => approvalFixture,
+      getLatestApprovalForRun: () => approvalFixture,
+      decide: async () => approvalFixture,
+      beginEffect: async () => ({
+        kind: "started",
+        effect: {
+          id: "eff-1",
+          identity: fixtures.effectIdentity,
+          status: "started",
+          outcome: null,
+          startedAt: fixtures.utc,
+          updatedAt: fixtures.utc,
+        },
+      }),
+      completeEffect: async () => ({
+        id: "eff-1",
+        identity: fixtures.effectIdentity,
+        status: "completed",
+        outcome: { ok: true },
+        startedAt: fixtures.utc,
+        updatedAt: fixtures.utc,
+      }),
+      markEffectUnknown: async () => ({
+        id: "eff-1",
+        identity: fixtures.effectIdentity,
+        status: "unknown",
+        outcome: null,
+        startedAt: fixtures.utc,
+        updatedAt: fixtures.utc,
+      }),
+      getEffect: () => undefined,
+    };
+    const outboxStore: OutboxStore = {
+      listOutboxEvents: () => [outboxEventFixture],
+      listDueOutboxEvents: () => [outboxEventFixture],
+      recordOutboxDelivery: async () => outboxEventFixture,
+    };
+    const routineStore: RoutineStore = {
+      createRoutine: () => fixtures.routine,
+      getRoutine: () => fixtures.routine,
+    };
+    const storeCapability: Store = {
+      ...botStore,
+      ...sessionStore,
+      ...runStore,
+      ...approvalEffectStore,
+      ...outboxStore,
+      ...routineStore,
+    };
+
+    const outboxSink: OutboxSink = {
+      kind: "webhook",
+      async deliver() {
+        return { status: "delivered", deliveredAt: fixtures.utc };
+      },
+    };
+    const workflowDriver: WorkflowDriver = {
+      runStep: async (_name, fn) => fn(),
+      awaitApproval: async () => approvalFixture,
+      resolveApproval: async () => {},
+    };
+    const runCoordinator: RunCoordinator = {
+      admit: (request) => storeCapability.admit(request),
+      decide: (decision) => storeCapability.decide(decision),
+      executeRun: async () => {},
     };
 
     const memoryFromIndex: Memory = memoryCapability;
@@ -375,14 +483,6 @@ describe("keep Memory schema and capability entry points distinct", () => {
         return { ok: true, outcome: null, isError: false };
       },
     };
-    const messagingCapability: Messaging = {
-      async *poll() {
-        yield fixtures.channelUpdate;
-      },
-      async deliver() {
-        return { status: "delivered", deliveredAt: fixtures.utc };
-      },
-    };
     const workflowCapability: Workflow = {
       admit: (request) => storeCapability.admit(request),
       decide: (decision) => storeCapability.decide(decision),
@@ -392,8 +492,389 @@ describe("keep Memory schema and capability entry points distinct", () => {
     expect(typeof engineCapability.run).toBe("function");
     expect(typeof sandboxCapability.execute).toBe("function");
     expect(typeof toolsCapability.invoke).toBe("function");
-    expect(typeof messagingCapability.deliver).toBe("function");
+    expect(typeof outboxSink.deliver).toBe("function");
     expect(typeof workflowCapability.admit).toBe("function");
+    expect(typeof workflowDriver.runStep).toBe("function");
+    expect(typeof runCoordinator.executeRun).toBe("function");
+    expect(effectOperationKind.safeParse("home-assistant").success).toBe(false);
+    expect(
+      outboxDestination.parse({
+        id: "dest-1",
+        kind: "webhook",
+        target: "https://example.invalid/hook",
+        botId: "bot-1",
+        sessionId: "sess-1",
+        enabled: true,
+        createdAt: fixtures.utc,
+        updatedAt: fixtures.utc,
+      }).kind,
+    ).toBe("webhook");
+  });
+});
+
+describe("register integrations and tools through IntegrationRegistry", () => {
+  it("validates tool input with Zod, enforces approval, and rejects duplicate tool IDs and outbox sinks", async () => {
+    const registry = new IntegrationRegistry({
+      verifyApproval: (effect) => effect.attemptId === "approved-attempt",
+    });
+
+    const notesIntegration = defineIntegration({
+      id: "notes",
+      setup() {
+        return {
+          tools: [
+            defineTool({
+              id: "notes.search",
+              operationKind: "mcp",
+              description: "Search notes.",
+              inputSchema: z.object({ query: z.string().min(1) }),
+              approval: "none",
+              async execute(input) {
+                return { ok: true, isError: false, outcome: { matches: [input.query] } };
+              },
+            }),
+            defineTool({
+              id: "notes.write",
+              operationKind: "mcp",
+              description: "Write a note.",
+              inputSchema: z.object({ title: z.string().min(1) }),
+              approval: "always",
+              async execute(input) {
+                return { ok: true, isError: false, outcome: { saved: input.title } };
+              },
+            }),
+          ],
+          outboxSinks: [
+            {
+              kind: "webhook",
+              async deliver() {
+                return { status: "delivered", deliveredAt: fixtures.utc };
+              },
+            },
+          ],
+        };
+      },
+    });
+
+    await registry.register(notesIntegration);
+    const descriptors = await registry.list();
+    expect(descriptors.map((d) => ({ id: d.id, requiresApproval: d.requiresApproval }))).toEqual([
+      { id: "notes.search", requiresApproval: false },
+      { id: "notes.write", requiresApproval: true },
+    ]);
+
+    const okResult = await registry.invoke({
+      effect: {
+        runId: "run-1",
+        operationKind: "mcp",
+        operationId: "notes.search",
+        canonicalArguments: { query: "uptime" },
+        attemptId: "att-1",
+      },
+    });
+    expect(okResult).toEqual({ ok: true, isError: false, outcome: { matches: ["uptime"] } });
+
+    const invalidArgs = await registry.invoke({
+      effect: {
+        runId: "run-1",
+        operationKind: "mcp",
+        operationId: "notes.search",
+        canonicalArguments: { query: "" },
+        attemptId: "att-2",
+      },
+    });
+    expect(invalidArgs.ok).toBe(false);
+    expect(invalidArgs.outcome).toEqual({ denied: true, code: "tool.invalid_arguments" });
+
+    const unapprovedWrite = await registry.invoke({
+      effect: {
+        runId: "run-1",
+        operationKind: "mcp",
+        operationId: "notes.write",
+        canonicalArguments: { title: "Shift" },
+        attemptId: "att-unapproved",
+      },
+    });
+    expect(unapprovedWrite.ok).toBe(false);
+    expect(unapprovedWrite.outcome).toEqual({ denied: true, code: "tool.approval_required" });
+
+    const approvedWrite = await registry.invoke({
+      effect: {
+        runId: "run-1",
+        operationKind: "mcp",
+        operationId: "notes.write",
+        canonicalArguments: { title: "Shift" },
+        attemptId: "approved-attempt",
+      },
+    });
+    expect(approvedWrite).toEqual({ ok: true, isError: false, outcome: { saved: "Shift" } });
+
+    expect(registry.getOutboxSink("webhook")?.kind).toBe("webhook");
+    expect(registry.listOutboxSinks().map((s) => s.kind)).toEqual(["webhook"]);
+
+    const duplicateToolIntegration = defineIntegration({
+      id: "notes-duplicate",
+      setup() {
+        return {
+          tools: [
+            defineTool({
+              id: "notes.search",
+              operationKind: "mcp",
+              description: "Conflicting search tool.",
+              inputSchema: z.object({}),
+              approval: "none",
+              async execute() {
+                return { ok: true, isError: false, outcome: null };
+              },
+            }),
+          ],
+        };
+      },
+    });
+
+    await expect(registry.register(duplicateToolIntegration)).rejects.toThrow(DomainError);
+    await expect(registry.register(duplicateToolIntegration)).rejects.toThrow(
+      /Tool "notes.search" is already registered/,
+    );
+
+    const duplicateSinkIntegration = defineIntegration({
+      id: "webhook-duplicate",
+      setup() {
+        return {
+          outboxSinks: [
+            {
+              kind: "webhook",
+              async deliver() {
+                return { status: "delivered", deliveredAt: fixtures.utc };
+              },
+            },
+          ],
+        };
+      },
+    });
+
+    await expect(registry.register(duplicateSinkIntegration)).rejects.toThrow(
+      /Outbox sink "webhook" is already registered/,
+    );
+  });
+
+  it("fails closed with 403 DomainError when invoking an approval-required tool without verifyApproval", async () => {
+    const registry = new IntegrationRegistry();
+    await registry.register(
+      defineIntegration({
+        id: "guarded",
+        setup() {
+          return {
+            tools: [
+              defineTool({
+                id: "guarded.read",
+                operationKind: "mcp",
+                description: "Read-only tool.",
+                inputSchema: z.object({ key: z.string().min(1) }),
+                approval: "none",
+                async execute(input) {
+                  return { ok: true, isError: false, outcome: { key: input.key } };
+                },
+              }),
+              defineTool({
+                id: "guarded.write",
+                operationKind: "mcp",
+                description: "Always-approved write tool.",
+                inputSchema: z.object({ key: z.string().min(1) }),
+                approval: "always",
+                async execute() {
+                  return { ok: true, isError: false, outcome: { written: true } };
+                },
+              }),
+              defineTool({
+                id: "guarded.conditional",
+                operationKind: "mcp",
+                description: "Predicate-approved tool.",
+                inputSchema: z.object({ destructive: z.boolean() }),
+                approval: (input) => input.destructive,
+                async execute() {
+                  return { ok: true, isError: false, outcome: { done: true } };
+                },
+              }),
+            ],
+          };
+        },
+      }),
+    );
+
+    const readResult = await registry.invoke({
+      effect: {
+        runId: "run-1",
+        operationKind: "mcp",
+        operationId: "guarded.read",
+        canonicalArguments: { key: "status" },
+        attemptId: "att-1",
+      },
+    });
+    expect(readResult).toEqual({ ok: true, isError: false, outcome: { key: "status" } });
+
+    const safeConditional = await registry.invoke({
+      effect: {
+        runId: "run-1",
+        operationKind: "mcp",
+        operationId: "guarded.conditional",
+        canonicalArguments: { destructive: false },
+        attemptId: "att-2",
+      },
+    });
+    expect(safeConditional).toEqual({ ok: true, isError: false, outcome: { done: true } });
+
+    for (const op of [
+      {
+        operationId: "guarded.write",
+        canonicalArguments: { key: "secret" },
+        attemptId: "att-3",
+      },
+      {
+        operationId: "guarded.conditional",
+        canonicalArguments: { destructive: true },
+        attemptId: "att-4",
+      },
+    ]) {
+      let caught: unknown;
+      try {
+        await registry.invoke({
+          effect: {
+            runId: "run-1",
+            operationKind: "mcp",
+            ...op,
+          },
+        });
+      } catch (error) {
+        caught = error;
+      }
+      expect(caught).toBeInstanceOf(DomainError);
+      expect((caught as DomainError).status).toBe(403);
+      expect((caught as DomainError).code).toBe("tool.approval_verifier_missing");
+    }
+  });
+
+  it("stops every registered integration even when an earlier stop() throws", async () => {
+    const registry = new IntegrationRegistry();
+    const stopped: string[] = [];
+
+    await registry.register(
+      defineIntegration({
+        id: "first",
+        setup() {
+          return {
+            async stop() {
+              stopped.push("first");
+            },
+          };
+        },
+      }),
+    );
+    await registry.register(
+      defineIntegration({
+        id: "second",
+        setup() {
+          return {
+            async stop() {
+              stopped.push("second");
+              throw new Error("second stop failed");
+            },
+          };
+        },
+      }),
+    );
+    await registry.register(
+      defineIntegration({
+        id: "third",
+        setup() {
+          return {
+            async stop() {
+              stopped.push("third");
+            },
+          };
+        },
+      }),
+    );
+
+    await registry.start();
+    await expect(registry.stop()).rejects.toThrow("second stop failed");
+    expect(stopped).toEqual(["third", "second", "first"]);
+  });
+
+  it("reserves integration IDs synchronously during async register() and releases on failure", async () => {
+    const registry = new IntegrationRegistry();
+    let resolveSetup!: () => void;
+    const setupGate = new Promise<void>((resolve) => {
+      resolveSetup = resolve;
+    });
+
+    const first = registry.register(
+      defineIntegration({
+        id: "async-int",
+        async setup() {
+          await setupGate;
+          return {};
+        },
+      }),
+    );
+
+    await expect(
+      registry.register(
+        defineIntegration({
+          id: "async-int",
+          setup() {
+            return {};
+          },
+        }),
+      ),
+    ).rejects.toThrow(/Integration "async-int" is already registered/);
+
+    resolveSetup();
+    await first;
+
+    await expect(
+      registry.register(
+        defineIntegration({
+          id: "flaky-int",
+          async setup() {
+            throw new Error("setup boom");
+          },
+        }),
+      ),
+    ).rejects.toThrow("setup boom");
+
+    await expect(
+      registry.register(
+        defineIntegration({
+          id: "flaky-int",
+          setup() {
+            return {};
+          },
+        }),
+      ),
+    ).resolves.toBeUndefined();
+  });
+
+  it("allows http, web, and routine on active runRequest while rejecting telegram and channelIntake", () => {
+    expect(runRequest.safeParse({ ...fixtures.runRequest, origin: "http" }).success).toBe(true);
+    expect(runRequest.safeParse({ ...fixtures.runRequest, origin: "web" }).success).toBe(true);
+    expect(runRequest.safeParse({ ...fixtures.runRequest, origin: "routine" }).success).toBe(true);
+    expect(runRequest.safeParse({ ...fixtures.runRequest, origin: "telegram" }).success).toBe(
+      false,
+    );
+    expect(
+      runRequest.safeParse({
+        ...fixtures.runRequest,
+        channelIntake: {
+          integration: "fixture",
+          consumer: "c-1",
+          externalUpdateId: "u-1",
+        },
+      }).success,
+    ).toBe(false);
+
+    expect(run.safeParse({ ...fixtures.run, origin: "telegram" }).success).toBe(true);
+    expect(run.safeParse({ ...fixtures.run, origin: "http" }).success).toBe(true);
   });
 });
 
@@ -517,7 +998,7 @@ describe("match compiled server and CSP-compatible Web parsing", () => {
       schema: channelBinding,
       compiled: compiledParsers.channelBinding,
       valid: fixtures.channelBinding,
-      invalid: { ...fixtures.channelBinding, integration: "slack" },
+      invalid: { ...fixtures.channelBinding, integration: "   " },
     },
     {
       name: "outboxEvent",

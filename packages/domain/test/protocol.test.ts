@@ -192,9 +192,9 @@ describe("validate typed CloudEvents v1.0 envelopes", () => {
         sessionId: "sess-1",
         runId: "run-1",
         approvalId: "appr-1",
-        operationKind: "home-assistant" as const,
-        operationId: "light.turn_on",
-        prompt: "Turn on living room lamp?",
+        operationKind: "mcp" as const,
+        operationId: "notes.append_note",
+        prompt: "Append daily shift note?",
         deadline: "2026-11-22T14:05:00Z",
       },
     };

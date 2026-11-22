@@ -1,10 +1,13 @@
+import { Database } from "bun:sqlite";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "bun:test";
 import { DomainError, type RunEvent } from "@der/domain";
 import {
+  applyMigrations,
   canonicalizeJson,
+  CORE_MIGRATION,
   fingerprintJson,
   openSqliteStore,
   type SqliteStore,
@@ -101,7 +104,11 @@ describe("configure SQLite WAL, foreign keys, busy timeout, and migration seam",
           "SELECT version FROM schema_migrations ORDER BY version ASC",
         )
         .all();
-      expect(applied.map((row) => row.version)).toEqual(["001-core", "002-memory-seam-test"]);
+      expect(applied.map((row) => row.version)).toEqual([
+        "001-core",
+        "002-memory-seam-test",
+        "003-outbox-destinations",
+      ]);
     } finally {
       store.close();
     }
@@ -116,7 +123,11 @@ describe("configure SQLite WAL, foreign keys, busy timeout, and migration seam",
           "SELECT version FROM schema_migrations ORDER BY version ASC",
         )
         .all();
-      expect(applied.map((row) => row.version)).toEqual(["001-core", "002-memory-seam-test"]);
+      expect(applied.map((row) => row.version)).toEqual([
+        "001-core",
+        "002-memory-seam-test",
+        "003-outbox-destinations",
+      ]);
     } finally {
       reopened.close();
     }
@@ -145,7 +156,7 @@ describe("admit runs with scoped idempotency and single active run", () => {
       const first = await store.admit({
         botId: bot.id,
         sessionId: session.id,
-        origin: "http",
+        origin: "web",
         idempotencyKey: "req-1",
         input: {
           parts: [
@@ -153,27 +164,16 @@ describe("admit runs with scoped idempotency and single active run", () => {
             { type: "text", text: "Run fixture" },
           ],
         },
-        channelIntake: {
-          integration: "fixture",
-          consumer: "fixture-consumer",
-          externalUpdateId: "upd-1",
-          nextCursor: "cursor-1",
-        },
       });
 
       expect(first.isDuplicate).toBe(false);
       expect(first.run.status).toBe("queued");
       expect(first.initialMessage.ordinal).toBe(1);
-      expect(store.getChannelReceipt("fixture", "fixture-consumer", "upd-1")).toMatchObject({
-        disposition: "admitted",
-        referenceId: first.run.id,
-      });
-      expect(store.getChannelCursor("fixture", "fixture-consumer")?.position).toBe("cursor-1");
 
       const replay = await store.admit({
         botId: bot.id,
         sessionId: session.id,
-        origin: "http",
+        origin: "web",
         idempotencyKey: "req-1",
         input: {
           parts: [
@@ -205,7 +205,7 @@ describe("admit runs with scoped idempotency and single active run", () => {
       await store.admit({
         botId: bot.id,
         sessionId: session.id,
-        origin: "http",
+        origin: "web",
         idempotencyKey: "req-1",
         input: { parts: [{ type: "text", text: "First payload" }] },
       });
@@ -215,7 +215,7 @@ describe("admit runs with scoped idempotency and single active run", () => {
           store.admit({
             botId: bot.id,
             sessionId: session.id,
-            origin: "http",
+            origin: "web",
             idempotencyKey: "req-1",
             input: { parts: [{ type: "text", text: "Mutated payload" }] },
           }),
@@ -227,7 +227,7 @@ describe("admit runs with scoped idempotency and single active run", () => {
           store.admit({
             botId: bot.id,
             sessionId: session.id,
-            origin: "http",
+            origin: "web",
             idempotencyKey: "req-2",
             input: { parts: [{ type: "text", text: "Competing active run" }] },
           }),
@@ -237,7 +237,7 @@ describe("admit runs with scoped idempotency and single active run", () => {
       const otherAdmission = await store.admit({
         botId: bot.id,
         sessionId: otherSession.id,
-        origin: "http",
+        origin: "web",
         idempotencyKey: "req-1",
         input: { parts: [{ type: "text", text: "Independent session" }] },
       });
@@ -260,7 +260,7 @@ describe("append bounded run events and replay exclusively after cursor", () => 
       const { run } = await store.admit({
         botId: bot.id,
         sessionId: session.id,
-        origin: "http",
+        origin: "web",
         idempotencyKey: "req-stream",
         input: { parts: [{ type: "text", text: "Stream chunks" }] },
       });
@@ -312,7 +312,7 @@ describe("persist approvals, transactional outbox rows, and exact-operation effe
       const { run } = await store.admit({
         botId: bot.id,
         sessionId: session.id,
-        origin: "http",
+        origin: "web",
         idempotencyKey: "req-appr",
         input: { parts: [{ type: "text", text: "Execute host fixture" }] },
       });
@@ -564,6 +564,169 @@ describe("persist approvals, transactional outbox rows, and exact-operation effe
         expect(delivered.state).toBe("delivered");
         expect(delivered.attempts).toBe(2);
       }
+    } finally {
+      store.close();
+    }
+  });
+
+  it("migrates 001-core channel_bindings preserving outbox_events foreign keys and persists custom OutboxSink kinds", async () => {
+    const dbPath = createTempDbPath();
+    const legacyDb = new Database(dbPath, { create: true, strict: true });
+    legacyDb.exec("PRAGMA foreign_keys = ON;");
+    applyMigrations(legacyDb, [CORE_MIGRATION], () => new Date("2026-11-22T15:00:00Z"));
+
+    const ts = "2026-11-22T15:00:00.000Z";
+    legacyDb
+      .query(
+        `INSERT INTO bots (id, name, persona, default_engine, allowed_engines_json, workspace_path, created_at, updated_at)
+         VALUES ('bot-mig', 'Mig Bot', 'Concise', 'fixture', '["fixture"]', NULL, ?, ?)`,
+      )
+      .run(ts, ts);
+    legacyDb
+      .query(
+        `INSERT INTO sessions (id, bot_id, title, engine, created_at, updated_at)
+         VALUES ('sess-mig', 'bot-mig', 'Mig Session', 'fixture', ?, ?)`,
+      )
+      .run(ts, ts);
+    legacyDb
+      .query(
+        `INSERT INTO channel_bindings (id, integration, external_chat_id, external_actor_id, bot_id, session_id, enabled, created_at, updated_at)
+         VALUES ('bind-legacy', 'fixture', 'chat-1', 'actor-1', 'bot-mig', 'sess-mig', 1, ?, ?)`,
+      )
+      .run(ts, ts);
+    legacyDb
+      .query(
+        `INSERT INTO outbox_events (id, binding_id, event_id, envelope_json, state, attempts, next_retry_at, delivered_at, last_error, created_at, updated_at)
+         VALUES ('outbox-legacy-1', 'bind-legacy', 'evt-legacy-1', ?, 'pending', 0, NULL, NULL, NULL, ?, ?)`,
+      )
+      .run(
+        JSON.stringify({
+          specversion: "1.0",
+          id: "evt-legacy-1",
+          source: "/bots/bot-mig",
+          type: "der.chat.replied",
+          time: ts,
+          subject: "sessions/sess-mig/runs/run-legacy",
+          datacontenttype: "application/json",
+          data: {
+            botId: "bot-mig",
+            sessionId: "sess-mig",
+            runId: "run-legacy",
+            message: {
+              id: "msg-legacy",
+              botId: "bot-mig",
+              sessionId: "sess-mig",
+              ordinal: 1,
+              role: "assistant",
+              parts: [{ type: "text", text: "Legacy reply" }],
+              runId: "run-legacy",
+              createdAt: ts,
+            },
+          },
+        }),
+        ts,
+        ts,
+      );
+    legacyDb.close();
+
+    const store = openSqliteStore({ filename: dbPath });
+    try {
+      expect(store.database.foreignKeysEnabled()).toBe(true);
+      expect(store.listChannelBindings({ botId: "bot-mig" }).map((b) => b.id)).toEqual([
+        "bind-legacy",
+      ]);
+      expect(store.listOutboxEvents({ bindingId: "bind-legacy" }).map((e) => e.id)).toEqual([
+        "outbox-legacy-1",
+      ]);
+
+      const webhookBinding = store.upsertChannelBinding({
+        id: "bind-webhook",
+        integration: "webhook",
+        externalChatId: "https://hooks.example.invalid/der",
+        externalActorId: "webhook-operator",
+        botId: "bot-mig",
+        sessionId: "sess-mig",
+        enabled: true,
+      });
+      expect(webhookBinding.integration).toBe("webhook");
+
+      const destinations = store.listOutboxDestinations({ kind: "webhook" });
+      expect(destinations).toHaveLength(1);
+      expect(destinations[0]).toMatchObject({
+        id: "bind-webhook",
+        kind: "webhook",
+        target: "https://hooks.example.invalid/der",
+      });
+
+      const { run } = await store.admit({
+        botId: "bot-mig",
+        sessionId: "sess-mig",
+        origin: "web",
+        idempotencyKey: "webhook-run-1",
+        input: { parts: [{ type: "text", text: "Notify webhook" }] },
+      });
+      const finished = await store.finishRun({
+        runId: run.id,
+        status: "completed",
+        terminalEvent: {
+          chunkKey: `${run.id}:terminal`,
+          chunk: { type: "RUN_FINISHED", runId: run.id },
+        },
+        finalMessageParts: [{ type: "text", text: "Webhook payload ready." }],
+      });
+      expect(finished.outboxEvents.map((event) => event.bindingId)).toContain("bind-webhook");
+    } finally {
+      store.close();
+    }
+  });
+
+  it("deserializes historical approvals and effects with removed legacy operation_kind as legacy", async () => {
+    const store = openSqliteStore({ filename: createTempDbPath() });
+    try {
+      const { bot, session } = seedFixture(store);
+      const { run } = await store.admit({
+        botId: bot.id,
+        sessionId: session.id,
+        origin: "web",
+        idempotencyKey: "legacy-op-kind-1",
+        input: { parts: [{ type: "text", text: "Historical run" }] },
+      });
+      const ts = "2026-11-22T15:00:00.000Z";
+      store.database.db
+        .query(
+          `INSERT INTO approvals
+            (id, bot_id, session_id, run_id, operation_kind, operation_id, canonical_arguments_json, attempt_id, prompt, awakeable, deadline, status, actor, decided_at, created_at, updated_at)
+           VALUES ('appr-legacy-1', ?, ?, ?, 'home-assistant', 'light.turn_on', '{"entity":"lamp"}', 'att-legacy', 'Turn on lamp?', 'awk-legacy', ?, 'approved', 'operator', ?, ?, ?)`,
+        )
+        .run(bot.id, session.id, run.id, ts, ts, ts, ts);
+      store.database.db
+        .query(
+          `INSERT INTO effects
+            (id, run_id, operation_kind, operation_id, canonical_arguments_json, attempt_id, status, outcome_json, started_at, updated_at)
+           VALUES ('eff-legacy-1', ?, 'home-assistant', 'light.turn_on', '{"entity":"lamp"}', 'att-legacy', 'completed', '{"ok":true}', ?, ?)`,
+        )
+        .run(run.id, ts, ts);
+
+      const byId = store.getApproval("appr-legacy-1");
+      expect(byId?.effect.operationKind).toBe("legacy");
+      expect(byId?.effect.operationId).toBe("light.turn_on");
+
+      const latest = store.getLatestApprovalForRun(run.id);
+      expect(latest?.id).toBe("appr-legacy-1");
+      expect(latest?.effect.operationKind).toBe("legacy");
+
+      const legacyEffect = store.getEffect({
+        runId: run.id,
+        operationKind: "home-assistant" as unknown as Parameters<
+          SqliteStore["getEffect"]
+        >[0]["operationKind"],
+        operationId: "light.turn_on",
+        canonicalArguments: { entity: "lamp" },
+        attemptId: "att-legacy",
+      });
+      expect(legacyEffect?.id).toBe("eff-legacy-1");
+      expect(legacyEffect?.identity.operationKind).toBe("legacy");
+      expect(legacyEffect?.identity.operationId).toBe("light.turn_on");
     } finally {
       store.close();
     }

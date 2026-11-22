@@ -36,7 +36,7 @@ describe("Operator-managed Agent Skills loader with root containment", () => {
         "description: Verify release checklist before deployment.",
         "license: MIT",
         "compatibility: bun>=1.4",
-        "allowed-tools: home_assistant.get_state notes.search",
+        "allowed-tools: notes.search_notes docker.execute",
         "metadata:",
         "  owner: ops",
         "---",
@@ -72,7 +72,7 @@ describe("Operator-managed Agent Skills loader with root containment", () => {
         license: "MIT",
         compatibility: "bun>=1.4",
         metadata: { owner: "ops" },
-        allowedTools: ["home_assistant.get_state", "notes.search"],
+        allowedTools: ["notes.search_notes", "docker.execute"],
       },
     ]);
     expect(loaded.rejected).toHaveLength(2);
