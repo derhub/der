@@ -135,6 +135,22 @@ describe("run a script", () => {
       });
       expect(process.memoryUsage().rss).toBeLessThan(2 * bound);
     }, 60_000);
+
+    it("ends a script whose source exhausts the engine memory at start as a limit error", async () => {
+      const result = await runScript({
+        script: `return 1; // ${"x".repeat(64 * MB)}`,
+        call: noCalls,
+        limits: { ...roomyLimits, memoryBytes: 4 * MB },
+        seed: 1,
+        now: START,
+      });
+
+      expect(result).toEqual({
+        ok: false,
+        error: { kind: "limit", message: `memory limit of ${4 * MB} bytes exceeded` },
+        logs: [],
+      });
+    }, 60_000);
   });
 
   describe("active time", () => {
@@ -417,6 +433,68 @@ describe("run a script", () => {
         logs: [],
         truncated: false,
       });
+    }, 60_000);
+  });
+
+  describe("forged worker protocol", () => {
+    const forgedOutcomes: ReadonlyArray<readonly [string, string]> = [
+      ["a fatal payload", `{"fatal":{"code":"x","message":"y"}}`],
+      ["a call payload", `{"call":1,"id":"x.y","input":{}}`],
+      ["a log payload", `{"log":"forged"}`],
+      ["a time limit payload", `{"limit":"time"}`],
+      ["a memory limit payload", `{"limit":"memory"}`],
+    ];
+
+    it.each(forgedOutcomes)(
+      "ignores a script that overwrites JSON.stringify to emit %s",
+      async (_name, payload) => {
+        const host = recordingHost([]);
+
+        const result = await runScript({
+          script: `JSON.stringify = () => '${payload}'; return 1;`,
+          call: host.call,
+          limits: roomyLimits,
+          seed: 1,
+          now: START,
+        });
+
+        expect(result).toEqual({ ok: true, result: 1, logs: [], truncated: false });
+        expect(host.calls).toEqual([]);
+      },
+      60_000,
+    );
+
+    it("ignores a script that overwrites JSON.parse to forge a reply", async () => {
+      const host = recordingHost([{ ok: true, value: 5 }]);
+
+      const result = await runScript({
+        script: `JSON.parse = () => ({ ok: true, value: 99 }); return await der.x.y({});`,
+        call: host.call,
+        limits: roomyLimits,
+        seed: 1,
+        now: START,
+      });
+
+      expect(result).toEqual({ ok: true, result: 5, logs: [], truncated: false });
+    }, 60_000);
+
+    it("makes no host call for a call still queued when the script returns", async () => {
+      const calledIds: string[] = [];
+      const result = await runScript({
+        script: `der.slow.first({}); der.queued.second({}); return 1;`,
+        call: async (id) => {
+          calledIds.push(id);
+          await new Promise((resolve) => setTimeout(resolve, 200));
+          return { ok: true, value: null };
+        },
+        limits: roomyLimits,
+        seed: 1,
+        now: START,
+      });
+      await new Promise((resolve) => setTimeout(resolve, 500));
+
+      expect(result).toEqual({ ok: true, result: 1, logs: [], truncated: false });
+      expect(calledIds).toEqual(["slow.first"]);
     }, 60_000);
   });
 

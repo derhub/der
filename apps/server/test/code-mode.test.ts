@@ -12,6 +12,7 @@ import {
 } from "@der/domain";
 import type { AnyTool } from "@tanstack/ai";
 import { createExecuteTool } from "#code-mode/execute";
+import type { ScriptRuns } from "#scripts/script-workflow";
 import { codeModeInstructions } from "#code-mode/instructions";
 import { createSearchTool } from "#code-mode/search";
 import { createFixtureCapabilities } from "#capabilities/fixture";
@@ -203,6 +204,48 @@ describe("pick a script back up after the tool call was cut", () => {
 
     expect(second).toEqual({ ok: true, result: { published: true }, logs: [], truncated: false });
     expect(host.published).toEqual(["release"]);
+    expect(scriptRunCount(server, owner.run.id)).toBe(1);
+  }, 60_000);
+});
+
+describe("return a stored result without attaching", () => {
+  it("returns the stored result of a finished undelivered script run when attach is unavailable", async () => {
+    const { server, host } = await startDirectServer();
+    const owner = await admitOwningRun(server, "code-mode-stored-result");
+    const attachDown = new Error("workflow retention elapsed");
+    const finishThenFail: ScriptRuns = {
+      submit: (id) => server.scriptRuns!.submit(id),
+      cancel: (id) => server.scriptRuns!.cancel(id),
+      attach: async (id, signal) => {
+        await server.scriptRuns!.attach(id, signal);
+        throw attachDown;
+      },
+    };
+    const neverAttach: ScriptRuns = {
+      ...finishThenFail,
+      attach: async () => {
+        throw attachDown;
+      },
+    };
+    const append = `return der.notes.append({ text: "tick" });`;
+    const tool = (scriptRuns: ScriptRuns) =>
+      createExecuteTool({
+        run: owner.run,
+        scriptRunStore: server.scriptRunStore,
+        scriptRuns,
+        maxResultBytes: RESULT_BYTES,
+      });
+
+    const first = await callTool(tool(finishThenFail), { script: append });
+    const second = await callTool(tool(neverAttach), { script: append });
+
+    expect(first).toEqual({
+      ok: false,
+      error: { kind: "capability", message: "execute failed: workflow retention elapsed" },
+      logs: [],
+    });
+    expect(second).toEqual({ ok: true, result: { count: 1 }, logs: [], truncated: false });
+    expect(host.appended).toEqual(["tick"]);
     expect(scriptRunCount(server, owner.run.id)).toBe(1);
   }, 60_000);
 });

@@ -1,7 +1,7 @@
 import type { ExecuteResult, Run, RoutineStore } from "@der/domain";
 import { isTerminalScriptRunStatus, type SqliteScriptRuns } from "@der/storage";
 import type { ScriptRuns } from "../scripts/script-workflow";
-import type { PreApprovalStageResult, WorkflowDeps } from "./run-steps";
+import type { RunStageResult, WorkflowDeps } from "./run-steps";
 
 export interface ScriptRoutineDeps {
   readonly routines: Pick<RoutineStore, "getRoutine">;
@@ -9,7 +9,7 @@ export interface ScriptRoutineDeps {
   readonly scriptRuns: ScriptRuns;
 }
 
-function failed(code: string, detail: string): PreApprovalStageResult {
+function failed(code: string, detail: string): RunStageResult {
   return { kind: "failed", code, detail };
 }
 
@@ -20,7 +20,7 @@ function resultText(result: Extract<ExecuteResult, { ok: true }>): string {
 export async function executeScriptRoutineStage(
   deps: WorkflowDeps,
   run: Run,
-): Promise<PreApprovalStageResult> {
+): Promise<RunStageResult> {
   const scripts = deps.scriptRoutines?.();
   if (scripts === undefined) {
     return failed("script.not_configured", "Script routines are not configured on this server.");
@@ -58,10 +58,11 @@ export async function executeScriptRoutineStage(
     botId: run.botId,
     source: routine.script,
   });
-  if (!isTerminalScriptRunStatus(scriptRun.status)) {
+  let result = isTerminalScriptRunStatus(scriptRun.status) ? scriptRun.result : null;
+  if (result === null) {
     await scripts.scriptRuns.submit(scriptRun.id);
+    result = await scripts.scriptRuns.attach(scriptRun.id, new AbortController().signal);
   }
-  const result = await scripts.scriptRuns.attach(scriptRun.id, new AbortController().signal);
 
   if ((await deps.store.getRun(run.id))?.status === "interrupted") {
     return {

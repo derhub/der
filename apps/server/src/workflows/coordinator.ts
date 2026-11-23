@@ -12,7 +12,7 @@ import {
 } from "@der/domain";
 import type { ApprovalBroker } from "@der/runtime/engines";
 import {
-  executeEnginePreApprovalStage,
+  executeEngineStage,
   finalizeDirectRunStep,
   loadAndStartRunStep,
   persistPendingApprovalStep,
@@ -99,7 +99,7 @@ export function createRunCoordinator(options: RunCoordinatorOptions): RunCoordin
     const nowMs = await currentNowMs(driver);
     const deadline = formatUtcTimestamp(new Date(nowMs + options.approvalTimeoutMs));
 
-    const persisted = await driver.runStep("persist-engine-approval", async () => {
+    const persisted = await driver.runStep("persist-approval", async () => {
       const result = await persistPendingApprovalStep(options, {
         run: input.run,
         effect: input.effect,
@@ -131,7 +131,7 @@ export function createRunCoordinator(options: RunCoordinatorOptions): RunCoordin
     if (awakeable) {
       const outcome = await awakeable.wait(remainingMs, signal, persisted.awakeableId);
       if (outcome === "timeout") {
-        decisionStatus = await driver.runStep("reconcile-engine-approval-expiry", () =>
+        decisionStatus = await driver.runStep("reconcile-approval-expiry", () =>
           reconcileApprovalExpiryStep(options, {
             run: input.run,
             approvalId: persisted.approvalId,
@@ -165,9 +165,7 @@ export function createRunCoordinator(options: RunCoordinatorOptions): RunCoordin
     const stage =
       run.engine === "script"
         ? await driver.runStep("run-routine-script", () => executeScriptRoutineStage(options, run))
-        : await driver.runStep("engine-pre-approval", () =>
-            executeEnginePreApprovalStage(options, run),
-          );
+        : await driver.runStep("run-engine", () => executeEngineStage(options, run));
 
     await driver.runStep("finish-direct-run", () =>
       finalizeDirectRunStep(options, { run, outcome: stage }),

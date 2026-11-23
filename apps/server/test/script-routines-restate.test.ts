@@ -34,8 +34,8 @@ async function startRestateServer(
   restateListen: number,
   host: NoteHost,
   seedFixture: boolean,
+  restate: LocalRestateHandle = restateHandle!,
 ): Promise<RunningServer> {
-  const restate = restateHandle!;
   const server = await startServer({
     config: {
       host: "127.0.0.1",
@@ -59,7 +59,17 @@ async function startRestateServer(
   return server;
 }
 
-const WAIT_PAST_RESTATE_TIMEOUTS_MS = 150_000;
+async function wasAbortedByTimeout(adminUrl: string, service: string): Promise<boolean> {
+  const response = await fetch(`${adminUrl}/query`, {
+    method: "POST",
+    headers: { "content-type": "application/json", accept: "application/json" },
+    body: JSON.stringify({
+      query: `SELECT COUNT(*) AS aborted FROM sys_invocation WHERE target_service_name = '${service}' AND last_failure LIKE '%abort timeout%'`,
+    }),
+  });
+  const body = (await response.json()) as { rows: { aborted: number }[] };
+  return (body.rows[0]?.aborted ?? 0) > 0;
+}
 
 const PUBLISH = `return await der.notes.publish({ text: "release" });`;
 
@@ -205,18 +215,34 @@ describe("a script routine under Restate", () => {
     ).toBe(1);
   }, 300_000);
 
-  it("wait: a script parked on an approval past the Restate inactivity and abort timeouts completes once approved with one approval and one effect", async () => {
+  it("re-enter: a script parked on an approval across short invoker timeouts re-enters its step and still ends with one approval and one effect", async () => {
+    const shortTimeouts = await ensureLocalRestate({
+      settings: {
+        RESTATE_WORKER__INVOKER__INACTIVITY_TIMEOUT: "2s",
+        RESTATE_WORKER__INVOKER__ABORT_TIMEOUT: "4s",
+      },
+    });
+    cleanups.push(() => shortTimeouts.stop());
     const tempDb = createTempDatabase("der-script-routine-wait-");
     cleanups.push(() => tempDb.cleanup());
     const host = createNoteHost();
-    const server = await startRestateServer(tempDb, await allocateLocalTcpNumber(), host, true);
+    const server = await startRestateServer(
+      tempDb,
+      await allocateLocalTcpNumber(),
+      host,
+      true,
+      shortTimeouts,
+    );
     cleanups.push(() => server.close());
     await createScriptRoutine(server, PUBLISH);
     const tick = await fire(server, "2026-06-01");
     const runId = tick.runId!;
     const approval = await pendingApproval(server, runId);
 
-    await Bun.sleep(WAIT_PAST_RESTATE_TIMEOUTS_MS);
+    await waitUntil(() => wasAbortedByTimeout(shortTimeouts.adminUrl, "RunWorkflow"), {
+      timeoutMs: 60_000,
+      label: "the routine step to be aborted and re-entered",
+    });
 
     expect(server.store.getRun(runId)?.status).toBe("waiting_approval");
     expect(approvalCount(server, runId)).toBe(1);
@@ -231,7 +257,7 @@ describe("a script routine under Restate", () => {
     });
     await waitUntil(
       async () => (server.store.getRun(runId)?.status === "completed" ? true : false),
-      { timeoutMs: 120_000, label: "approved script routine run after a long wait" },
+      { timeoutMs: 120_000, label: "approved script routine run after re-entry" },
     );
 
     expect(approvalCount(server, runId)).toBe(1);
@@ -239,5 +265,5 @@ describe("a script routine under Restate", () => {
     expect(
       server.store.getEffect({ ...approval.effect, operationKind: "capability" })?.status,
     ).toBe("completed");
-  }, 420_000);
+  }, 240_000);
 });

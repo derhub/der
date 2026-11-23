@@ -152,6 +152,9 @@ export async function runScript(options: RunScriptOptions): Promise<ScriptResult
   }, STALL_POLL_MS);
 
   const handleCall = async (message: { call: number; id: string; input: unknown }) => {
+    if (outcome.verdict !== undefined) {
+      return;
+    }
     calls += 1;
     if (calls > limits.maxCalls) {
       fail("limit", `call limit of ${limits.maxCalls} exceeded`);
@@ -187,19 +190,30 @@ export async function runScript(options: RunScriptOptions): Promise<ScriptResult
   };
 
   const handleMessage = (message: ScriptWorkerMessage): void => {
-    if ("log" in message) {
-      logs.push(message.log);
-    } else if ("call" in message) {
-      callsInFlight += 1;
-      callQueue = callQueue.then(() =>
-        handleCall(message).finally(() => {
-          callsInFlight -= 1;
-        }),
-      );
-    } else if ("fatal" in message) {
-      outcome.fatal = new ScriptRunnerError(message.fatal.code, message.fatal.message);
-      fail("script", message.fatal.message);
-    } else if (message.limit === "memory") {
+    switch (message.type) {
+      case "log":
+        logs.push(message.text);
+        return;
+      case "call":
+        callsInFlight += 1;
+        callQueue = callQueue.then(() =>
+          handleCall(message).finally(() => {
+            callsInFlight -= 1;
+          }),
+        );
+        return;
+      case "fatal":
+        outcome.fatal = new ScriptRunnerError(message.code, message.message);
+        fail("script", message.message);
+        return;
+      case "done":
+        finishDone(message);
+        return;
+    }
+  };
+
+  const finishDone = (message: Extract<ScriptWorkerMessage, { type: "done" }>): void => {
+    if (message.limit === "memory") {
       fail("limit", `memory limit of ${limits.memoryBytes} bytes exceeded`);
     } else if (message.limit === "time") {
       fail("limit", `active time limit of ${limits.activeMs} ms exceeded`);

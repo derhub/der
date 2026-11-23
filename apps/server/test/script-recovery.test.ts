@@ -1,6 +1,9 @@
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "bun:test";
+import * as z from "zod";
 import {
+  defineCapability,
   formatUtcTimestamp,
+  type Capability,
   type Engine,
   type EngineEvent,
   type EngineKind,
@@ -144,6 +147,68 @@ describe("recover a script run across a server restart", () => {
       replacement.store.getEffect({ ...approval.effect, operationKind: "capability" })?.status,
     ).toBe("completed");
     expect(replacement.scriptRunStore.get(scriptRun.id)?.status).toBe("completed");
+  }, 240_000);
+
+  it("predicate: an approval rule that answers differently after a restart still follows its first answer", async () => {
+    const tempDb = createTempDatabase("der-script-predicate-");
+    cleanups.push(() => tempDb.cleanup());
+    const restateListen = await allocateLocalTcpNumber();
+    const host = createNoteHost();
+    const applied: string[] = [];
+    let evaluations = 0;
+    host.catalog.add(
+      defineCapability({
+        id: "ledger.post",
+        description: "Post an entry",
+        input: z.object({ text: z.string() }),
+        output: z.object({ posted: z.boolean() }),
+        effect: "write",
+        approval: () => {
+          evaluations += 1;
+          return evaluations === 1;
+        },
+        async execute(input) {
+          applied.push(input.text);
+          return { posted: true };
+        },
+      }) as unknown as Capability,
+    );
+
+    let first: RunningServer | undefined = await startRestateServer(
+      tempDb,
+      restateListen,
+      host,
+      true,
+    );
+    cleanups.push(async () => {
+      await first?.close();
+    });
+    const owner = await admitOwningRun(first, "recovery-predicate");
+    const scriptRun = await submitScript(
+      first,
+      owner,
+      `return der.ledger.post({ text: "entry" });`,
+    );
+    const approval = await awaitPendingApproval(first, owner.run.id);
+
+    const closing = first;
+    first = undefined;
+    await closing.close();
+    const replacement = await startRestateServer(tempDb, restateListen, host, false);
+    cleanups.push(() => replacement.close());
+    await replacement.coordinator.decide({
+      approvalId: approval.id,
+      botId: owner.botId,
+      sessionId: owner.sessionId,
+      runId: owner.run.id,
+      status: "approved",
+      actor: "operator",
+      decidedAt: formatUtcTimestamp(new Date()),
+    });
+    const result = await replacement.scriptRuns!.attach(scriptRun.id, AbortSignal.timeout(90_000));
+
+    expect(result).toEqual({ ok: true, result: { posted: true }, logs: [], truncated: false });
+    expect(applied).toEqual(["entry"]);
   }, 240_000);
 });
 

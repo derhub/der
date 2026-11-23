@@ -66,7 +66,7 @@ async function finishRunAndNotify(
   return finished;
 }
 
-export type PreApprovalStageResult =
+export type RunStageResult =
   | {
       readonly kind: "completed";
       readonly finalMessageParts?: readonly MessagePart[];
@@ -129,10 +129,7 @@ export async function loadAndStartRunStep(
   return { run: started, alreadyTerminal: false };
 }
 
-export async function executeEnginePreApprovalStage(
-  deps: WorkflowDeps,
-  run: Run,
-): Promise<PreApprovalStageResult> {
+export async function executeEngineStage(deps: WorkflowDeps, run: Run): Promise<RunStageResult> {
   const engine = run.engine === "script" ? undefined : deps.engines.get(run.engine);
   if (!engine) {
     return {
@@ -151,7 +148,7 @@ export async function executeEnginePreApprovalStage(
 
   const readInterruptedStage = async (
     fallbackDetail?: string,
-  ): Promise<PreApprovalStageResult | undefined> => {
+  ): Promise<RunStageResult | undefined> => {
     const currentRun = await deps.store.getRun(run.id);
     if (currentRun?.status !== "interrupted") {
       return undefined;
@@ -365,7 +362,7 @@ export async function finalizeDirectRunStep(
   deps: WorkflowDeps,
   input: {
     readonly run: Run;
-    readonly outcome: PreApprovalStageResult;
+    readonly outcome: RunStageResult;
   },
 ): Promise<Run> {
   const current = await deps.store.getRun(input.run.id);

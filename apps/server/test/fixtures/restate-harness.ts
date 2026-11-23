@@ -129,7 +129,17 @@ async function isRestateHealthy(adminUrl: string): Promise<boolean> {
   }
 }
 
-export async function ensureLocalRestate(): Promise<LocalRestateHandle> {
+export interface LocalRestateOptions {
+  readonly settings?: Readonly<Record<string, string>>;
+}
+
+export async function ensureLocalRestate(
+  options: LocalRestateOptions = {},
+): Promise<LocalRestateHandle> {
+  const settings = Object.entries(options.settings ?? {});
+  if (settings.length > 0) {
+    return launchRestateContainer(settings);
+  }
   const envIngress =
     process.env["DER_TEST_RESTATE_INGRESS_URL"] ?? process.env["RESTATE_INGRESS_URL"];
   const envAdmin = process.env["DER_TEST_RESTATE_ADMIN_URL"] ?? process.env["RESTATE_ADMIN_URL"];
@@ -153,6 +163,12 @@ export async function ensureLocalRestate(): Promise<LocalRestateHandle> {
     };
   }
 
+  return launchRestateContainer([]);
+}
+
+async function launchRestateContainer(
+  settings: readonly (readonly [string, string])[],
+): Promise<LocalRestateHandle> {
   const ingressNum = await allocateLocalTcpNumber();
   const adminNum = await allocateLocalTcpNumber();
   const nodeNum = await allocateLocalTcpNumber();
@@ -177,6 +193,7 @@ export async function ensureLocalRestate(): Promise<LocalRestateHandle> {
       `RESTATE_BIND_PORT=${nodeNum}`,
       "-e",
       "RESTATE_NODE_NAME=der-test-node",
+      ...settings.flatMap(([key, value]) => ["-e", `${key}=${value}`]),
       image,
       "--no-logo",
     ],

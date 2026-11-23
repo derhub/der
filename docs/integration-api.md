@@ -58,7 +58,7 @@ interface CapabilityContext {
 - `input` and `output` are Zod schemas. Inputs and outputs cross a JSON boundary, so use JSON-compatible types.
 - `ctx.botId` is the bot that owns the calling Run. Scope data by it, as the host capabilities do (`apps/server/src/capabilities/scope.ts`).
 - `ctx.effect` is set for a `write` called from a Script. It carries the identity of the recorded Effect (`runId`, `operationKind: "capability"`, `operationId` = the capability id, `canonicalArguments`, `attemptId`). Use `attemptId` as an idempotency key against the upstream system.
-- `ctx.signal` aborts when the Script is cancelled.
+- `ctx.signal` aborts when the Script is cancelled. Under Restate it also aborts when the current attempt ends (for example when the server restarts), which is not a cancel: an abort is not proof the Script was cancelled.
 - `example` is one line of Script that calls the capability. It is shown to the agent and counts toward search ranking.
 
 ### Ids
@@ -70,7 +70,7 @@ An id is dot-separated, with at least two segments, and every segment matches `[
 - `effect: "read"` must have `approval: "none"`; `defineCapability` throws otherwise. Reads run as journaled steps and leave no Effect record.
 - `effect: "write"` gets an Effect record before it runs. The recorded outcome is replayed if the Script resumes, so the call is not repeated.
 - `approval: "always"` asks an operator for an exact-operation Approval on every call. The prompt shows the capability id and the first 400 characters of the input.
-- `approval: (input) => boolean` is evaluated against the validated input. It runs once per call, before the Approval is requested. If the input does not validate, it counts as no approval and the call then fails with `capability.invalid_input`.
+- `approval: (input) => boolean` is evaluated against the validated input. It runs once per call, before the Approval is requested, in a journaled step: a replay reuses the recorded answer instead of evaluating it again. If the input does not validate, it counts as no approval and the call then fails with `capability.invalid_input`.
 - `approval: "none"` on a `write` runs without an Approval but is still recorded as an Effect.
 
 A denied or expired Approval ends the Script with error kind `denied` or `expired`.

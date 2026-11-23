@@ -279,7 +279,10 @@ export async function executeScriptRun(
         attemptId: `${scriptRunId}:${ordinal}`,
       };
       let approvalId: string | undefined;
-      if (deps.catalog.requiresApproval(id, input)) {
+      const needsApproval = await driver.runStep(`${name}:needs-approval`, async () =>
+        deps.catalog.requiresApproval(id, input),
+      );
+      if (needsApproval) {
         const asked = await askApproval(name, id, input, effect);
         if ("reply" in asked) {
           return asked.reply;

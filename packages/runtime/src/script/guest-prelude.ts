@@ -1,5 +1,7 @@
 export const GUEST_PRELUDE = String.raw`(function (log, call, done, seed, now, source) {
   const AsyncFunction = Object.getPrototypeOf(async function () {}).constructor;
+  const stringify = JSON.stringify;
+  const parse = JSON.parse;
   const WRAPPER_LINES = 2;
   const HOST_ERROR_KINDS = ["denied", "expired", "cancelled", "capability"];
 
@@ -42,7 +44,7 @@ export const GUEST_PRELUDE = String.raw`(function (log, call, done, seed, now, s
   function formatLogArgument(value) {
     if (typeof value === "string") return value;
     try {
-      const text = JSON.stringify(value);
+      const text = stringify(value);
       return text === undefined ? String(value) : text;
     } catch {
       return String(value);
@@ -56,9 +58,7 @@ export const GUEST_PRELUDE = String.raw`(function (log, call, done, seed, now, s
 
   async function hostCall(id, input) {
     callOrdinal += 1;
-    const reply = JSON.parse(
-      await call(callOrdinal, id, JSON.stringify(input === undefined ? null : input)),
-    );
+    const reply = parse(await call(callOrdinal, id, stringify(input === undefined ? null : input)));
     if (typeof reply.now === "number") clock = reply.now;
     if (reply.ok) return reply.value;
     throw new HostError(id, reply.error);
@@ -120,9 +120,9 @@ export const GUEST_PRELUDE = String.raw`(function (log, call, done, seed, now, s
       const run = new AsyncFunction("der", source);
       disableCodeGeneration();
       const result = await run(namespace([]));
-      outcome = JSON.stringify({ result: result === undefined ? null : result });
+      outcome = stringify({ result: result === undefined ? null : result });
     } catch (error) {
-      outcome = JSON.stringify({ error: failure(error) });
+      outcome = stringify({ error: failure(error) });
     }
     done(outcome);
   }

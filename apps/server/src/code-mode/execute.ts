@@ -71,10 +71,11 @@ async function runScript(deps: ExecuteToolDeps, script: string, signal: AbortSig
     botId: deps.run.botId,
     source: script,
   });
-  if (!isTerminalScriptRunStatus(scriptRun.status)) {
+  let result = isTerminalScriptRunStatus(scriptRun.status) ? scriptRun.result : null;
+  if (result === null) {
     await deps.scriptRuns.submit(scriptRun.id);
+    result = await deps.scriptRuns.attach(scriptRun.id, signal);
   }
-  const result = await deps.scriptRuns.attach(scriptRun.id, signal);
   await deps.scriptRunStore.markDelivered(scriptRun.id);
   return result;
 }

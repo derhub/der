@@ -45,7 +45,7 @@ export {
   type UnattendedEligibilityResult,
 } from "./routine-schedule";
 export {
-  executeEnginePreApprovalStage,
+  executeEngineStage,
   finalizeDirectRunStep,
   finalizeInterruptedUncertainStep,
   loadAndStartRunStep,
@@ -55,7 +55,7 @@ export {
   type AwaitApprovalInput,
   type AwaitApprovalOutcome,
   type DurableWorkflow,
-  type PreApprovalStageResult,
+  type RunStageResult,
   type WorkflowDeps,
   type WorkflowStore,
 } from "./run-steps";

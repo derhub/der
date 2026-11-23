@@ -31,15 +31,15 @@ export interface ScriptWorkerFailure {
 }
 
 export type ScriptWorkerMessage =
-  | { readonly log: string }
-  | { readonly call: number; readonly id: string; readonly input: unknown }
+  | { readonly type: "log"; readonly text: string }
+  | { readonly type: "call"; readonly call: number; readonly id: string; readonly input: unknown }
   | {
-      readonly done: true;
+      readonly type: "done";
       readonly result?: unknown;
       readonly error?: ScriptWorkerFailure;
       readonly limit?: "memory" | "time";
     }
-  | { readonly fatal: { readonly code: string; readonly message: string } };
+  | { readonly type: "fatal"; readonly code: string; readonly message: string };
 
 declare const self: Worker;
 
@@ -49,6 +49,7 @@ const WASM_INITIAL_PAGES = 256;
 const WASM_MAX_PAGES = 32_768;
 const WASM_OVERHEAD_BYTES = 32 * 1024 * 1024;
 const OUT_OF_MEMORY = "InternalError: out of memory";
+const WASM_OUT_OF_BOUNDS = "RuntimeError: Out of bounds memory access";
 const STOP_REQUESTED = 1;
 
 // The engine renders local time through the worker's Date; pinning it to UTC keeps a Script's
@@ -146,7 +147,7 @@ async function run(init: ScriptWorkerInit): Promise<void> {
 
   const finishWithEngineError = (error: unknown): void => {
     if (timedOut) {
-      finish({ done: true, limit: "time" });
+      finish({ type: "done", limit: "time" });
       return;
     }
     const detail = error as { name?: unknown; message?: unknown } | null;
@@ -154,10 +155,14 @@ async function run(init: ScriptWorkerInit): Promise<void> {
       typeof detail === "object" && detail !== null && typeof detail.message === "string"
         ? `${String(detail.name)}: ${detail.message}`
         : undefined;
-    if (message === undefined || message === OUT_OF_MEMORY) {
-      finish({ done: true, limit: "memory" });
+    if (
+      message === undefined ||
+      message === OUT_OF_MEMORY ||
+      message.startsWith(WASM_OUT_OF_BOUNDS)
+    ) {
+      finish({ type: "done", limit: "memory" });
     } else {
-      finish({ done: true, error: { kind: "script", message } });
+      finish({ type: "done", error: { kind: "script", message } });
     }
   };
 
@@ -168,18 +173,23 @@ async function run(init: ScriptWorkerInit): Promise<void> {
       jobs.error.dispose();
       finishWithEngineError(dumped);
     } else if (!finished && pending.size === 0) {
-      finish({ done: true, error: { kind: "script", message: "script ended without a result" } });
+      finish({ type: "done", error: { kind: "script", message: "script ended without a result" } });
     }
   };
 
   const log = vm.newFunction("log", (text) => {
-    post({ log: vm.getString(text) });
+    post({ type: "log", text: vm.getString(text) });
   });
   const call = vm.newFunction("call", (ordinal, id, input) => {
     const deferred = vm.newPromise();
     const number = vm.getNumber(ordinal);
     pending.set(number, deferred);
-    post({ call: number, id: vm.getString(id), input: JSON.parse(vm.getString(input)) });
+    post({
+      type: "call",
+      call: number,
+      id: vm.getString(id),
+      input: JSON.parse(vm.getString(input)),
+    });
     return deferred.handle;
   });
   const done = vm.newFunction("done", (outcome) => {
@@ -188,11 +198,15 @@ async function run(init: ScriptWorkerInit): Promise<void> {
       error?: ScriptWorkerFailure;
     };
     if (timedOut) {
-      finish({ done: true, limit: "time" });
+      finish({ type: "done", limit: "time" });
     } else if (parsed.error?.message === OUT_OF_MEMORY) {
-      finish({ done: true, limit: "memory" });
+      finish({ type: "done", limit: "memory" });
     } else {
-      finish({ done: true, ...parsed });
+      finish({
+        type: "done",
+        ...(parsed.result === undefined ? {} : { result: parsed.result }),
+        ...(parsed.error === undefined ? {} : { error: parsed.error }),
+      });
     }
   });
 
@@ -202,45 +216,52 @@ async function run(init: ScriptWorkerInit): Promise<void> {
       return;
     }
     pending.delete(reply.call);
-    const text = vm.newString(JSON.stringify(reply));
-    deferred.resolve(text);
-    text.dispose();
-    drainJobs();
-    deferred.dispose();
+    try {
+      const text = vm.newString(JSON.stringify(reply));
+      deferred.resolve(text);
+      text.dispose();
+      drainJobs();
+      deferred.dispose();
+    } catch (error) {
+      finishWithEngineError(error);
+    }
   };
 
-  const prelude = vm.unwrapResult(vm.evalCode(GUEST_PRELUDE, "prelude.js"));
-  const args = [
-    log,
-    call,
-    done,
-    vm.newNumber(init.seed),
-    vm.newNumber(init.now),
-    vm.newString(init.script),
-  ];
-  const started = inGuest(() => vm.callFunction(prelude, vm.undefined, ...args));
-  prelude.dispose();
-  for (const handle of args) {
-    handle.dispose();
+  try {
+    const prelude = vm.unwrapResult(vm.evalCode(GUEST_PRELUDE, "prelude.js"));
+    const args = [
+      log,
+      call,
+      done,
+      vm.newNumber(init.seed),
+      vm.newNumber(init.now),
+      vm.newString(init.script),
+    ];
+    const started = inGuest(() => vm.callFunction(prelude, vm.undefined, ...args));
+    prelude.dispose();
+    for (const handle of args) {
+      handle.dispose();
+    }
+    if (started.error) {
+      const dumped: unknown = vm.dump(started.error);
+      started.error.dispose();
+      finishWithEngineError(dumped);
+      return;
+    }
+    started.value.dispose();
+    drainJobs();
+  } catch (error) {
+    finishWithEngineError(error);
   }
-  if (started.error) {
-    const dumped: unknown = vm.dump(started.error);
-    started.error.dispose();
-    finishWithEngineError(dumped);
-    return;
-  }
-  started.value.dispose();
-  drainJobs();
 }
 
 self.onmessage = (event: MessageEvent<ScriptWorkerInit | ScriptWorkerReply>) => {
   if ("script" in event.data) {
     run(event.data).catch((error: unknown) => {
       post({
-        fatal: {
-          code: "script.engine_start_failed",
-          message: error instanceof Error ? error.message : String(error),
-        },
+        type: "fatal",
+        code: "script.engine_start_failed",
+        message: error instanceof Error ? error.message : String(error),
       });
     });
   } else {
