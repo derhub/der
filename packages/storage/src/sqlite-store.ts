@@ -47,6 +47,7 @@ import {
   completeEffect as completeEffectCommand,
   decideApproval,
   getApproval as getApprovalQuery,
+  findWriteInDoubt as findWriteInDoubtQuery,
   getEffect as getEffectQuery,
   getLatestApprovalForRun as getLatestApprovalForRunQuery,
   markEffectUnknown as markEffectUnknownCommand,
@@ -469,6 +470,10 @@ export class SqliteStore
 
   getEffect(identity: EffectIdentity): EffectRecord | undefined {
     return getEffectQuery(this.database, identity);
+  }
+
+  findWriteInDoubt(runId: RunId): EffectRecord | undefined {
+    return findWriteInDoubtQuery(this.database, runId);
   }
 
   finishRun(input: FinishRunInput): Promise<FinishRunOutcome> {

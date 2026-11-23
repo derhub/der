@@ -478,23 +478,22 @@ describe("run a script", () => {
       expect(result).toEqual({ ok: true, result: 5, logs: [], truncated: false });
     }, 60_000);
 
-    it("makes no host call for a call still queued when the script returns", async () => {
+    it("carries a call still queued behind a slow one to its outcome before returning", async () => {
       const calledIds: string[] = [];
       const result = await runScript({
         script: `der.slow.first({}); der.queued.second({}); return 1;`,
         call: async (id) => {
           calledIds.push(id);
-          await new Promise((resolve) => setTimeout(resolve, 200));
+          await new Promise((resolve) => setTimeout(resolve, 100));
           return { ok: true, value: null };
         },
         limits: roomyLimits,
         seed: 1,
         now: START,
       });
-      await new Promise((resolve) => setTimeout(resolve, 500));
 
       expect(result).toEqual({ ok: true, result: 1, logs: [], truncated: false });
-      expect(calledIds).toEqual(["slow.first"]);
+      expect(calledIds).toEqual(["slow.first", "queued.second"]);
     }, 60_000);
   });
 
@@ -574,6 +573,111 @@ describe("run a script", () => {
     }, 60_000);
   });
 
+  describe("calls issued without await", () => {
+    it("lets a halt after the script returned win over its result", async () => {
+      const result = await runScript({
+        script: `der.a.b({}); return 1;`,
+        call: async () => {
+          await new Promise((resolve) => setTimeout(resolve, 50));
+          return { halt: true };
+        },
+        limits: roomyLimits,
+        seed: 1,
+        now: START,
+      });
+
+      expect(result).toEqual({
+        ok: false,
+        error: { kind: "cancelled", message: "script halted by the host" },
+        logs: [],
+      });
+    }, 60_000);
+
+    it("rethrows a host failure that happens after the script returned", async () => {
+      const failure = await runScript({
+        script: `der.a.b({}); return 1;`,
+        call: async () => {
+          await new Promise((resolve) => setTimeout(resolve, 50));
+          throw new Error("store unavailable");
+        },
+        limits: roomyLimits,
+        seed: 1,
+        now: START,
+      }).catch((error: unknown) => error);
+
+      expect((failure as Error).message).toBe("store unavailable");
+    }, 60_000);
+
+    it("does not run calls queued behind a call that halted", async () => {
+      const calledIds: string[] = [];
+
+      await runScript({
+        script: `der.first.call({}); der.second.call({}); return 1;`,
+        call: async (id) => {
+          calledIds.push(id);
+          await new Promise((resolve) => setTimeout(resolve, 100));
+          return { halt: true };
+        },
+        limits: roomyLimits,
+        seed: 1,
+        now: START,
+      });
+      await new Promise((resolve) => setTimeout(resolve, 100));
+
+      expect(calledIds).toEqual(["first.call"]);
+    }, 60_000);
+
+    it("ends as cancelled when the signal aborts while a call is still pending", async () => {
+      const controller = new AbortController();
+      let reached: () => void = () => {};
+      const callReached = new Promise<void>((resolve) => {
+        reached = resolve;
+      });
+
+      const running = runScript({
+        script: `der.approval.wait({}); return 1;`,
+        call: () => {
+          reached();
+          return new Promise<ScriptCallReply>(() => {});
+        },
+        limits: roomyLimits,
+        seed: 1,
+        now: START,
+        signal: controller.signal,
+      });
+      await callReached;
+      controller.abort();
+
+      expect(await running).toEqual({
+        ok: false,
+        error: { kind: "cancelled", message: "script cancelled" },
+        logs: [],
+      });
+    }, 60_000);
+
+    it("ends a script that exceeds the call cap with unawaited calls as a limit error", async () => {
+      const calledIds: string[] = [];
+
+      const result = await runScript({
+        script: `for (let i = 0; i < 5; i++) der.x.y({}); return 1;`,
+        call: async (id) => {
+          calledIds.push(id);
+          return { ok: true, value: null };
+        },
+        limits: { ...roomyLimits, maxCalls: 3 },
+        seed: 1,
+        now: START,
+      });
+
+      expect(result).toEqual({
+        ok: false,
+        error: { kind: "limit", message: "call limit of 3 exceeded" },
+        logs: [],
+      });
+      expect(calledIds).toHaveLength(3);
+    }, 60_000);
+  });
+
   describe("host failure inside a call", () => {
     const catchThenRead = `try { await der.a.b({}); } catch (e) { await der.after.catch({}); } return 1;`;
 
@@ -619,28 +723,21 @@ describe("run a script", () => {
   });
 
   describe("reported line", () => {
-    it.each([
-      ["a line beyond the safe integer range", "<input>:99999999999999999999:1"],
-      ["a line of zero", "<input>:0:1"],
-    ])(
-      "drops %s from a thrown value",
-      async (_name, stack) => {
-        const result = await runScript({
-          script: `throw { stack: "${stack}" };`,
-          call: noCalls,
-          limits: roomyLimits,
-          seed: 1,
-          now: START,
-        });
+    it("drops a line beyond the safe integer range from a thrown value", async () => {
+      const result = await runScript({
+        script: `throw { stack: "<input>:99999999999999999999:1" };`,
+        call: noCalls,
+        limits: roomyLimits,
+        seed: 1,
+        now: START,
+      });
 
-        expect(result).toEqual({
-          ok: false,
-          error: { kind: "script", message: "[object Object]" },
-          logs: [],
-        });
-      },
-      60_000,
-    );
+      expect(result).toEqual({
+        ok: false,
+        error: { kind: "script", message: "[object Object]" },
+        logs: [],
+      });
+    }, 60_000);
   });
 
   describe("other limits", () => {

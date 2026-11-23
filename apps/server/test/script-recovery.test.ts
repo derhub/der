@@ -582,3 +582,86 @@ describe("keep a write at most once when the store fails around it under Restate
     ).toBe("unknown");
   }, 180_000);
 });
+
+function ledgerCapability(applied: string[], delayMs = 0): Capability {
+  return defineCapability({
+    id: "ledger.post",
+    description: "Post an entry",
+    input: z.object({ text: z.string() }),
+    output: z.object({ posted: z.boolean() }),
+    effect: "write",
+    approval: "none",
+    async execute(input) {
+      await Bun.sleep(delayMs);
+      applied.push(input.text);
+      return { posted: true };
+    },
+  }) as unknown as Capability;
+}
+
+describe("refuse and settle at the edges of a script run under Restate", () => {
+  it("in doubt: a script run in a run whose earlier script run left a write started calls no capability", async () => {
+    const { server, host, owner } = await startOwned("restate-in-doubt");
+    const applied: string[] = [];
+    host.catalog.add(ledgerCapability(applied));
+    const { scriptRun: earlier } = await server.scriptRunStore.acquire({
+      runId: owner.run.id,
+      botId: owner.botId,
+      source: `return 0;`,
+    });
+    await server.store.beginEffect({
+      runId: owner.run.id,
+      operationKind: "capability",
+      operationId: "ledger.post",
+      canonicalArguments: { text: "entry" },
+      attemptId: `${earlier.id}:1`,
+    });
+    await server.scriptRunStore.finish(earlier.id, "failed", {
+      ok: false,
+      error: { kind: "script", message: "store fault" },
+      logs: [],
+    });
+
+    const later = await submitScript(
+      server,
+      owner,
+      `await der.ledger.post({ text: "entry" }); return 1;`,
+    );
+    const result = await server.scriptRuns!.attach(later.id, AbortSignal.timeout(60_000));
+
+    expect(result).toEqual({
+      ok: false,
+      error: {
+        kind: "capability",
+        message: `A previous write in this Run, capability:ledger.post (${earlier.id}:1), has an unknown outcome, so no Script can run in this Run until an operator resolves it.`,
+      },
+      logs: [],
+    });
+    expect(applied).toEqual([]);
+  }, 120_000);
+
+  it("without await: a write issued and not awaited runs and is recorded completed before the result is reported", async () => {
+    const { server, host, owner } = await startOwned("restate-without-await");
+    const applied: string[] = [];
+    host.catalog.add(ledgerCapability(applied, 300));
+    const scriptRun = await submitScript(
+      server,
+      owner,
+      `der.ledger.post({ text: "entry" }); return 1;`,
+    );
+
+    const result = await server.scriptRuns!.attach(scriptRun.id, AbortSignal.timeout(60_000));
+
+    expect(result).toEqual({ ok: true, result: 1, logs: [], truncated: false });
+    expect(applied).toEqual(["entry"]);
+    expect(
+      server.store.getEffect({
+        runId: owner.run.id,
+        operationKind: "capability",
+        operationId: "ledger.post",
+        canonicalArguments: { text: "entry" },
+        attemptId: `${scriptRun.id}:1`,
+      })?.status,
+    ).toBe("completed");
+  }, 120_000);
+});

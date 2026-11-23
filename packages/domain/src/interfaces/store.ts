@@ -128,6 +128,7 @@ export interface ApprovalEffectStore {
   completeEffect(effectId: EffectId, outcome: JsonValue): Promise<EffectRecord>;
   markEffectUnknown(effectId: EffectId): Promise<EffectRecord>;
   getEffect(identity: EffectIdentity): MaybePromise<EffectRecord | undefined>;
+  findWriteInDoubt(runId: RunId): MaybePromise<EffectRecord | undefined>;
 }
 
 export interface OutboxEventFilter {

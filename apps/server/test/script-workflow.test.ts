@@ -346,7 +346,7 @@ describe("run a call whose approval rule fails", () => {
   }, 60_000);
 });
 
-function ledgerCapability(applied: string[]): Capability {
+function ledgerCapability(applied: string[], delayMs = 0): Capability {
   return defineCapability({
     id: "ledger.post",
     description: "Post an entry",
@@ -355,6 +355,7 @@ function ledgerCapability(applied: string[]): Capability {
     effect: "write",
     approval: "none",
     async execute(input) {
+      await Bun.sleep(delayMs);
       applied.push(input.text);
       return { posted: true };
     },
@@ -370,37 +371,6 @@ const RETRY_THE_WRITE = `
 `;
 
 describe("keep a write at most once when the store fails around it", () => {
-  it("store fault: a write whose completion cannot be recorded ends the script run interrupted with the effect unknown", async () => {
-    const { server, host } = await startDirectServer();
-    const applied: string[] = [];
-    host.catalog.add(ledgerCapability(applied));
-    const owner = await admitOwningRun(server, "store-fault-completion");
-    server.store.database.db.run(
-      "CREATE TRIGGER refuse_completion BEFORE UPDATE ON effects WHEN NEW.status = 'completed' BEGIN SELECT RAISE(ABORT, 'disk full'); END",
-    );
-    const scriptRun = await submitScript(server, owner, RETRY_THE_WRITE);
-
-    const result = await server.scriptRuns!.attach(scriptRun.id, AbortSignal.timeout(30_000));
-
-    expect(result).toEqual({
-      ok: false,
-      error: { kind: "capability", message: expect.stringContaining("disk full") },
-      logs: [],
-    });
-    expect(applied).toEqual(["entry"]);
-    expect(server.scriptRunStore.get(scriptRun.id)?.status).toBe("interrupted");
-    expect(server.store.getRun(owner.run.id)?.status).toBe("interrupted");
-    expect(
-      server.store.getEffect({
-        runId: owner.run.id,
-        operationKind: "capability",
-        operationId: "ledger.post",
-        canonicalArguments: { text: "entry" },
-        attemptId: `${scriptRun.id}:1`,
-      })?.status,
-    ).toBe("unknown");
-  }, 60_000);
-
   it("store fault: a store that refuses every effect update never lets the script write twice", async () => {
     const { server, host } = await startDirectServer();
     const applied: string[] = [];
@@ -459,5 +429,197 @@ describe("end a script on a host failure instead of telling the script", () => {
     expect(result).toMatchObject({ ok: false });
     expect(host.reads).toEqual([]);
     expect(applied).toEqual([]);
+  }, 60_000);
+});
+
+describe("refuse to start a script run while a write in the run is in doubt", () => {
+  it("in doubt: a second script run after a store fault calls no capability and says why", async () => {
+    const { server, host } = await startDirectServer();
+    const applied: string[] = [];
+    host.catalog.add(ledgerCapability(applied));
+    const owner = await admitOwningRun(server, "in-doubt-direct");
+    const source = `await der.ledger.post({ text: "entry" }); return 1;`;
+    server.store.database.db.run(
+      "CREATE TRIGGER refuse_updates BEFORE UPDATE ON effects BEGIN SELECT RAISE(ABORT, 'disk full'); END",
+    );
+    const first = await submitScript(server, owner, source);
+    await server.scriptRuns!.attach(first.id, AbortSignal.timeout(30_000));
+    server.store.database.db.run("DROP TRIGGER refuse_updates");
+    await server.scriptRunStore.markDelivered(first.id);
+
+    const second = await submitScript(server, owner, source);
+    const result = await server.scriptRuns!.attach(second.id, AbortSignal.timeout(30_000));
+
+    expect(result).toEqual({
+      ok: false,
+      error: {
+        kind: "capability",
+        message: `A previous write in this Run, capability:ledger.post (${first.id}:1), has an unknown outcome, so no Script can run in this Run until an operator resolves it.`,
+      },
+      logs: [],
+    });
+    expect(applied).toEqual(["entry"]);
+  }, 60_000);
+
+  it("concurrent: a script run starts normally while another script run in the same run has a write started and running", async () => {
+    const { server, host } = await startDirectServer();
+    let release: () => void = () => {};
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const started: string[] = [];
+    host.catalog.add(
+      defineCapability({
+        id: "ledger.post",
+        description: "Post an entry",
+        input: z.object({ text: z.string() }),
+        output: z.object({ posted: z.boolean() }),
+        effect: "write",
+        approval: "none",
+        async execute(input) {
+          started.push(input.text);
+          await gate;
+          return { posted: true };
+        },
+      }) as unknown as Capability,
+    );
+    const owner = await admitOwningRun(server, "concurrent-scripts");
+    const writing = await submitScript(
+      server,
+      owner,
+      `return await der.ledger.post({ text: "entry" });`,
+    );
+    await waitUntil(async () => started.length === 1, {
+      timeoutMs: 10_000,
+      label: "write started",
+    });
+
+    const reading = await submitScript(server, owner, `return await der.notes.read({ key: "a" });`);
+    const readResult = await server.scriptRuns!.attach(reading.id, AbortSignal.timeout(30_000));
+    release();
+    const writeResult = await server.scriptRuns!.attach(writing.id, AbortSignal.timeout(30_000));
+
+    expect(readResult).toEqual({
+      ok: true,
+      result: { value: "value-a" },
+      logs: [],
+      truncated: false,
+    });
+    expect(writeResult).toEqual({
+      ok: true,
+      result: { posted: true },
+      logs: [],
+      truncated: false,
+    });
+  }, 60_000);
+});
+
+describe("settle a script run only after every call it issued", () => {
+  it("without await: a write issued and not awaited is recorded completed before the result is reported", async () => {
+    const { server, host } = await startDirectServer();
+    const applied: string[] = [];
+    host.catalog.add(ledgerCapability(applied, 300));
+    const owner = await admitOwningRun(server, "without-await-ok");
+    const scriptRun = await submitScript(
+      server,
+      owner,
+      `der.ledger.post({ text: "entry" }); return 1;`,
+    );
+
+    const result = await server.scriptRuns!.attach(scriptRun.id, AbortSignal.timeout(30_000));
+
+    expect(result).toEqual({ ok: true, result: 1, logs: [], truncated: false });
+    expect(applied).toEqual(["entry"]);
+    expect(
+      server.store.getEffect({
+        runId: owner.run.id,
+        operationKind: "capability",
+        operationId: "ledger.post",
+        canonicalArguments: { text: "entry" },
+        attemptId: `${scriptRun.id}:1`,
+      })?.status,
+    ).toBe("completed");
+  }, 60_000);
+
+  it("without await: a write that cannot be recorded after the script returned ends the script run interrupted", async () => {
+    const { server, host } = await startDirectServer();
+    const applied: string[] = [];
+    host.catalog.add(ledgerCapability(applied, 300));
+    const owner = await admitOwningRun(server, "without-await-fault");
+    server.store.database.db.run(
+      "CREATE TRIGGER refuse_completion BEFORE UPDATE ON effects WHEN NEW.status = 'completed' BEGIN SELECT RAISE(ABORT, 'disk full'); END",
+    );
+    const scriptRun = await submitScript(
+      server,
+      owner,
+      `der.ledger.post({ text: "entry" }); return 1;`,
+    );
+
+    const result = await server.scriptRuns!.attach(scriptRun.id, AbortSignal.timeout(30_000));
+
+    expect(result).toMatchObject({ ok: false, error: { kind: "capability" } });
+    expect(applied).toEqual(["entry"]);
+    expect(server.scriptRunStore.get(scriptRun.id)?.status).toBe("interrupted");
+    expect(server.store.getRun(owner.run.id)?.status).toBe("interrupted");
+  }, 60_000);
+
+  it("without await: an unawaited write parked on an approval holds the script run until it is decided", async () => {
+    const { server, host } = await startDirectServer();
+    const owner = await admitOwningRun(server, "without-await-approval");
+    const scriptRun = await submitScript(
+      server,
+      owner,
+      `der.notes.publish({ text: "release" }); return 1;`,
+    );
+    const approval = await awaitPendingApproval(server, owner.run.id);
+    const attaching = server.scriptRuns!.attach(scriptRun.id, AbortSignal.timeout(30_000));
+    await Bun.sleep(300);
+
+    expect(server.scriptRunStore.get(scriptRun.id)?.status).toBe("waiting_approval");
+    await server.coordinator.decide(decision(approval, owner, "approved"));
+
+    expect(await attaching).toEqual({ ok: true, result: 1, logs: [], truncated: false });
+    expect(host.published).toEqual(["release"]);
+  }, 60_000);
+
+  it("without await: cancelling a script run whose unawaited write waits on an approval ends it cancelled", async () => {
+    const { server, host } = await startDirectServer();
+    const owner = await admitOwningRun(server, "without-await-cancel");
+    const scriptRun = await submitScript(
+      server,
+      owner,
+      `der.notes.publish({ text: "release" }); return 1;`,
+    );
+    await awaitPendingApproval(server, owner.run.id);
+
+    await server.scriptRuns!.cancel(scriptRun.id);
+    const result = await server.scriptRuns!.attach(scriptRun.id, AbortSignal.timeout(30_000));
+
+    expect(result).toEqual({
+      ok: false,
+      error: { kind: "cancelled", message: "script cancelled" },
+      logs: [],
+    });
+    expect(host.published).toEqual([]);
+  }, 60_000);
+});
+
+describe("report a result the store cannot hold", () => {
+  it("deep: a result nested 7000 levels ends as a script error naming an unstorable result", async () => {
+    const { server } = await startDirectServer();
+    const owner = await admitOwningRun(server, "deep-result");
+    const scriptRun = await submitScript(
+      server,
+      owner,
+      `let nested = []; for (let i = 0; i < 7000; i++) nested = [nested]; return nested;`,
+    );
+
+    const result = await server.scriptRuns!.attach(scriptRun.id, AbortSignal.timeout(30_000));
+
+    expect(result).toEqual({
+      ok: false,
+      error: { kind: "script", message: "script produced a result the host cannot store" },
+      logs: [],
+    });
   }, 60_000);
 });

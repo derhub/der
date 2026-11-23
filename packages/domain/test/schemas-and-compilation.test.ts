@@ -430,6 +430,7 @@ describe("keep Memory schema and capability entry points distinct", () => {
         updatedAt: fixtures.utc,
       }),
       getEffect: () => undefined,
+      findWriteInDoubt: () => undefined,
     };
     const outboxStore: OutboxStore = {
       listOutboxEvents: () => [outboxEventFixture],

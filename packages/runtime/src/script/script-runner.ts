@@ -136,6 +136,7 @@ export async function runScript(options: RunScriptOptions): Promise<ScriptResult
   let callsInFlight = 0;
   let lastHeardAt = performance.now();
   let callQueue: Promise<void> = Promise.resolve();
+  let returned = false;
   const hostFailures = new Map<
     number,
     { kind: ScriptHostErrorKind; message: string; call: string }
@@ -149,6 +150,17 @@ export async function runScript(options: RunScriptOptions): Promise<ScriptResult
     Atomics.store(new Int32Array(stop), 0, STOP_REQUESTED);
     worker.terminate();
     resolveVerdict();
+  };
+  const settleReturned = (result: ScriptResult): void => {
+    if (callsInFlight === 0) {
+      finish(result);
+      return;
+    }
+    returned = true;
+    Atomics.store(new Int32Array(stop), 0, STOP_REQUESTED);
+    worker.terminate();
+    const settle = (): void => finish(result);
+    callQueue = callQueue.then(settle, settle);
   };
   const fail = (kind: ScriptErrorKind, message: string): void => {
     finish({ ok: false, error: { kind, message }, logs });
@@ -209,7 +221,9 @@ export async function runScript(options: RunScriptOptions): Promise<ScriptResult
       });
     }
     lastHeardAt = performance.now();
-    worker.postMessage(wire);
+    if (!returned) {
+      worker.postMessage(wire);
+    }
   };
 
   const handleMessage = (message: ScriptWorkerMessage): void => {
@@ -257,14 +271,19 @@ export async function runScript(options: RunScriptOptions): Promise<ScriptResult
     } else if (message.limit === "time") {
       fail("limit", `active time limit of ${limits.activeMs} ms exceeded`);
     } else if (message.error !== undefined) {
-      finish({ ok: false, error: describeFailure(message.error), logs });
+      settleReturned({ ok: false, error: describeFailure(message.error), logs });
     } else {
-      finish({ ok: true, result: (message.result ?? null) as JsonValue, logs, truncated: false });
+      settleReturned({
+        ok: true,
+        result: (message.result ?? null) as JsonValue,
+        logs,
+        truncated: false,
+      });
     }
   };
 
   worker.onmessage = (event: MessageEvent<string>) => {
-    if (outcome.verdict !== undefined) {
+    if (outcome.verdict !== undefined || returned) {
       return;
     }
     lastHeardAt = performance.now();
@@ -280,6 +299,9 @@ export async function runScript(options: RunScriptOptions): Promise<ScriptResult
     fail("script", event.message);
   };
   worker.addEventListener("close", () => {
+    if (returned) {
+      return;
+    }
     fail("script", "script ended without a result");
   });
 

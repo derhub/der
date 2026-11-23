@@ -42,6 +42,7 @@ interface ScriptStart {
   readonly run: Run | null;
   readonly seed: number;
   readonly now: number;
+  readonly writeInDoubt: string | null;
 }
 
 type CallStepResult =
@@ -54,6 +55,7 @@ interface Halt {
   readonly call: string;
 }
 
+const MAX_RESULT_DEPTH = 256;
 const HALT_SCRIPT: ScriptCallHalt = { halt: true };
 const PROMPT_INPUT_CHARS = 400;
 const INPUT_DIGEST_CHARS = 8;
@@ -123,7 +125,12 @@ export async function executeScriptRun(
       });
     }
     const run = (await deps.store.getRun(scriptRun.runId)) ?? null;
+    const doubtful = await deps.store.findWriteInDoubt(scriptRun.runId);
     return {
+      writeInDoubt:
+        doubtful === undefined
+          ? null
+          : `capability:${doubtful.identity.operationId} (${doubtful.identity.attemptId})`,
       terminal: isTerminalScriptRunStatus(scriptRun.status) ? scriptRun.result : null,
       source: scriptRun.source,
       run,
@@ -140,6 +147,15 @@ export async function executeScriptRun(
   const run: Run = start.run;
   if (run.status === "interrupted" || run.status === "failed" || run.status === "cancelled") {
     return finish(failure("capability", `owning Run ${run.id} has ended as ${run.status}`));
+  }
+
+  if (start.writeInDoubt !== null) {
+    return finish(
+      failure(
+        "capability",
+        `A previous write in this Run, ${start.writeInDoubt}, has an unknown outcome, so no Script can run in this Run until an operator resolves it.`,
+      ),
+    );
   }
 
   const descriptors = new Map<string, CapabilityDescriptor>(
@@ -355,7 +371,7 @@ export async function executeScriptRun(
     return undefined;
   }
   if (hostFailure !== undefined) {
-    await recordInDoubtWrite(hostFailure.effect);
+    interrupted = await resolveInDoubtWrite(hostFailure.effect, errorMessage(hostFailure.error));
     if (interrupted === undefined) {
       throw hostFailure.error;
     }
@@ -363,17 +379,24 @@ export async function executeScriptRun(
 
   return finish(await settle(result));
 
-  async function recordInDoubtWrite(effect: EffectIdentity | undefined): Promise<void> {
-    const recorded = effect === undefined ? undefined : await deps.store.getEffect(effect);
-    if (
-      recorded !== undefined &&
-      (recorded.status === "started" || recorded.status === "unknown")
-    ) {
-      interrupted = {
+  async function resolveInDoubtWrite(
+    effect: EffectIdentity | undefined,
+    cause: string,
+  ): Promise<{ readonly effectId: EffectId; readonly detail: string } | undefined> {
+    const doubt = await driver.runStep("script-resolve-doubt", async () => {
+      const recorded = effect === undefined ? undefined : await deps.store.getEffect(effect);
+      if (
+        recorded === undefined ||
+        (recorded.status !== "started" && recorded.status !== "unknown")
+      ) {
+        return null;
+      }
+      return {
         effectId: recorded.id,
-        detail: `Effect capability:${recorded.identity.operationId} (${recorded.identity.attemptId}) could not be recorded after the host failed: ${errorMessage(hostFailure?.error)}`,
+        detail: `Effect capability:${recorded.identity.operationId} (${recorded.identity.attemptId}) could not be recorded after the host failed: ${cause}`,
       };
-    }
+    });
+    return doubt ?? undefined;
   }
 
   async function settle(scripted: ScriptResult): Promise<ExecuteResult> {
@@ -399,7 +422,7 @@ export async function executeScriptRun(
   }
 
   async function finish(computed: ExecuteResult): Promise<ExecuteResult> {
-    const outcome = executeResult.safeParse(computed).success
+    const outcome = isStorable(computed)
       ? computed
       : failure("script", "script produced a result the host cannot store");
     const settled = await bounded.runStep("script-finish", async () => {
@@ -411,6 +434,32 @@ export async function executeScriptRun(
       return row.result ?? outcome;
     });
     return settled;
+  }
+}
+
+function nestingDepth(value: unknown): number {
+  let deepest = 0;
+  const pending: Array<readonly [unknown, number]> = [[value, 0]];
+  for (let next = pending.pop(); next !== undefined; next = pending.pop()) {
+    const [node, depth] = next;
+    if (typeof node === "object" && node !== null) {
+      deepest = Math.max(deepest, depth + 1);
+      for (const child of Object.values(node)) {
+        pending.push([child, depth + 1]);
+      }
+    }
+  }
+  return deepest;
+}
+
+function isStorable(result: ExecuteResult): boolean {
+  if (nestingDepth(result) > MAX_RESULT_DEPTH) {
+    return false;
+  }
+  try {
+    return executeResult.safeParse(result).success;
+  } catch {
+    return false;
   }
 }
 

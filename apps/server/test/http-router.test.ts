@@ -193,6 +193,7 @@ function createMinimalDeps(overrides: Partial<HttpRouterDeps> = {}): HttpRouterD
       throw new Error("not used");
     },
     getEffect: () => undefined,
+    findWriteInDoubt: () => undefined,
   };
 
   const memoryRecord: MemoryRecord = {

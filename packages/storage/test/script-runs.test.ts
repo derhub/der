@@ -181,3 +181,94 @@ describe("pending approvals of a script run", () => {
     ]);
   });
 });
+
+describe("find a write in doubt", () => {
+  const identity = (runId: string, attemptId: string) =>
+    ({
+      runId,
+      operationKind: "capability",
+      operationId: "ledger.post",
+      canonicalArguments: { text: "entry" },
+      attemptId,
+    }) as const;
+
+  it("finds an unknown effect of the run", async () => {
+    const { store, run } = await openFixture();
+    const begun = await store.beginEffect(identity(run.id, "att-1"));
+    await store.markEffectUnknown(begun.effect.id);
+
+    const found = store.findWriteInDoubt(run.id);
+
+    expect(found?.id).toBe(begun.effect.id);
+    expect(found?.status).toBe("unknown");
+  });
+
+  it.each(["completed", "failed", "cancelled", "interrupted"] as const)(
+    "finds a started effect whose script run ended %s",
+    async (status) => {
+      const { store, scriptRuns, run, bot } = await openFixture();
+      const { scriptRun } = await scriptRuns.acquire({
+        runId: run.id,
+        botId: bot.id,
+        source: "return 1",
+      });
+      const begun = await store.beginEffect(identity(run.id, `${scriptRun.id}:1`));
+      await scriptRuns.finish(scriptRun.id, status, done);
+
+      expect(store.findWriteInDoubt(run.id)?.id).toBe(begun.effect.id);
+    },
+  );
+
+  it.each(["running", "waiting_approval"] as const)(
+    "ignores a started effect whose script run is %s",
+    async (status) => {
+      const { store, scriptRuns, run, bot } = await openFixture();
+      const { scriptRun } = await scriptRuns.acquire({
+        runId: run.id,
+        botId: bot.id,
+        source: "return 1",
+      });
+      await scriptRuns.setStatus(scriptRun.id, status);
+      await store.beginEffect(identity(run.id, `${scriptRun.id}:1`));
+
+      expect(store.findWriteInDoubt(run.id)).toBeUndefined();
+    },
+  );
+
+  it("ignores a started effect that belongs to no script run", async () => {
+    const { store, run } = await openFixture();
+    await store.beginEffect(identity(run.id, "att-engine"));
+
+    expect(store.findWriteInDoubt(run.id)).toBeUndefined();
+  });
+
+  it("ignores a completed effect of a finished script run", async () => {
+    const { store, scriptRuns, run, bot } = await openFixture();
+    const { scriptRun } = await scriptRuns.acquire({
+      runId: run.id,
+      botId: bot.id,
+      source: "return 1",
+    });
+    const begun = await store.beginEffect(identity(run.id, `${scriptRun.id}:1`));
+    await store.completeEffect(begun.effect.id, { ok: true, value: null });
+    await scriptRuns.finish(scriptRun.id, "completed", done);
+
+    expect(store.findWriteInDoubt(run.id)).toBeUndefined();
+  });
+
+  it("ignores an unknown effect of another run", async () => {
+    const { store, run, bot } = await openFixture();
+    const otherSession = store.createSession({ id: "sess-2", botId: bot.id, title: "Other" });
+    const other = await store.admit({
+      botId: bot.id,
+      sessionId: otherSession.id,
+      origin: "web",
+      idempotencyKey: "req-2",
+      input: { parts: [{ type: "text", text: "again" }] },
+    });
+    const begun = await store.beginEffect(identity(other.run.id, "att-1"));
+    await store.markEffectUnknown(begun.effect.id);
+
+    expect(store.findWriteInDoubt(run.id)).toBeUndefined();
+  });
+});
