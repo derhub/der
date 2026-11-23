@@ -31,18 +31,25 @@ import {
 } from "@der/domain";
 import { createMcpIntegration } from "@der/mcp";
 import {
+  baseHashWithModel,
   buildRunContext,
+  composeResumeText,
   createSkillCatalog,
+  planTurn,
   type RunContextCaps,
   type SkillCatalog,
 } from "@der/runtime/context";
 import {
+  antigravityResume,
+  claudeCodeResume,
+  codexResume,
   createAntigravityEngine,
   createClaudeCodeEngine,
   createCodexEngine,
   DEFAULT_TERMS_COVERAGE,
   diagnoseEngine,
   type EngineAuthProbeResult,
+  type EngineResumeTraits,
   type LoadEngineRunInput,
 } from "@der/runtime/engines";
 import {
@@ -90,6 +97,7 @@ import {
   type RoutineScheduleClient,
   type RunCoordinator,
   type ScriptRoutineDeps,
+  type TurnRecord,
 } from "./workflows/index";
 import { createHostCapabilities } from "./capabilities/index";
 import { createFixtureCapabilities } from "./capabilities/fixture";
@@ -358,6 +366,97 @@ function createShadowHomeAuthProbe(
   };
 }
 
+const NEWEST_MESSAGE_WINDOW = 200;
+
+const ENGINE_RESUME_TRAITS: Partial<Record<EngineKind, EngineResumeTraits>> = {
+  "claude-code": claudeCodeResume,
+  codex: codexResume,
+  antigravity: antigravityResume,
+};
+
+function modelOf(engine: EngineKind, models: ServerConfig["engineModels"]): string {
+  switch (engine) {
+    case "claude-code":
+      return models.claudeCode;
+    case "codex":
+      return models.codex;
+    case "antigravity":
+      return models.antigravity;
+    case "fixture":
+      return "fixture";
+  }
+}
+
+/**
+ * Decides resume or rebuild for a Run, records the decision for the engine step, and marks the
+ * stored vendor session pending. The mark happens inside the engine step, after the plan has read
+ * the row: a re-executed step finds its own Run id pending and rebuilds.
+ */
+function planRunTurn(
+  input: {
+    readonly store: SqliteStore;
+    readonly engineModels: ServerConfig["engineModels"];
+    readonly turns: Map<RunId, TurnRecord>;
+  },
+  run: Run,
+  built: Awaited<ReturnType<typeof buildRunContext>>,
+  messages: readonly Message[],
+): {
+  readonly messages?: Array<{ role: "user"; content: string }>;
+  readonly resumeSessionId?: string;
+} {
+  const engine = run.engine === "script" ? undefined : run.engine;
+  const resumable = engine !== undefined && ENGINE_RESUME_TRAITS[engine]?.resumable === true;
+  const baseHash = baseHashWithModel(
+    built.baseHash,
+    engine === undefined ? "" : modelOf(engine, input.engineModels),
+  );
+  const stored = resumable ? input.store.getEngineSession(run.sessionId, engine) : null;
+  // The loaded window is the newest 200 messages; it holds every message after `lastOrdinal`
+  // unless 200 or more arrived since.
+  const windowIsComplete =
+    stored === null ||
+    messages.length < NEWEST_MESSAGE_WINDOW ||
+    (messages[0]?.ordinal ?? 0) <= stored.lastOrdinal + 1;
+  const messagesAfterLastOrdinal =
+    stored !== null && windowIsComplete
+      ? messages.filter((message) => message.ordinal > stored.lastOrdinal)
+      : [];
+
+  const plan = planTurn({
+    engineResumable: resumable,
+    stored,
+    runId: run.id,
+    baseHash,
+    contextHash: built.contextHash,
+    contextBlock: built.contextBlock,
+    messagesAfterLastOrdinal,
+  });
+
+  if (engine !== undefined) {
+    input.turns.set(run.id, {
+      contextMode: plan.mode === "resume" ? "resumed" : "rebuilt",
+      ...(plan.mode === "resume" ? { resumedFrom: plan.vendorSessionId } : {}),
+      saveable: resumable,
+      baseHash,
+      contextHash: built.contextHash,
+      lastOrdinal: messages.at(-1)?.ordinal ?? 0,
+    });
+  }
+  if (resumable) {
+    input.store.markEngineSessionPending(run.sessionId, engine, run.id);
+  }
+
+  return plan.mode === "resume"
+    ? {
+        messages: [
+          { role: "user", content: composeResumeText(plan.contextNote, messagesAfterLastOrdinal) },
+        ],
+        resumeSessionId: plan.vendorSessionId,
+      }
+    : {};
+}
+
 function createContextLoader(input: {
   readonly store: SqliteStore;
   readonly memory: SqliteMemory;
@@ -365,6 +464,8 @@ function createContextLoader(input: {
   readonly coordinator: RunCoordinator;
   readonly maxTokens: number;
   readonly caps: RunContextCaps;
+  readonly engineModels: ServerConfig["engineModels"];
+  readonly turns: Map<RunId, TurnRecord>;
   readonly codeMode: {
     readonly catalog: Catalog;
     readonly scriptRunStore: SqliteScriptRuns;
@@ -374,7 +475,10 @@ function createContextLoader(input: {
 }): LoadEngineRunInput {
   return async (run: Run) => {
     const bot = input.store.getBot(run.botId);
-    const messages = input.store.listMessages(run.sessionId, { limit: 200, newest: true });
+    const messages = input.store.listMessages(run.sessionId, {
+      limit: NEWEST_MESSAGE_WINDOW,
+      newest: true,
+    });
     const [memoryRecord, skillList] = await Promise.all([
       input.memory.read(run.botId),
       input.skills.listSkills(),
@@ -394,10 +498,11 @@ function createContextLoader(input: {
     });
 
     const approvalBroker = input.coordinator.createApprovalBroker(run);
+    const turn = planRunTurn(input, run, built, messages);
 
     const codeMode = input.codeMode;
     return {
-      messages: [...built.messages],
+      messages: turn.messages ?? [...built.messages],
       systemPrompts: [...built.systemPrompts],
       tools: [
         createSearchTool({ catalog: codeMode.catalog, maxResultBytes: codeMode.maxResultBytes }),
@@ -409,6 +514,9 @@ function createContextLoader(input: {
         }),
       ],
       approvalBroker,
+      ...(turn.resumeSessionId !== undefined
+        ? { resumeSessionId: turn.resumeSessionId, requireResume: true }
+        : {}),
     };
   };
 }
@@ -699,11 +807,14 @@ export async function startServer(options: CreateServerOptions = {}): Promise<Ru
       now: clockNow,
     });
 
+    const turns = new Map<RunId, TurnRecord>();
+
     if (config.restateMode === "direct") {
       const directDriver = createDirectWorkflowDriver({ now: clockNow });
       coordinator = createRunCoordinator({
         store,
         engines,
+        turns,
         driver: directDriver,
         approvalTimeoutMs: config.approvalTimeoutMs,
         now: clockNow,
@@ -744,6 +855,7 @@ export async function startServer(options: CreateServerOptions = {}): Promise<Ru
       coordinator = createRunCoordinator({
         store,
         engines,
+        turns,
         driver: restateDriver,
         approvalTimeoutMs: config.approvalTimeoutMs,
         now: clockNow,
@@ -788,6 +900,8 @@ export async function startServer(options: CreateServerOptions = {}): Promise<Ru
       skills,
       coordinator,
       maxTokens: config.contextMaxTokens,
+      engineModels: config.engineModels,
+      turns,
       caps: {
         memoryMaxBytes: config.memoryPromptMaxBytes,
         skillCatalogMaxBytes: config.skillCatalogMaxBytes,
