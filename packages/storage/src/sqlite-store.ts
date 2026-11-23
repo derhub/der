@@ -20,6 +20,7 @@ import {
   type EffectRecord,
   type JsonValue,
   type Message,
+  type MessagePage,
   type OutboxDeliveryState,
   type OutboxDestination,
   type OutboxEvent,
@@ -376,19 +377,22 @@ export class SqliteStore
     return row ? mapRoutineRow(row) : undefined;
   }
 
-  listMessages(
-    sessionId: SessionId,
-    options?: { readonly limit?: number; readonly afterOrdinal?: number },
-  ): Message[] {
+  listMessages(sessionId: SessionId, options?: MessagePage): Message[] {
     const limit = options?.limit ?? 100;
     const afterOrdinal = options?.afterOrdinal ?? 0;
-    const rows = this.database.db
-      .query<MessageRow, [string, number, number]>(
-        `SELECT * FROM messages
+    const sql = options?.newest
+      ? `SELECT * FROM (
+           SELECT * FROM messages
+           WHERE session_id = ? AND ordinal > ?
+           ORDER BY ordinal DESC
+           LIMIT ?
+         ) ORDER BY ordinal ASC`
+      : `SELECT * FROM messages
          WHERE session_id = ? AND ordinal > ?
          ORDER BY ordinal ASC
-         LIMIT ?`,
-      )
+         LIMIT ?`;
+    const rows = this.database.db
+      .query<MessageRow, [string, number, number]>(sql)
       .all(sessionId, afterOrdinal, limit);
     return rows.map(mapMessageRow);
   }

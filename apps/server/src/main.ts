@@ -368,7 +368,7 @@ function createContextLoader(input: {
 }): LoadEngineRunInput {
   return async (run: Run) => {
     const bot = input.store.getBot(run.botId);
-    const messages = input.store.listMessages(run.sessionId, { limit: 200 });
+    const messages = input.store.listMessages(run.sessionId, { limit: 200, newest: true });
     const [memoryRecord, skillList] = await Promise.all([
       input.memory.read(run.botId),
       input.skills.listSkills(),
