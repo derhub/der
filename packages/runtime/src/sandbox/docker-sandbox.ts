@@ -1,5 +1,6 @@
 import type { Sandbox, SandboxRequest, SandboxResult } from "@der/domain";
 import { compiledParsers } from "@der/domain/compiled";
+import { constants as osConstants } from "node:os";
 import {
   createExecBackedGit,
   UnsupportedCapabilityError,
@@ -74,6 +75,29 @@ function sanitizeContainerSegment(raw: string): string {
   return cleaned.length > 0 ? cleaned.slice(0, 48) : crypto.randomUUID().slice(0, 12);
 }
 
+const SPAWN_MARKER_ENV = "DER_SPAWN_ID";
+
+const SIGNAL_SPAWNED_SCRIPT = [
+  `marker="${SPAWN_MARKER_ENV}=$1"`,
+  "scan() { for d in /proc/[0-9]*; do",
+  `  tr '\\0' '\\n' < "$d/environ" 2>/dev/null | grep -qxF "$marker" && echo "\${d#/proc/}"`,
+  "done; }",
+  "pids=$(scan)",
+  '[ -z "$pids" ] && exit 0',
+  'kill -"$2" $pids 2>/dev/null',
+  "i=0",
+  "while [ $i -lt 20 ]; do",
+  '  [ -z "$(scan)" ] && exit 0',
+  "  sleep 0.1",
+  "  i=$((i + 1))",
+  "done",
+  "exit 1",
+].join("\n");
+
+function signalNumber(signal: NodeJS.Signals | number): number {
+  return typeof signal === "number" ? signal : osConstants.signals[signal];
+}
+
 function checkAborted(signal?: AbortSignal): void {
   if (signal?.aborted) {
     throw new Error("Sandbox operation aborted.");
@@ -126,18 +150,71 @@ function createDockerHandle(input: {
 
     async spawn(command: string, options?: ProcessOptions): Promise<SpawnHandle> {
       checkAborted(options?.signal);
-      const args = [...buildExecPrefix(options, true), "sh", "-lc", command];
+      const spawnId = crypto.randomUUID();
+      const args = [
+        ...buildExecPrefix(
+          { ...options, env: { ...options?.env, [SPAWN_MARKER_ENV]: spawnId } },
+          true,
+        ),
+        "sh",
+        "-lc",
+        command,
+      ];
       const handle = await input.runner.spawn(input.dockerBinary, args, {
         env: hostEnv,
         ...(options?.signal !== undefined ? { signal: options.signal } : {}),
       });
+
+      const signalInContainer = async (signal: NodeJS.Signals | number): Promise<void> => {
+        const result = await input.runner.exec(
+          input.dockerBinary,
+          [
+            "exec",
+            input.containerId,
+            "sh",
+            "-c",
+            SIGNAL_SPAWNED_SCRIPT,
+            "der-signal",
+            spawnId,
+            String(signalNumber(signal)),
+          ],
+          { env: hostEnv, timeoutMs: 10_000 },
+        );
+        if (result.exitCode !== 0) {
+          throw new SandboxControlError(
+            "docker.exec_failed",
+            `Spawned process "${command}" survived signal ${String(signal)} in container ${input.containerId} (exit ${result.exitCode}): ${result.stderr.trim()}`,
+          );
+        }
+      };
+
+      let abortKill: Promise<void> | undefined;
+      options?.signal?.addEventListener(
+        "abort",
+        () => {
+          abortKill = signalInContainer("SIGKILL");
+          abortKill.catch(() => {});
+        },
+        { once: true },
+      );
+
       return {
         pid: handle.pid,
         stdout: handle.stdout,
         stderr: handle.stderr,
         stdin: handle.stdin,
-        wait: handle.wait,
-        kill: handle.kill,
+        async wait() {
+          const exitCode = await handle.wait();
+          await abortKill;
+          return exitCode;
+        },
+        async kill(signal?: NodeJS.Signals | number) {
+          try {
+            await signalInContainer(signal ?? "SIGTERM");
+          } finally {
+            await handle.kill(signal);
+          }
+        },
       };
     },
   };
