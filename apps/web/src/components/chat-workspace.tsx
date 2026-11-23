@@ -330,6 +330,7 @@ export interface ChatWorkspaceProps {
 }
 
 const USAGE_RETRY_DELAY_MS = 1_000;
+const USAGE_RETRY_LIMIT = 3;
 
 function isTerminalRunStatus(status: Run["status"]): boolean {
   return (
@@ -615,6 +616,7 @@ export function ChatWorkspace({
   const resumeAbortRef = useRef<AbortController | null>(null);
   const setChatMessagesRef = useRef<((msgs: ReadonlyArray<UIMessage>) => void) | null>(null);
   const usageRetryRef = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
+  const usageWatchRunRef = useRef<string | undefined>(undefined);
 
   const refreshHistory = useCallback(async () => {
     setHistoryLoading(true);
@@ -707,20 +709,28 @@ export function ChatWorkspace({
     (runId: string) => {
       void refreshRunState(runId);
       void refreshHistory();
-      void refreshSessionRuns().then((runs) => {
-        // The stream can close before the finish step saves usage; look once more after a delay.
-        const watched = runs?.find((sessionRun) => sessionRun.id === runId);
-        if (
-          watched !== undefined &&
-          isTerminalRunStatus(watched.status) &&
-          watched.usage === null
-        ) {
-          clearTimeout(usageRetryRef.current);
-          usageRetryRef.current = setTimeout(() => {
-            void refreshSessionRuns();
-          }, USAGE_RETRY_DELAY_MS);
-        }
-      });
+      // The stream can close before the finish step commits status and usage; look again a
+      // bounded number of times.
+      usageWatchRunRef.current = runId;
+      clearTimeout(usageRetryRef.current);
+      const watchUsage = (retriesLeft: number) => {
+        void refreshSessionRuns().then((runs) => {
+          const watched = runs?.find((sessionRun) => sessionRun.id === runId);
+          if (
+            usageWatchRunRef.current !== runId ||
+            watched === undefined ||
+            retriesLeft === 0 ||
+            (isTerminalRunStatus(watched.status) && watched.usage !== null)
+          ) {
+            return;
+          }
+          usageRetryRef.current = setTimeout(
+            () => watchUsage(retriesLeft - 1),
+            USAGE_RETRY_DELAY_MS,
+          );
+        });
+      };
+      watchUsage(USAGE_RETRY_LIMIT);
     },
     [refreshHistory, refreshRunState, refreshSessionRuns],
   );
@@ -775,6 +785,7 @@ export function ChatWorkspace({
     }
     return () => {
       resumeAbortRef.current?.abort();
+      usageWatchRunRef.current = undefined;
       clearTimeout(usageRetryRef.current);
     };
   }, [refreshHistory, refreshRunState, refreshSessionRuns, session.id]);

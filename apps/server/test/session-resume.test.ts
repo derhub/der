@@ -4,6 +4,8 @@ import { join } from "node:path";
 import type { CoordinatorDriver } from "#workflows/coordinator";
 import type { Run, RunEvent } from "@der/domain";
 import type { CommandRunner, CommandSpawnHandle } from "@der/runtime/sandbox";
+import { SqliteStore, type FinishRunInput, type FinishRunOutcome } from "@der/storage";
+import { MEMORY_ROUTINE_SLOTS_MIGRATION } from "@der/storage/memory";
 import { startServer, type RunningServer } from "#main";
 import { createTempDatabase, waitUntil } from "./fixtures/restate-harness";
 
@@ -175,14 +177,30 @@ function createFakeClaude(
 
 type FakeClaude = ReturnType<typeof createFakeClaude>;
 
+/** Runs `afterFinish` once, when the next finish transaction has committed. */
+class FinishHookStore extends SqliteStore {
+  afterFinish: (() => Promise<void>) | undefined;
+
+  override async finishRun(input: FinishRunInput): Promise<FinishRunOutcome> {
+    const finished = await super.finishRun(input);
+    const hook = this.afterFinish;
+    this.afterFinish = undefined;
+    await hook?.();
+    return finished;
+  }
+}
+
 async function startResumeServer(
   cli: FakeClaude,
   bot: { persona: string } = { persona: "Terse." },
+  openStore?: (dbPath: string) => SqliteStore,
 ): Promise<{ server: RunningServer; botId: string; sessionId: string }> {
   const tempDb = createTempDatabase("der-session-resume-");
   const workspaceDir = join(tempDb.dir, "workspaces");
   mkdirSync(workspaceDir, { recursive: true });
+  const store = openStore?.(tempDb.dbPath);
   const server = await startServer({
+    ...(store !== undefined ? { store } : {}),
     config: {
       host: "127.0.0.1",
       port: 0,
@@ -200,6 +218,7 @@ async function startResumeServer(
   });
   cleanups.push(async () => {
     await server.close();
+    store?.close();
     tempDb.cleanup();
   });
   const created = server.store.createBot({
@@ -455,6 +474,16 @@ describe("rebuild the context", () => {
     });
   }
 
+  function textDeltasAndAttemptResets(events: readonly RunEvent[]): string[] {
+    return events.flatMap((event) => {
+      const chunk = event.chunk as Record<string, unknown>;
+      if (chunk["type"] === "CUSTOM" && chunk["name"] === "der.attempt-reset") {
+        return ["<attempt-reset>"];
+      }
+      return chunk["type"] === "TEXT_MESSAGE_CONTENT" ? [String(chunk["delta"])] : [];
+    });
+  }
+
   it("finishes with the first answer and usage when a replayed engine step finds a persisted finish", async () => {
     const cli = createFakeClaude({
       onCall: (index) =>
@@ -487,6 +516,7 @@ describe("rebuild the context", () => {
     expect([
       cli.calls.map((call) => resumeTarget(call)),
       done.status,
+      done.contextMode,
       done.usage?.inputTokens,
       done.usage?.outputTokens,
       assistantTexts(ctx),
@@ -494,6 +524,7 @@ describe("rebuild the context", () => {
     ]).toEqual([
       [undefined, "vendor-1"],
       "completed",
+      "resumed",
       11,
       22,
       ["answer 1", "first attempt"],
@@ -537,7 +568,7 @@ describe("rebuild the context", () => {
       ctx.server.store.getEngineSession(ctx.sessionId, "claude-code")?.vendorSessionId,
       assistantTexts(ctx),
       textDeltas(rebuiltAttempt),
-      textDeltas(events),
+      textDeltasAndAttemptResets(events),
     ]).toEqual([
       [undefined, "vendor-1", undefined],
       true,
@@ -546,7 +577,98 @@ describe("rebuild the context", () => {
       "vendor-2",
       ["answer 1", "answer 3"],
       ["answer 3"],
-      ["PARTIAL", "answer 3"],
+      ["PARTIAL", "<attempt-reset>", "answer 3"],
     ]);
+  }, 60_000);
+
+  it("rebuilds a replayed Run that was admitted the moment the Run before it finished", async () => {
+    const cli = createFakeClaude({
+      onCall: (index) =>
+        index === 2
+          ? {
+              lines: [
+                initLine("vendor-1"),
+                JSON.stringify({
+                  type: "assistant",
+                  parent_tool_use_id: null,
+                  message: { id: "msg-partial", content: [{ type: "text", text: "PARTIAL" }] },
+                }),
+              ],
+              stderr: "boom",
+              exitCode: 1,
+            }
+          : undefined,
+    });
+    let hookStore: FinishHookStore | undefined;
+    const ctx = await startResumeServer(cli, undefined, (dbPath) => {
+      hookStore = new FinishHookStore({
+        filename: dbPath,
+        extraMigrations: [MEMORY_ROUTINE_SLOTS_MIGRATION],
+      });
+      return hookStore;
+    });
+    await ask(ctx, "first question");
+
+    const inline: CoordinatorDriver = {
+      runStep: (_name, fn) => fn(),
+      async awaitApproval() {
+        throw new Error("no approvals in this test");
+      },
+      async resolveApproval() {},
+    };
+    let firstEngineStepDone!: () => void;
+    const firstEngineStep = new Promise<void>((resolve) => {
+      firstEngineStepDone = resolve;
+    });
+    let releaseReplay!: () => void;
+    const replay = new Promise<void>((resolve) => {
+      releaseReplay = resolve;
+    });
+    const replayingAfterRelease: CoordinatorDriver = {
+      ...inline,
+      async runStep<T>(name: string, fn: () => Promise<T>): Promise<T> {
+        if (name !== "run-engine") {
+          return fn();
+        }
+        await fn();
+        firstEngineStepDone();
+        await replay;
+        return fn();
+      },
+    };
+    let successorId = "";
+    let successorExecution: Promise<void> | undefined;
+    hookStore!.afterFinish = async () => {
+      const { run } = await ctx.server.coordinator.admitOnly({
+        botId: ctx.botId,
+        sessionId: ctx.sessionId,
+        origin: "http",
+        idempotencyKey: "key-third question",
+        input: { parts: [{ type: "text", text: "third question" }] },
+      });
+      successorId = run.id;
+      successorExecution = ctx.server.coordinator.executeRun(run.id, replayingAfterRelease);
+      await firstEngineStep;
+    };
+
+    const { run: predecessor } = await ctx.server.coordinator.admitOnly({
+      botId: ctx.botId,
+      sessionId: ctx.sessionId,
+      origin: "http",
+      idempotencyKey: "key-second question",
+      input: { parts: [{ type: "text", text: "second question" }] },
+    });
+    await ctx.server.coordinator.executeRun(predecessor.id, inline);
+    releaseReplay();
+    await successorExecution;
+    const successor = await finished(ctx.server, successorId);
+
+    expect([
+      resumeTarget(cli.calls[3]),
+      cli.calls[3]!.prompt.includes("first question"),
+      successor.status,
+      successor.contextMode,
+      ctx.server.store.getEngineSession(ctx.sessionId, "claude-code")?.vendorSessionId,
+    ]).toEqual([undefined, true, "completed", "rebuilt", "vendor-2"]);
   }, 60_000);
 });

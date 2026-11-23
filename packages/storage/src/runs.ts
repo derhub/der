@@ -4,6 +4,7 @@ import {
   formatUtcTimestamp,
   type CloudEvent,
   type ContextMode,
+  type EngineSession,
   type JsonValue,
   type Message,
   type MessagePart,
@@ -22,6 +23,7 @@ import { compiledParsers } from "@der/domain/compiled";
 import { fingerprintJson } from "./canonical";
 import { insertOutboxForBindings } from "./channel-outbox";
 import type { SqliteDatabase } from "./database";
+import { saveEngineSession } from "./engine-sessions";
 import { conflictError, notFoundError, validationError } from "./errors";
 import {
   mapBotRow,
@@ -53,6 +55,8 @@ export interface FinishRunInput {
   readonly checkpoint?: JsonValue | null;
   readonly usage?: RunUsage;
   readonly contextMode?: ContextMode;
+  /** Saved in the finish transaction at the reply's ordinal when there is one. */
+  readonly engineSession?: Omit<EngineSession, "pendingRunId" | "updatedAt">;
 }
 
 export interface FinishRunOutcome {
@@ -299,6 +303,14 @@ export function listSessionRuns(database: SqliteDatabase, sessionId: SessionId):
     .query<RunRow, [string]>("SELECT * FROM runs WHERE session_id = ? ORDER BY rowid DESC")
     .all(sessionId)
     .map(mapRunRow);
+}
+
+export function setRunContextMode(
+  database: SqliteDatabase,
+  runId: RunId,
+  contextMode: ContextMode,
+): void {
+  database.db.query("UPDATE runs SET context_mode = ? WHERE id = ?").run(contextMode, runId);
 }
 
 export async function markRunRunning(
@@ -648,6 +660,17 @@ export async function finishRun(
       };
 
       outboxEvents.push(...insertOutboxForBindings(db, botBindings, routineEnvelope, now));
+    }
+
+    if (input.engineSession !== undefined) {
+      saveEngineSession(
+        db,
+        {
+          ...input.engineSession,
+          lastOrdinal: finalMessage?.ordinal ?? input.engineSession.lastOrdinal,
+        },
+        now,
+      );
     }
 
     const updatedRun = db

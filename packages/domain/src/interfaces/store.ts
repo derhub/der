@@ -72,6 +72,8 @@ export interface FinishRunInput {
   readonly checkpoint?: JsonValue | null;
   readonly usage?: RunUsage;
   readonly contextMode?: ContextMode;
+  /** Saved in the finish transaction at the reply's ordinal when there is one. */
+  readonly engineSession?: Omit<EngineSession, "pendingRunId" | "updatedAt">;
 }
 
 export interface FinishRunOutcome {

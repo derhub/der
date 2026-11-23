@@ -439,8 +439,11 @@ function planRunTurn(
   });
 
   if (engine !== undefined) {
+    const contextMode = plan.mode === "resume" ? "resumed" : "rebuilt";
+    // Written now so a finish recovered from persisted events, which skips planning, keeps it.
+    input.store.setRunContextMode(run.id, contextMode);
     input.turns.set(run.id, {
-      contextMode: plan.mode === "resume" ? "resumed" : "rebuilt",
+      contextMode,
       ...(plan.mode === "resume" ? { resumedFrom: plan.vendorSessionId } : {}),
       saveable: resumable,
       baseHash,

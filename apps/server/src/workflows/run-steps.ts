@@ -119,6 +119,7 @@ export interface ApprovalDecisionPayload {
 }
 
 const DEFAULT_EVENT_BATCH_SIZE = 8;
+const ATTEMPT_RESET_EVENT = "der.attempt-reset";
 
 function isToolCallEnd(chunk: JsonValue): boolean {
   return (
@@ -189,6 +190,15 @@ export async function executeEngineStage(deps: WorkflowDeps, run: Run): Promise<
   const earlier = await readEarlierExecution(deps, run);
   if (earlier.outcome !== undefined) {
     return earlier.outcome;
+  }
+  if (earlier.keySuffix !== "") {
+    // Tells stream readers to drop the abandoned attempt's output before the new attempt's.
+    await deps.store.appendRunEvents(run.id, [
+      {
+        chunkKey: `${run.id}:attempt-reset${earlier.keySuffix}`,
+        chunk: { type: "CUSTOM", name: ATTEMPT_RESET_EVENT },
+      },
+    ]);
   }
 
   try {
@@ -603,13 +613,8 @@ export async function finalizeDirectRunStep(
         : {}),
       ...(input.outcome.usage !== undefined ? { usage: input.outcome.usage } : {}),
       ...(input.outcome.turn !== undefined ? { contextMode: input.outcome.turn.contextMode } : {}),
+      ...(input.outcome.turn?.save !== undefined ? { engineSession: input.outcome.turn.save } : {}),
     });
-    if (input.outcome.turn?.save !== undefined) {
-      deps.store.saveEngineSession({
-        ...input.outcome.turn.save,
-        lastOrdinal: finished.finalMessage?.ordinal ?? input.outcome.turn.save.lastOrdinal,
-      });
-    }
     return finished.run;
   }
 

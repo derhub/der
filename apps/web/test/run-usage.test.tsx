@@ -146,13 +146,10 @@ describe("show usage for a Run that just finished", () => {
     vi.useRealTimers();
   });
 
-  it("re-fetches the session's Runs once when the watched Run settles before its usage is saved", async () => {
+  async function finishRunWhileRunListsReturn(
+    runListResponses: readonly (readonly Record<string, unknown>[])[],
+  ): Promise<() => number> {
     vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"], shouldAdvanceTime: true });
-    const runListResponses = [
-      [],
-      [runRecord("run-1", { usage: null, contextMode: null })],
-      [runRecord("run-1", { usage: usage(42), contextMode: "resumed" })],
-    ];
     let runListFetches = 0;
     const fetcher: typeof fetch = async (input, init) => {
       const url = new URL(
@@ -228,13 +225,56 @@ describe("show usage for a Run that just finished", () => {
     fireEvent.change(prompt, { target: { value: "count" } });
     fireEvent.keyDown(prompt, { key: "Enter" });
     await waitFor(() => expect(runListFetches).toBe(2));
+    return () => runListFetches;
+  }
+
+  it("re-fetches the session's Runs when the watched Run settles before its usage is saved", async () => {
+    const runListFetches = await finishRunWhileRunListsReturn([
+      [],
+      [runRecord("run-1", { usage: null, contextMode: null })],
+      [runRecord("run-1", { usage: usage(42), contextMode: "resumed" })],
+    ]);
     await act(async () => {
       await vi.advanceTimersByTimeAsync(1_000);
     });
 
-    await waitFor(() => expect(runListFetches).toBe(3));
+    await waitFor(() => expect(runListFetches()).toBe(3));
     expect(
       await screen.findByText("run-1 · input 42 · cached - · cache write - · output 7 · resumed"),
     ).toBeTruthy();
+  });
+
+  it("re-fetches the session's Runs when the stream closes while the watched Run still reads running", async () => {
+    const runListFetches = await finishRunWhileRunListsReturn([
+      [],
+      [runRecord("run-1", { status: "running", finishedAt: null, usage: null, contextMode: null })],
+      [runRecord("run-1", { usage: usage(42), contextMode: "resumed" })],
+    ]);
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(1_000);
+    });
+
+    await waitFor(() => expect(runListFetches()).toBe(3));
+    expect(
+      await screen.findByText("run-1 · input 42 · cached - · cache write - · output 7 · resumed"),
+    ).toBeTruthy();
+  });
+
+  it("stops re-fetching after three more tries when the watched Run never shows usage", async () => {
+    const runListFetches = await finishRunWhileRunListsReturn([
+      [],
+      [runRecord("run-1", { status: "running", finishedAt: null, usage: null, contextMode: null })],
+    ]);
+    for (const expected of [3, 4, 5]) {
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(1_000);
+      });
+      await waitFor(() => expect(runListFetches()).toBe(expected));
+    }
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(5_000);
+    });
+
+    expect(runListFetches()).toBe(5);
   });
 });
