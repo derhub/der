@@ -1,5 +1,12 @@
 import type { Database } from "bun:sqlite";
-import type { EngineKind, EngineSession, EngineSessionInput, SessionId } from "@der/domain";
+import type {
+  ContextMode,
+  EngineKind,
+  EngineSession,
+  EngineSessionInput,
+  RunId,
+  SessionId,
+} from "@der/domain";
 import type { SqliteDatabase } from "./database";
 
 interface EngineSessionRow {
@@ -36,21 +43,42 @@ export function getEngineSession(
   };
 }
 
-export function takeEngineSession(
+export function takeEngineSession<T extends { readonly contextMode: ContextMode }>(
   database: SqliteDatabase,
-  sessionId: SessionId,
-  engine: EngineKind,
-): EngineSession | null {
+  runId: RunId,
+  plan: (stored: EngineSession | null) => T,
+): T | undefined {
   return database.inTransaction((db) => {
-    const stored = getEngineSession(db, sessionId, engine);
-    db.query("DELETE FROM engine_sessions WHERE session_id = ?").run(sessionId);
-    return stored;
+    const run = db
+      .query<{ session_id: string; engine: string }, [string]>(
+        `SELECT session_id, engine FROM runs
+         WHERE id = ? AND status IN ('queued', 'running', 'waiting_approval')`,
+      )
+      .get(runId);
+    if (!run) {
+      return undefined;
+    }
+    const stored = getEngineSession(db, run.session_id, run.engine as EngineKind);
+    db.query("DELETE FROM engine_sessions WHERE session_id = ?").run(run.session_id);
+    const planned = plan(stored);
+    db.query("UPDATE runs SET context_mode = ? WHERE id = ?").run(planned.contextMode, runId);
+    return planned;
   });
 }
 
-export function saveEngineSession(db: Database, row: EngineSessionInput, updatedAt: string): void {
+/** Replaces the session's engine sessions with `row`, or with none. */
+export function handOverEngineSession(
+  db: Database,
+  sessionId: SessionId,
+  row: EngineSessionInput | undefined,
+  updatedAt: string,
+): void {
+  db.query("DELETE FROM engine_sessions WHERE session_id = ?").run(sessionId);
+  if (row === undefined) {
+    return;
+  }
   db.query(
-    `INSERT OR REPLACE INTO engine_sessions
+    `INSERT INTO engine_sessions
        (session_id, engine, vendor_session_id, base_hash, context_hash, last_ordinal, updated_at)
      VALUES (?, ?, ?, ?, ?, ?, ?)`,
   ).run(

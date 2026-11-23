@@ -452,7 +452,7 @@ describe("keep Memory schema and capability entry points distinct", () => {
       ...outboxStore,
       ...routineStore,
       getEngineSession: () => null,
-      takeEngineSession: () => null,
+      takeEngineSession: () => undefined,
     };
 
     const outboxSink: OutboxSink = {

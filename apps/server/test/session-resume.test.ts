@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it } from "bun:test";
 import { mkdirSync } from "node:fs";
 import { join } from "node:path";
 import type { CoordinatorDriver } from "#workflows/coordinator";
+import { finalizeInterruptedUncertainStep } from "#workflows/run-steps";
 import type { Run, RunEvent } from "@der/domain";
 import type { CommandRunner, CommandSpawnHandle } from "@der/runtime/sandbox";
 import { SqliteStore, type FinishRunInput, type FinishRunOutcome } from "@der/storage";
@@ -51,6 +52,7 @@ function createFakeClaude(
   options: {
     readonly onRejectedResume?: (id: string) => CliReply;
     readonly onCall?: (index: number) => CliReply | undefined;
+    readonly onReadinessProbe?: () => Promise<void>;
   } = {},
 ) {
   const calls: CliCall[] = [];
@@ -135,6 +137,7 @@ function createFakeClaude(
   const runner: CommandRunner = {
     async exec(command, args, execOptions) {
       if (command === "docker" && args[0] === "info") {
+        await options.onReadinessProbe?.();
         return {
           exitCode: 0,
           stdout: JSON.stringify({
@@ -194,13 +197,35 @@ class FinishHookStore extends SqliteStore {
 
 async function startResumeServer(
   cli: FakeClaude,
-  bot: { persona: string } = { persona: "Terse." },
   openStore?: (dbPath: string) => SqliteStore,
-): Promise<{ server: RunningServer; botId: string; sessionId: string }> {
+): Promise<{ server: RunningServer; botId: string; sessionId: string; dir: string }> {
   const tempDb = createTempDatabase("der-session-resume-");
-  const workspaceDir = join(tempDb.dir, "workspaces");
+  cleanups.push(tempDb.cleanup);
+  const server = await openResumeServer(cli, tempDb.dir, openStore?.(tempDb.dbPath));
+  const created = server.store.createBot({
+    id: "bot-resume",
+    name: "Resume Bot",
+    persona: "Terse.",
+    defaultEngine: "claude-code",
+    allowedEngines: ["claude-code", "fixture", "codex"],
+  });
+  const session = server.store.createSession({
+    id: "sess-resume",
+    botId: created.id,
+    title: "Long",
+    engine: "claude-code",
+  });
+  return { server, botId: created.id, sessionId: session.id, dir: tempDb.dir };
+}
+
+async function openResumeServer(
+  cli: FakeClaude,
+  dir: string,
+  store?: SqliteStore,
+  claudeModel = "claude-sonnet-4-5",
+): Promise<RunningServer> {
+  const workspaceDir = join(dir, "workspaces");
   mkdirSync(workspaceDir, { recursive: true });
-  const store = openStore?.(tempDb.dbPath);
   const server = await startServer({
     ...(store !== undefined ? { store } : {}),
     config: {
@@ -209,34 +234,21 @@ async function startResumeServer(
       restateHost: "127.0.0.1",
       restateListen: 0,
       restateMode: "direct",
-      databasePath: tempDb.dbPath,
-      memoryProjectionDir: join(tempDb.dir, "memory"),
-      skillsRootDir: join(tempDb.dir, "skills"),
+      databasePath: join(dir, "der.sqlite"),
+      memoryProjectionDir: join(dir, "memory"),
+      skillsRootDir: join(dir, "skills"),
       workspaceRootDir: workspaceDir,
       dockerHost: "unix:///run/der-rootless/docker.sock",
       enabledEngines: ["claude-code", "fixture"],
+      engineModels: { codex: "gpt-5-codex", claudeCode: claudeModel, antigravity: "default" },
     },
     commandRunner: cli.runner,
   });
   cleanups.push(async () => {
     await server.close();
     store?.close();
-    tempDb.cleanup();
   });
-  const created = server.store.createBot({
-    id: "bot-resume",
-    name: "Resume Bot",
-    persona: bot.persona,
-    defaultEngine: "claude-code",
-    allowedEngines: ["claude-code", "fixture"],
-  });
-  const session = server.store.createSession({
-    id: "sess-resume",
-    botId: created.id,
-    title: "Long",
-    engine: "claude-code",
-  });
-  return { server, botId: created.id, sessionId: session.id };
+  return server;
 }
 
 async function finished(server: RunningServer, runId: string): Promise<Run> {
@@ -384,6 +396,29 @@ describe("rebuild the context", () => {
     ]).toEqual([undefined, true, true, "rebuilt", "vendor-2"]);
   }, 60_000);
 
+  it("finishes rebuilt with the full prompt after a restart with another Claude model", async () => {
+    const cli = createFakeClaude();
+    const ctx = await startResumeServer(cli);
+    await ask(ctx, "first question");
+    await ctx.server.close();
+
+    const server = await openResumeServer(cli, ctx.dir, undefined, "claude-opus-4-1");
+    const second = await ask({ ...ctx, server }, "second question");
+
+    const argv = cli.calls[1]!.argv;
+    expect([
+      resumeTarget(cli.calls[1]),
+      argv[argv.indexOf("--model") + 1],
+      cli.calls[1]!.prompt,
+      second.contextMode,
+    ]).toEqual([
+      undefined,
+      "claude-opus-4-1",
+      "Previous conversation:\nUser: first question\nAssistant: answer 1\n\nsecond question",
+      "rebuilt",
+    ]);
+  }, 60_000);
+
   it("finishes rebuilt after a turn on another engine and carries that turn", async () => {
     const cli = createFakeClaude();
     const ctx = await startResumeServer(cli);
@@ -400,7 +435,7 @@ describe("rebuild the context", () => {
     ]).toEqual([undefined, true, "rebuilt", "vendor-2"]);
   }, 60_000);
 
-  it("finishes rebuilt after a failed turn on another engine that left no reply", async () => {
+  it("finishes rebuilt with every message after a turn on an unregistered engine failed", async () => {
     const cli = createFakeClaude();
     const ctx = await startResumeServer(cli);
     await ask(ctx, "first question");
@@ -408,20 +443,25 @@ describe("rebuild the context", () => {
       botId: ctx.botId,
       sessionId: ctx.sessionId,
       origin: "http",
-      idempotencyKey: "key-fixture-fail",
-      input: { parts: [{ type: "text", text: "fail: fixture turn" }] },
-      engine: "fixture",
+      idempotencyKey: "key-codex-turn",
+      input: { parts: [{ type: "text", text: "codex question" }] },
+      engine: "codex",
     });
-    expect((await finished(ctx.server, failing.id)).status).toBe("failed");
+    const failed = await finished(ctx.server, failing.id);
 
     const third = await ask(ctx, "third question");
 
     expect([
+      failed.status,
       resumeTarget(cli.calls[1]),
-      cli.calls[1]!.prompt.includes("first question"),
+      cli.calls[1]!.prompt,
       third.contextMode,
-      ctx.server.store.getEngineSession(ctx.sessionId, "claude-code")?.vendorSessionId,
-    ]).toEqual([undefined, true, "rebuilt", "vendor-2"]);
+    ]).toEqual([
+      "failed",
+      undefined,
+      "Previous conversation:\nUser: first question\nAssistant: answer 1\nUser: codex question\n\nthird question",
+      "rebuilt",
+    ]);
   }, 60_000);
 
   async function executeWithReplayedEngineStep(ctx: {
@@ -582,7 +622,7 @@ describe("rebuild the context", () => {
     beforeReplay: (store: FinishHookStore, predecessorId: string) => Promise<void>,
   ): Promise<{ ctx: Awaited<ReturnType<typeof startResumeServer>>; successor: Run }> {
     let hookStore: FinishHookStore | undefined;
-    const ctx = await startResumeServer(cli, undefined, (dbPath) => {
+    const ctx = await startResumeServer(cli, (dbPath) => {
       hookStore = new FinishHookStore({
         filename: dbPath,
         extraMigrations: [MEMORY_ROUTINE_SLOTS_MIGRATION],
@@ -694,6 +734,67 @@ describe("rebuild the context", () => {
       "completed",
       "rebuilt",
       "vendor-2",
+    ]);
+  }, 60_000);
+});
+
+describe("leave the successor's vendor session alone", () => {
+  it("makes no vendor call and keeps the successor's session when an interrupted Run plans late", async () => {
+    let holdNextProbe = false;
+    let probeHeld!: () => void;
+    const held = new Promise<void>((resolve) => {
+      probeHeld = resolve;
+    });
+    let releaseProbe!: () => void;
+    const released = new Promise<void>((resolve) => {
+      releaseProbe = resolve;
+    });
+    const cli = createFakeClaude({
+      onReadinessProbe: async () => {
+        if (holdNextProbe) {
+          holdNextProbe = false;
+          probeHeld();
+          await released;
+        }
+      },
+    });
+    const ctx = await startResumeServer(cli);
+    const { run: stale } = await ctx.server.coordinator.admitOnly({
+      botId: ctx.botId,
+      sessionId: ctx.sessionId,
+      origin: "http",
+      idempotencyKey: "key-stale question",
+      input: { parts: [{ type: "text", text: "stale question" }] },
+    });
+    holdNextProbe = true;
+    const staleExecution = ctx.server.coordinator.executeRun(stale.id, {
+      runStep: (_name, fn) => fn(),
+      async awaitApproval() {
+        throw new Error("no approvals in this test");
+      },
+      async resolveApproval() {},
+    });
+    await held;
+    await finalizeInterruptedUncertainStep(
+      { store: ctx.server.store },
+      { run: stale, effectId: "effect-1", detail: "Host effect outcome is uncertain." },
+    );
+    await ask(ctx, "second question");
+
+    releaseProbe();
+    await staleExecution;
+
+    const staleRun = ctx.server.store.getRun(stale.id);
+    expect([
+      cli.calls.map((call) => [resumeTarget(call), call.prompt]),
+      staleRun?.status,
+      staleRun?.contextMode,
+      ctx.server.store.getEngineSession(ctx.sessionId, "claude-code")?.vendorSessionId,
+    ]).toEqual([
+      [[undefined, "Previous conversation:\nUser: stale question\n\nsecond question"]],
+      "interrupted",
+      null,
+      "vendor-1",
     ]);
   }, 60_000);
 });

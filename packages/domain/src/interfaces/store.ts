@@ -22,6 +22,7 @@ import type { Message, MessagePart } from "../schemas/message";
 import type { Routine, RoutineTarget } from "../schemas/routine";
 import type {
   ChannelIntakeMetadata,
+  ContextMode,
   Run,
   RunAdmission,
   RunEvent,
@@ -71,8 +72,9 @@ export interface FinishRunInput {
   readonly checkpoint?: JsonValue | null;
   readonly usage?: RunUsage;
   /**
-   * Stored at the reply's ordinal when there is one, and only by the finish that first makes the
-   * Run terminal: a replayed finish writes nothing.
+   * The finish that first makes the Run terminal replaces the session's engine sessions with this
+   * one, at the reply's ordinal when there is one, or with none when absent. A replayed finish
+   * writes nothing.
    */
   readonly engineSession?: EngineSessionInput;
 }
@@ -187,11 +189,14 @@ export type EngineSessionInput = Omit<EngineSession, "updatedAt">;
 export interface EngineSessionStore {
   getEngineSession(sessionId: SessionId, engine: EngineKind): EngineSession | null;
   /**
-   * Returns the session's row for `engine` and deletes every row of the session in one
-   * transaction. The Run that takes it owns the vendor session; no row exists again until that
-   * Run's finish stores one.
+   * In one transaction, while the Run is still active: deletes every engine session of its session,
+   * hands its engine's row to `plan` and stores the returned `contextMode` on the Run. Returns
+   * `plan`'s result, or `undefined` with nothing changed once the Run is terminal.
    */
-  takeEngineSession(sessionId: SessionId, engine: EngineKind): EngineSession | null;
+  takeEngineSession<T extends { readonly contextMode: ContextMode }>(
+    runId: RunId,
+    plan: (stored: EngineSession | null) => T,
+  ): T | undefined;
 }
 
 export interface Store

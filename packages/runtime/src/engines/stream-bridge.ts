@@ -116,9 +116,10 @@ function isAssistantOutput(chunkType: string): boolean {
 
 /**
  * Translates adapter chunks into engine events. A resumed turn holds its chunks until the first
- * assistant content or tool call, the point where the vendor has accepted the session; a failure
- * before it is `engine.resume_unavailable` and yields none of them. `isResumeFailure` narrows
- * which vendor-reported errors count, so a transient vendor error does not discard the session.
+ * assistant content or tool call, the point where the vendor has accepted the session; a refusal
+ * before it is `engine.resume_unavailable` and yields none of them, any other vendor error yields
+ * them first. `isResumeFailure` narrows which vendor-reported errors count as a refusal, so a
+ * transient vendor error does not discard the session.
  */
 export async function* bridgeAdapterStream(options: {
   readonly run: Run;
@@ -165,6 +166,8 @@ export async function* bridgeAdapterStream(options: {
       if (isRecord(sessionValue) && typeof sessionValue["sessionId"] === "string") {
         const observedSessionId = sessionValue["sessionId"];
         if (held !== undefined && observedSessionId !== resumeSessionId) {
+          // The abort makes the adapter cancel the fresh session, but an ACP adapter has already
+          // sent it the prompt: whatever the vendor does before the cancel lands is not undone.
           const detail = `Engine could not resume session "${resumeSessionId}"; started fresh session "${observedSessionId}" instead.`;
           options.approvalBridge?.markTransportLost(detail);
           options.abortController.abort(detail);
@@ -203,6 +206,7 @@ export async function* bridgeAdapterStream(options: {
           };
           return;
         }
+        yield* release();
         if (isTransportLossMessage(message)) {
           options.approvalBridge?.markTransportLost(message);
           yield {

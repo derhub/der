@@ -39,16 +39,19 @@ interface FakeAgy {
   readonly provider: SandboxProvider;
   readonly loadedSessionIds: string[];
   readonly prompts: string[];
+  readonly cancelledSessionIds: string[];
 }
 
 /** Stands in for `agy acp`: the only external process. */
 function fakeAgy(behavior: {
   readonly loadFails?: boolean;
   readonly promptError?: string;
+  readonly thought?: string;
   readonly reply?: string;
 }): FakeAgy {
   const loadedSessionIds: string[] = [];
   const prompts: string[] = [];
+  const cancelledSessionIds: string[] = [];
   const queue: string[] = [];
   let notify: (() => void) | undefined;
   let closed = false;
@@ -86,6 +89,18 @@ function fakeAgy(behavior: {
       push({ id: message.id, result: { sessionId: "acp-session-new" } });
     } else if (message.method === "session/prompt") {
       prompts.push(message.params?.prompt?.[0]?.text ?? "");
+      if (behavior.thought !== undefined) {
+        push({
+          method: "session/update",
+          params: {
+            sessionId: message.params?.sessionId,
+            update: {
+              sessionUpdate: "agent_thought_chunk",
+              content: { type: "text", text: behavior.thought },
+            },
+          },
+        });
+      }
       if (behavior.promptError !== undefined) {
         push({ id: message.id, error: { code: -32603, message: behavior.promptError } });
         return;
@@ -101,6 +116,8 @@ function fakeAgy(behavior: {
         },
       });
       push({ id: message.id, result: { stopReason: "end_turn" } });
+    } else if (message.method === "session/cancel") {
+      cancelledSessionIds.push(message.params?.sessionId ?? "");
     }
   };
 
@@ -225,7 +242,7 @@ function fakeAgy(behavior: {
     },
     async destroy() {},
   };
-  return { provider, loadedSessionIds, prompts };
+  return { provider, loadedSessionIds, prompts, cancelledSessionIds };
 }
 
 async function runEngine(agy: FakeAgy, input: EngineRunInput): Promise<EngineEvent[]> {
@@ -310,12 +327,17 @@ describe("detect an Antigravity session the agent rejects", () => {
     });
   });
 
-  it("reports engine.resume_unavailable and no assistant text on a session id mismatch", async () => {
+  it("cancels the fresh session and reports engine.resume_unavailable with no assistant text on a session id mismatch", async () => {
     const agy = fakeAgy({ loadFails: true, reply: "answer from a blank session" });
 
     const events = await runEngine(agy, resumedInput);
 
-    expect([JSON.stringify(events).includes("blank session"), events.at(-1)]).toEqual([
+    expect([
+      agy.cancelledSessionIds,
+      JSON.stringify(events).includes("blank session"),
+      events.at(-1),
+    ]).toEqual([
+      ["acp-session-new"],
       false,
       {
         type: "failed",
@@ -323,6 +345,35 @@ describe("detect an Antigravity session the agent rejects", () => {
         detail:
           'Engine could not resume session "vendor-1"; started fresh session "acp-session-new" instead.',
       },
+    ]);
+  });
+});
+
+describe("keep the run events of a resumed Antigravity turn that fails", () => {
+  it("yields the start, session and reasoning chunks before a quota error", async () => {
+    const agy = fakeAgy({ thought: "checking the quota", promptError: "quota exceeded" });
+
+    const events = await runEngine(agy, resumedInput);
+
+    expect(
+      events.map((event) => {
+        if (event.type !== "chunk") {
+          return event.type === "failed" ? event.code : event.type;
+        }
+        const chunk = event.chunk as Record<string, unknown>;
+        return chunk["name"] ?? chunk["type"];
+      }),
+    ).toEqual([
+      "RUN_STARTED",
+      "sandbox.starting",
+      "sandbox.created",
+      "antigravity.session-id",
+      "REASONING_START",
+      "REASONING_MESSAGE_START",
+      "REASONING_MESSAGE_CONTENT",
+      "REASONING_MESSAGE_END",
+      "REASONING_END",
+      "engine.run_error",
     ]);
   });
 });

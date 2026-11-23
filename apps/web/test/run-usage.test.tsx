@@ -278,3 +278,60 @@ describe("show usage for a Run that just finished", () => {
     expect(runListFetches()).toBe(5);
   });
 });
+
+describe("show usage for a reloaded Run whose stream is resumed by hand", () => {
+  it("re-fetches the session's Runs when the resumed stream settles", async () => {
+    window.sessionStorage.setItem(
+      "der:activeRun:sess-1",
+      JSON.stringify({ runId: "run-1", cursor: 0 }),
+    );
+    const runLists = [[], [runRecord("run-1", { usage: usage(42), contextMode: "resumed" })]];
+    let runListFetches = 0;
+    const fetcher: typeof fetch = async (input) => {
+      const url = new URL(
+        typeof input === "string" ? input : input instanceof URL ? input.href : input.url,
+        "http://127.0.0.1:5173",
+      );
+      if (url.pathname === "/api/sessions/sess-1/messages") {
+        return Response.json({ messages: [] });
+      }
+      if (url.pathname === "/api/sessions/sess-1/runs") {
+        const runs = runLists[Math.min(runListFetches, runLists.length - 1)];
+        runListFetches += 1;
+        return Response.json({ runs });
+      }
+      if (url.pathname === "/api/runs/run-1/events") {
+        return new Response(
+          formatSseEvent({
+            id: 1,
+            data: { type: "RUN_FINISHED", runId: "run-1", threadId: "sess-1" },
+          }),
+          { status: 200, headers: { "content-type": "text/event-stream; charset=utf-8" } },
+        );
+      }
+      if (url.pathname === "/api/runs/run-1") {
+        return Response.json({
+          run: runRecord("run-1", { status: "running", finishedAt: null, usage: null }),
+          approval: null,
+        });
+      }
+      return new Response("Not found", { status: 404 });
+    };
+    render(
+      <ChatWorkspace
+        api={createOperatorApi({ fetcher })}
+        fetcher={fetcher}
+        bot={bot}
+        session={session}
+        actor="operator"
+        onAnnounce={() => {}}
+      />,
+    );
+
+    fireEvent.click(await screen.findByRole("button", { name: "Resume stream" }));
+
+    expect(
+      await screen.findByText("run-1 · input 42 · cached - · cache write - · output 7 · resumed"),
+    ).toBeTruthy();
+  });
+});

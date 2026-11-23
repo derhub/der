@@ -402,29 +402,44 @@ function planRunTurn(
   const resumable = input.engines.get(engine)?.resumable === true;
   // `buildRunContext`'s base hash does not cover the engine model; a model change must rebuild.
   const baseHash = `${built.baseHash}:${modelOf(engine, input.engineModels)}`;
-  const taken = input.store.takeEngineSession(run.sessionId, engine);
-  const stored = resumable ? taken : null;
-  // The loaded window is the newest 200 messages; it holds every message after `lastOrdinal`
-  // unless 200 or more arrived since.
-  const windowIsComplete =
-    stored === null ||
-    messages.length < NEWEST_MESSAGE_WINDOW ||
-    (messages[0]?.ordinal ?? 0) <= stored.lastOrdinal + 1;
-  const messagesAfterLastOrdinal =
-    stored !== null && windowIsComplete
-      ? messages.filter((message) => message.ordinal > stored.lastOrdinal)
-      : [];
-
-  const plan = planTurn({
-    stored,
-    baseHash,
-    contextHash: built.contextHash,
-    contextBlock: built.contextBlock,
-    messagesAfterLastOrdinal,
+  // The mode is written now so a finish recovered from persisted events, which skips planning,
+  // keeps it.
+  const turn = input.store.takeEngineSession(run.id, (taken) => {
+    const stored = resumable ? taken : null;
+    // The loaded window is the newest 200 messages; it holds every message after `lastOrdinal`
+    // unless 200 or more arrived since.
+    const windowIsComplete =
+      stored === null ||
+      messages.length < NEWEST_MESSAGE_WINDOW ||
+      (messages[0]?.ordinal ?? 0) <= stored.lastOrdinal + 1;
+    const messagesAfterLastOrdinal =
+      stored !== null && windowIsComplete
+        ? messages.filter((message) => message.ordinal > stored.lastOrdinal)
+        : [];
+    const plan = planTurn({
+      stored,
+      baseHash,
+      contextHash: built.contextHash,
+      contextBlock: built.contextBlock,
+      messagesAfterLastOrdinal,
+    });
+    return plan.mode === "resume"
+      ? {
+          contextMode: "resumed" as const,
+          messages: [
+            {
+              role: "user" as const,
+              content: composeResumeText(plan.contextNote, messagesAfterLastOrdinal),
+            },
+          ],
+          resumeSessionId: plan.vendorSessionId,
+        }
+      : { contextMode: "rebuilt" as const };
   });
-
-  // Written now so a finish recovered from persisted events, which skips planning, keeps it.
-  input.store.setRunContextMode(run.id, plan.mode === "resume" ? "resumed" : "rebuilt");
+  if (turn === undefined) {
+    // An interrupt ended the Run while it was loading; its successor may own the engine session.
+    throw new Error(`Run ${run.id} ended before its turn was planned.`);
+  }
   if (resumable) {
     input.turns.set(run.id, {
       sessionId: run.sessionId,
@@ -434,15 +449,7 @@ function planRunTurn(
       lastOrdinal: messages.at(-1)?.ordinal ?? 0,
     });
   }
-
-  return plan.mode === "resume"
-    ? {
-        messages: [
-          { role: "user", content: composeResumeText(plan.contextNote, messagesAfterLastOrdinal) },
-        ],
-        resumeSessionId: plan.vendorSessionId,
-      }
-    : {};
+  return turn;
 }
 
 function createContextLoader(input: {

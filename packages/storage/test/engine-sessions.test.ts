@@ -41,32 +41,40 @@ const rowA: EngineSessionInput = {
   lastOrdinal: 4,
 };
 
-async function admitRun(store: SqliteStore, row: EngineSessionInput): Promise<string> {
+function insertRow(store: SqliteStore, sessionId: string, engine: string): void {
+  store.database.db
+    .query(
+      `INSERT INTO engine_sessions
+         (session_id, engine, vendor_session_id, base_hash, context_hash, last_ordinal, updated_at)
+       VALUES (?, ?, 'vendor-0', 'base-0', 'ctx-0', 1, '2026-03-04T05:06:07.000Z')`,
+    )
+    .run(sessionId, engine);
+}
+
+async function admitRun(store: SqliteStore, row: EngineSessionInput, text = "hello") {
   const { run } = await store.admit({
     botId: "bot-es",
     sessionId: row.sessionId,
     origin: "http",
-    idempotencyKey: `${row.sessionId}:${row.engine}`,
+    idempotencyKey: `${row.sessionId}:${text}`,
     engine: row.engine,
-    input: { parts: [{ type: "text", text: "hello" }] },
+    input: { parts: [{ type: "text", text }] },
   });
   return run.id;
 }
 
-function completion(runId: string, row: EngineSessionInput): FinishRunInput {
+function completion(runId: string, row?: EngineSessionInput): FinishRunInput {
   return {
     runId,
     status: "completed",
     terminalEvent: { chunkKey: `${runId}:terminal`, chunk: { type: "RUN_FINISHED" } },
-    engineSession: row,
+    ...(row !== undefined ? { engineSession: row } : {}),
   };
 }
 
-async function finishWithEngineSession(store: SqliteStore, row: EngineSessionInput) {
-  await store.finishRun(completion(await admitRun(store, row), row));
-}
+const planResumed = (stored: unknown) => ({ contextMode: "resumed" as const, stored });
 
-describe("store the engine session with the Run's finish", () => {
+describe("hand the engine session over with the Run's finish", () => {
   it("writes the completed Run, its reply and the engine session at the reply's ordinal", async () => {
     const store = openStore();
     try {
@@ -86,12 +94,41 @@ describe("store the engine session with the Run's finish", () => {
     }
   });
 
+  it.each([
+    { handedOver: "none", row: undefined, codex: null },
+    {
+      handedOver: "its own row",
+      row: rowA,
+      codex: { ...rowA, updatedAt: "2026-03-04T05:06:07.000Z" },
+    },
+  ])(
+    "replaces every engine session of the session when the Run hands over $handedOver",
+    async ({ row, codex }) => {
+      const store = openStore();
+      try {
+        insertRow(store, "sess-a", "codex");
+        insertRow(store, "sess-a", "claude-code");
+        insertRow(store, "sess-b", "codex");
+        const runId = await admitRun(store, rowA);
+
+        await store.finishRun(completion(runId, row));
+
+        expect([
+          store.getEngineSession("sess-a", "codex"),
+          store.getEngineSession("sess-a", "claude-code"),
+          store.getEngineSession("sess-b", "codex")?.vendorSessionId,
+        ]).toEqual([codex, null, "vendor-0"]);
+      } finally {
+        store.close();
+      }
+    },
+  );
+
   it("writes nothing when a replayed finish finds the Run already terminal", async () => {
     const store = openStore();
     try {
       const runId = await admitRun(store, rowA);
-      await store.finishRun(completion(runId, rowA));
-      store.takeEngineSession("sess-a", "codex");
+      await store.finishRun(completion(runId));
 
       await store.finishRun(completion(runId, rowA));
 
@@ -124,35 +161,64 @@ describe("store the engine session with the Run's finish", () => {
 });
 
 describe("take the engine session when a Run plans its turn", () => {
-  it("returns the engine's row and deletes every row of that session only", async () => {
+  it("plans with the engine's row, deletes every row of that session only and records the mode", async () => {
     const store = openStore();
     try {
-      await finishWithEngineSession(store, rowA);
-      await finishWithEngineSession(store, { ...rowA, engine: "claude-code" });
-      await finishWithEngineSession(store, { ...rowA, sessionId: "sess-b" });
+      insertRow(store, "sess-a", "codex");
+      insertRow(store, "sess-a", "claude-code");
+      insertRow(store, "sess-b", "codex");
+      const runId = await admitRun(store, rowA);
 
-      const taken = store.takeEngineSession("sess-a", "codex");
+      const planned = store.takeEngineSession(runId, planResumed);
 
       expect([
-        taken,
+        planned,
+        store.getRun(runId)?.contextMode,
         store.getEngineSession("sess-a", "codex"),
         store.getEngineSession("sess-a", "claude-code"),
         store.getEngineSession("sess-b", "codex")?.vendorSessionId,
-      ]).toEqual([{ ...rowA, updatedAt: "2026-03-04T05:06:07.000Z" }, null, null, "vendor-1"]);
+      ]).toEqual([
+        {
+          contextMode: "resumed",
+          stored: {
+            sessionId: "sess-a",
+            engine: "codex",
+            vendorSessionId: "vendor-0",
+            baseHash: "base-0",
+            contextHash: "ctx-0",
+            lastOrdinal: 1,
+            updatedAt: "2026-03-04T05:06:07.000Z",
+          },
+        },
+        "resumed",
+        null,
+        null,
+        "vendor-0",
+      ]);
     } finally {
       store.close();
     }
   });
 
-  it("returns null and still clears the session when this engine has no row", async () => {
+  it("changes nothing and does not plan once an interrupt ended the Run and a successor finished", async () => {
     const store = openStore();
     try {
-      await finishWithEngineSession(store, { ...rowA, engine: "claude-code" });
+      const stale = await admitRun(store, rowA, "first");
+      await store.finishRun({ ...completion(stale), status: "interrupted" });
+      await store.finishRun(completion(await admitRun(store, rowA, "second"), rowA));
+      const plannedWith: unknown[] = [];
+
+      const planned = store.takeEngineSession(stale, (stored) => {
+        plannedWith.push(stored);
+        return planResumed(stored);
+      });
 
       expect([
-        store.takeEngineSession("sess-a", "codex"),
-        store.getEngineSession("sess-a", "claude-code"),
-      ]).toEqual([null, null]);
+        planned,
+        plannedWith,
+        store.getRun(stale)?.contextMode,
+        store.getEngineSession("sess-a", "codex")?.vendorSessionId,
+      ]).toEqual([undefined, [], null, "vendor-1"]);
     } finally {
       store.close();
     }
@@ -163,20 +229,15 @@ describe("delete a session", () => {
   it("removes its engine sessions and keeps other sessions' rows", async () => {
     const store = openStore();
     try {
-      const insert = store.database.db.query(
-        `INSERT INTO engine_sessions
-           (session_id, engine, vendor_session_id, base_hash, context_hash, last_ordinal, updated_at)
-         VALUES (?, 'codex', 'vendor-1', 'base-1', 'ctx-1', 4, '2026-03-04T05:06:07.000Z')`,
-      );
-      insert.run("sess-a");
-      insert.run("sess-b");
+      insertRow(store, "sess-a", "codex");
+      insertRow(store, "sess-b", "codex");
 
       store.database.db.query("DELETE FROM sessions WHERE id = ?").run("sess-a");
 
       expect([
         store.getEngineSession("sess-a", "codex"),
         store.getEngineSession("sess-b", "codex")?.vendorSessionId,
-      ]).toEqual([null, "vendor-1"]);
+      ]).toEqual([null, "vendor-0"]);
     } finally {
       store.close();
     }

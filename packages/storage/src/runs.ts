@@ -3,7 +3,6 @@ import {
   CLOUD_EVENT_TYPES,
   formatUtcTimestamp,
   type CloudEvent,
-  type ContextMode,
   type EngineSessionInput,
   type JsonValue,
   type Message,
@@ -23,7 +22,7 @@ import { compiledParsers } from "@der/domain/compiled";
 import { fingerprintJson } from "./canonical";
 import { insertOutboxForBindings } from "./channel-outbox";
 import type { SqliteDatabase } from "./database";
-import { saveEngineSession } from "./engine-sessions";
+import { handOverEngineSession } from "./engine-sessions";
 import { conflictError, notFoundError, validationError } from "./errors";
 import {
   mapBotRow,
@@ -302,14 +301,6 @@ export function listSessionRuns(database: SqliteDatabase, sessionId: SessionId):
     .query<RunRow, [string]>("SELECT * FROM runs WHERE session_id = ? ORDER BY rowid DESC")
     .all(sessionId)
     .map(mapRunRow);
-}
-
-export function setRunContextMode(
-  database: SqliteDatabase,
-  runId: RunId,
-  contextMode: ContextMode,
-): void {
-  database.db.query("UPDATE runs SET context_mode = ? WHERE id = ?").run(contextMode, runId);
 }
 
 export async function markRunRunning(
@@ -659,10 +650,13 @@ export async function finishRun(
       outboxEvents.push(...insertOutboxForBindings(db, botBindings, routineEnvelope, now));
     }
 
-    if (!existingTerminal && input.engineSession !== undefined) {
-      saveEngineSession(
+    // Only the first terminal write hands over: the Run is then still the session's active Run,
+    // so no successor exists whose row this could replace.
+    if (!existingTerminal) {
+      handOverEngineSession(
         db,
-        {
+        runRow.session_id,
+        input.engineSession && {
           ...input.engineSession,
           lastOrdinal: finalMessage?.ordinal ?? input.engineSession.lastOrdinal,
         },

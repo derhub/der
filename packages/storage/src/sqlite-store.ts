@@ -95,7 +95,6 @@ import {
   getRunStreamState as getRunStreamStateQuery,
   listSessionRuns as listSessionRunsQuery,
   markRunRunning as markRunRunningCommand,
-  setRunContextMode as setRunContextModeCommand,
   readRunEventsAfter as readRunEventsAfterQuery,
   type FinishRunInput,
   type FinishRunOutcome,
@@ -420,17 +419,15 @@ export class SqliteStore
     return getEngineSessionQuery(this.database.db, sessionId, engine);
   }
 
-  takeEngineSession(sessionId: SessionId, engine: EngineKind): EngineSession | null {
-    return takeEngineSessionCommand(this.database, sessionId, engine);
+  takeEngineSession<T extends { readonly contextMode: ContextMode }>(
+    runId: RunId,
+    plan: (stored: EngineSession | null) => T,
+  ): T | undefined {
+    return takeEngineSessionCommand(this.database, runId, plan);
   }
 
   listSessionRuns(sessionId: SessionId): Run[] {
     return listSessionRunsQuery(this.database, sessionId);
-  }
-
-  /** Records how the engine step delivered the Run's context, before the engine call. */
-  setRunContextMode(runId: RunId, contextMode: ContextMode): void {
-    setRunContextModeCommand(this.database, runId, contextMode);
   }
 
   markRunRunning(runId: RunId, checkpoint?: JsonValue | null): Promise<Run> {

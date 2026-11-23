@@ -853,7 +853,7 @@ export function ChatWorkspace({
       if (streamedDelta.length > 0) {
         onAnnounce(`Replayed stream updates for run ${activeRun.id}.`);
       }
-      await Promise.all([refreshRunState(activeRun.id), refreshHistory()]);
+      handleRunSettled(activeRun.id);
     } catch (error) {
       if (!controller.signal.aborted) {
         setProblem(toOperatorProblem(error, `/api/runs/${activeRun.id}/events`));
@@ -943,7 +943,7 @@ export function ChatWorkspace({
             label="Sync history"
             icon={<RefreshCwIcon {...stylex.props(styles.iconSm)} aria-hidden="true" />}
             isDisabled={historyLoading}
-            onClick={() => void refreshHistory()}
+            onClick={() => void Promise.all([refreshHistory(), refreshSessionRuns()])}
           />
         </div>
       </div>
