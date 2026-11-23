@@ -15,6 +15,8 @@ export {
   type Engine,
   type FinishRunInput,
   type FinishRunOutcome,
+  type EngineSession,
+  type EngineSessionStore,
   type Integration,
   type IntegrationContext,
   type IntegrationContribution,

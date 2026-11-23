@@ -29,6 +29,11 @@ const scriptRoutinesMigrationPath = resolve(
 
 const runUsageMigrationPath = resolve(import.meta.dirname, "../migrations/007-run-usage.sql");
 
+const engineSessionsMigrationPath = resolve(
+  import.meta.dirname,
+  "../migrations/008-engine-sessions.sql",
+);
+
 export const CORE_MIGRATION: StorageMigration = {
   version: "001-core",
   sql: readFileSync(coreMigrationPath, "utf8"),
@@ -62,6 +67,11 @@ export const RUN_USAGE_MIGRATION: StorageMigration = {
   sql: readFileSync(runUsageMigrationPath, "utf8"),
 };
 
+export const ENGINE_SESSIONS_MIGRATION: StorageMigration = {
+  version: "008-engine-sessions",
+  sql: readFileSync(engineSessionsMigrationPath, "utf8"),
+};
+
 export const CORE_MIGRATIONS: readonly StorageMigration[] = [
   CORE_MIGRATION,
   OUTBOX_DESTINATIONS_MIGRATION,
@@ -69,6 +79,7 @@ export const CORE_MIGRATIONS: readonly StorageMigration[] = [
   SCRIPT_RUNS_MIGRATION,
   SCRIPT_ROUTINES_MIGRATION,
   RUN_USAGE_MIGRATION,
+  ENGINE_SESSIONS_MIGRATION,
 ];
 
 export function applyMigrations(
