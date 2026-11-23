@@ -27,18 +27,29 @@ import {
 } from "@astryxdesign/core/theme/tokens.stylex";
 import * as stylex from "@stylexjs/stylex";
 import { CheckIcon, MessageSquareIcon, RefreshCwIcon, ShieldAlertIcon, XIcon } from "lucide-react";
-import { useCallback, useEffect, useMemo, useRef, useState, type KeyboardEvent } from "react";
-import type {
-  Approval,
-  Bot,
-  EngineKind,
-  Message,
-  ProblemDetails,
-  Run,
-  RunAdmission,
-  Session,
+import {
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type KeyboardEvent,
+  type ReactNode,
+} from "react";
+import {
+  capabilitySearchHit,
+  executeResult,
+  type Approval,
+  type Bot,
+  type EngineKind,
+  type Message,
+  type ProblemDetails,
+  type Run,
+  type RunAdmission,
+  type Session,
 } from "@der/domain";
 import { useChat, type UIMessage } from "@tanstack/ai-react";
+import * as z from "zod";
 import { ProblemAlert } from "@/components/problem-alert";
 import { createIdempotencyTracker } from "@/lib/idempotency";
 import type { OperatorApi } from "@/lib/operator-api";
@@ -341,6 +352,120 @@ function streamStatusLabel(status: RunStreamStatus): string {
   }
 }
 
+const executeArgs = z.object({ script: z.string() });
+const searchArgs = z.object({ query: z.string() });
+const searchResult = z.object({ hits: z.array(capabilitySearchHit), truncated: z.boolean() });
+
+function parseJson(text: string): unknown {
+  try {
+    return JSON.parse(text);
+  } catch {
+    return undefined;
+  }
+}
+
+interface ToolCallView {
+  readonly args: ReactNode;
+  readonly result: ReactNode;
+  readonly errorMessage: string | undefined;
+}
+
+function executeView(argsText: string, resultText: string | null): ToolCallView {
+  const script = executeArgs.safeParse(parseJson(argsText));
+  const outcome = executeResult.safeParse(resultText === null ? undefined : parseJson(resultText));
+  const args = (
+    <pre {...stylex.props(styles.toolArgsPre)}>
+      {script.success ? script.data.script : argsText}
+    </pre>
+  );
+  if (!outcome.success) {
+    return {
+      args,
+      result:
+        resultText === null ? null : (
+          <pre {...stylex.props(styles.toolResultPre)}>{resultText}</pre>
+        ),
+      errorMessage: undefined,
+    };
+  }
+  const value = outcome.data;
+  const logs =
+    value.logs.length > 0 ? (
+      <pre {...stylex.props(styles.toolArgsPre)}>{value.logs.join("\n")}</pre>
+    ) : null;
+  if (!value.ok) {
+    return {
+      args,
+      result: (
+        <>
+          <pre
+            {...stylex.props(styles.toolResultPre)}
+          >{`${value.error.kind}: ${value.error.message}`}</pre>
+          {logs}
+        </>
+      ),
+      errorMessage: `${value.error.kind}: ${value.error.message}`,
+    };
+  }
+  return {
+    args,
+    result: (
+      <>
+        <pre {...stylex.props(styles.toolResultPre)}>
+          {JSON.stringify(value.result, null, 2)}
+          {value.truncated ? "\nResult truncated" : ""}
+        </pre>
+        {logs}
+      </>
+    ),
+    errorMessage: undefined,
+  };
+}
+
+function searchView(argsText: string, resultText: string | null): ToolCallView {
+  const query = searchArgs.safeParse(parseJson(argsText));
+  const outcome = searchResult.safeParse(resultText === null ? undefined : parseJson(resultText));
+  const args = (
+    <pre {...stylex.props(styles.toolArgsPre)}>{query.success ? query.data.query : argsText}</pre>
+  );
+  if (!outcome.success) {
+    return {
+      args,
+      result:
+        resultText === null ? null : (
+          <pre {...stylex.props(styles.toolResultPre)}>{resultText}</pre>
+        ),
+      errorMessage: undefined,
+    };
+  }
+  const ids = outcome.data.hits.map((hit) => hit.id);
+  return {
+    args,
+    result: (
+      <pre {...stylex.props(styles.toolResultPre)}>
+        {ids.length > 0 ? ids.join("\n") : "No matching capabilities"}
+        {outcome.data.truncated ? "\nResults truncated" : ""}
+      </pre>
+    ),
+    errorMessage: undefined,
+  };
+}
+
+function genericView(argsText: string, resultText: string | null): ToolCallView {
+  return {
+    args: <pre {...stylex.props(styles.toolArgsPre)}>{argsText}</pre>,
+    result:
+      resultText === null ? null : <pre {...stylex.props(styles.toolResultPre)}>{resultText}</pre>,
+    errorMessage: undefined,
+  };
+}
+
+function toolCallView(name: string, argsText: string, resultText: string | null): ToolCallView {
+  if (name === "execute") return executeView(argsText, resultText);
+  if (name === "search") return searchView(argsText, resultText);
+  return genericView(argsText, resultText);
+}
+
 function extractToolCallItems(parts: UIMessage["parts"]): ChatToolCallItem[] {
   const resultsById = new Map<
     string,
@@ -361,25 +486,26 @@ function extractToolCallItems(parts: UIMessage["parts"]): ChatToolCallItem[] {
       if (result) {
         consumedResultIds.add(part.id);
       }
-      const isError = result?.state === "error";
-      const status = isError ? "error" : result ? "complete" : "running";
       const resultText = result
         ? typeof result.content === "string"
           ? result.content
           : JSON.stringify(result.content, null, 2)
         : null;
+      const view = toolCallView(part.name, part.arguments, resultText);
+      const errorMessage =
+        view.errorMessage ??
+        (result?.state === "error" ? "Tool returned an error outcome." : undefined);
+      const status = errorMessage !== undefined ? "error" : result ? "complete" : "running";
 
       items.push({
         key: part.id,
         name: part.name,
         status,
-        ...(isError ? { errorMessage: "Tool returned an error outcome." } : {}),
+        ...(errorMessage !== undefined ? { errorMessage } : {}),
         resultDetail: (
           <div {...stylex.props(styles.toolDetailBox)}>
-            <pre {...stylex.props(styles.toolArgsPre)}>{part.arguments}</pre>
-            {resultText !== null ? (
-              <pre {...stylex.props(styles.toolResultPre)}>{resultText}</pre>
-            ) : null}
+            {view.args}
+            {view.result}
           </div>
         ),
       });

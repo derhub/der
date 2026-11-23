@@ -89,16 +89,24 @@ function createFakeServerFetch() {
       });
     }
 
-    if (method === "GET" && url.pathname === "/api/tools") {
+    if (method === "GET" && url.pathname === "/api/capabilities") {
       return Response.json({
-        tools: [
+        capabilities: [
           {
-            kind: "fixture",
             id: "fixture.apply",
-            name: "Fixture Apply",
             description: "Applies one deterministic fixture effect.",
+            effect: "write",
             requiresApproval: true,
             inputSchema: { type: "object" },
+            outputSchema: { type: "object" },
+          },
+          {
+            id: "catalog.search",
+            description: "Find capabilities by query and return their declarations.",
+            effect: "read",
+            requiresApproval: false,
+            inputSchema: { type: "string" },
+            outputSchema: { type: "object" },
           },
         ],
       });
@@ -224,7 +232,7 @@ function createFakeServerFetch() {
             name: "approval.requested",
             value: {
               approvalId: "apr-1",
-              operationKind: "fixture",
+              operationKind: "capability",
               operationId: "fixture.apply",
               prompt: "Approve fixture.apply for lamp-1?",
               deadline: "2026-01-01T00:05:00.000Z",
@@ -260,7 +268,7 @@ function createFakeServerFetch() {
           runId: "run-1",
           effect: {
             runId: "run-1",
-            operationKind: "fixture",
+            operationKind: "capability",
             operationId: "fixture.apply",
             canonicalArguments: { target: "lamp-1", mode: "apply" },
             attemptId: "attempt-1",
@@ -299,7 +307,7 @@ function createFakeServerFetch() {
           runId: "run-1",
           effect: {
             runId: "run-1",
-            operationKind: "fixture",
+            operationKind: "capability",
             operationId: "fixture.apply",
             canonicalArguments: { target: "lamp-1", mode: "apply" },
             attemptId: "attempt-1",
@@ -537,14 +545,20 @@ describe("operate der through the Web operator console", () => {
 
     await user.click(screen.getByRole("tab", { name: "Readiness" }));
     await screen.findByText("Run `codex login` inside der-home-codex.");
-    expect(screen.getByText("Fixture Apply")).toBeTruthy();
+    const fixtureGroup = screen.getByRole("region", { name: "fixture" });
+    expect(within(fixtureGroup).getByText("fixture.apply")).toBeTruthy();
+    expect(within(fixtureGroup).getByText("Approval required")).toBeTruthy();
+    expect(within(fixtureGroup).getByText("write")).toBeTruthy();
+    const catalogGroup = screen.getByRole("region", { name: "catalog" });
+    expect(within(catalogGroup).getByText("catalog.search")).toBeTruthy();
+    expect(within(catalogGroup).getByText("No approval")).toBeTruthy();
 
     await user.click(screen.getByRole("tab", { name: "Skills" }));
     await screen.findByText(/Read sensor state before mutating\./);
     expect(screen.getByText("broken/SKILL.md")).toBeTruthy();
   });
 
-  it("renders tool call history in Astryx ChatToolCalls and creates sessions via Astryx Dialog", async () => {
+  it("renders execute and search call history in Astryx ChatToolCalls and creates sessions via Astryx Dialog", async () => {
     const user = userEvent.setup();
     const createdSessions: Array<Record<string, unknown>> = [];
     const base = createFakeServerFetch();
@@ -555,8 +569,8 @@ describe("operate der through the Web operator console", () => {
       const url = new URL(rawUrl, "http://127.0.0.1:5173");
       const method = init?.method ?? "GET";
 
-      if (method === "GET" && url.pathname === "/api/tools") {
-        return Response.json({ tools: [] });
+      if (method === "GET" && url.pathname === "/api/capabilities") {
+        return Response.json({ capabilities: [] });
       }
 
       if (method === "GET" && url.pathname === "/api/sessions/sess-fixture/messages") {
@@ -572,14 +586,40 @@ describe("operate der through the Web operator console", () => {
                 {
                   type: "tool-call",
                   toolCallId: "tc-1",
-                  toolName: "docker.execute",
-                  arguments: { cmd: "uname -a" },
+                  toolName: "search",
+                  arguments: { query: "append note" },
                 },
                 {
                   type: "tool-result",
                   toolCallId: "tc-1",
-                  toolName: "docker.execute",
-                  outcome: { stdout: "Linux" },
+                  toolName: "search",
+                  outcome: {
+                    hits: [
+                      {
+                        id: "notes.append",
+                        summary: "Append a line to a note.",
+                        declaration: "declare function append(input: string): Promise<void>;",
+                      },
+                    ],
+                    truncated: false,
+                  },
+                  isError: false,
+                },
+                {
+                  type: "tool-call",
+                  toolCallId: "tc-2",
+                  toolName: "execute",
+                  arguments: { script: 'return await der.notes.append("buy milk");' },
+                },
+                {
+                  type: "tool-result",
+                  toolCallId: "tc-2",
+                  toolName: "execute",
+                  outcome: {
+                    ok: false,
+                    error: { kind: "denied", message: "Operator denied notes.append." },
+                    logs: [],
+                  },
                   isError: false,
                 },
                 { type: "text", text: "Checked container kernel." },
@@ -617,7 +657,18 @@ describe("operate der through the Web operator console", () => {
     render(<App fetcher={fetcher} />);
 
     await screen.findByText("Checked container kernel.");
-    expect(screen.getByText("docker.execute")).toBeTruthy();
+    for (const label of [/execute2$/, /search$/, /execute$/]) {
+      const toggle = screen
+        .getAllByRole("button", { expanded: false })
+        .find((button) => label.test(button.textContent ?? ""));
+      if (toggle === undefined) throw new Error(`no collapsed toggle matches ${label}`);
+      await user.click(toggle);
+    }
+    expect(screen.getByText("append note")).toBeTruthy();
+    expect(screen.getByText("notes.append")).toBeTruthy();
+    expect(screen.getByText("execute")).toBeTruthy();
+    expect(screen.getByText('return await der.notes.append("buy milk");')).toBeTruthy();
+    expect(screen.getAllByText("denied: Operator denied notes.append.").length).toBeGreaterThan(0);
 
     await user.click(screen.getByRole("button", { name: "New session" }));
     const titleInput = await screen.findByLabelText(/^Title/);
@@ -630,9 +681,7 @@ describe("operate der through the Web operator console", () => {
     await screen.findByText("No messages in this session");
 
     await user.click(screen.getByRole("tab", { name: "Readiness" }));
-    await screen.findByText("No host tools registered");
-    expect(
-      screen.getByText("Configure MCP servers, Docker, or Wasmer tools on the server."),
-    ).toBeTruthy();
+    await screen.findByText("No capabilities registered");
+    expect(screen.getByText("Configure capability sources on the server.")).toBeTruthy();
   });
 });

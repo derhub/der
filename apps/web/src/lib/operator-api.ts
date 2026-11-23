@@ -5,6 +5,7 @@ import {
   type ApprovalId,
   type Bot,
   type BotId,
+  type CapabilityDescriptor,
   type CreateBotInput,
   type EngineKind,
   type EngineReadiness,
@@ -19,7 +20,6 @@ import {
   type Session,
   type SessionId,
   type SkillId,
-  type ToolDescriptor,
   type UpdateBotInput,
 } from "@der/domain";
 import {
@@ -27,6 +27,7 @@ import {
   botMemoryResponseSchema,
   botResponseSchema,
   botsResponseSchema,
+  capabilitiesResponseSchema,
   configureRoutineResponseSchema,
   enginesResponseSchema,
   healthResponseSchema,
@@ -41,7 +42,6 @@ import {
   sessionsResponseSchema,
   skillDetailResponseSchema,
   skillsCatalogResponseSchema,
-  toolsResponseSchema,
   writeMemoryResponseSchema,
   type BotMemoryResponse,
   type ConfigureRoutineResponse,
@@ -105,7 +105,7 @@ export interface UpdateRoutinePayload {
 export interface OperatorApi {
   getHealth(signal?: AbortSignal): Promise<HealthResponse>;
   listEngines(signal?: AbortSignal): Promise<EngineReadiness[]>;
-  listTools(signal?: AbortSignal): Promise<ToolDescriptor[]>;
+  listCapabilities(signal?: AbortSignal): Promise<CapabilityDescriptor[]>;
   listBots(signal?: AbortSignal): Promise<Bot[]>;
   createBot(input: CreateBotInput, signal?: AbortSignal): Promise<Bot>;
   updateBot(botId: BotId, input: UpdateBotInput, signal?: AbortSignal): Promise<Bot>;
@@ -231,9 +231,13 @@ export function createOperatorApi(options: OperatorApiOptions = {}): OperatorApi
       const data = await requestJson("/api/engines", enginesResponseSchema, signalOpt(signal));
       return data.engines;
     },
-    async listTools(signal) {
-      const data = await requestJson("/api/tools", toolsResponseSchema, signalOpt(signal));
-      return data.tools;
+    async listCapabilities(signal) {
+      const data = await requestJson(
+        "/api/capabilities",
+        capabilitiesResponseSchema,
+        signalOpt(signal),
+      );
+      return data.capabilities;
     },
     async listBots(signal) {
       const data = await requestJson("/api/bots", botsResponseSchema, signalOpt(signal));

@@ -2,6 +2,7 @@ import * as z from "zod";
 import {
   approval,
   bot,
+  capabilityDescriptor,
   engineReadiness,
   jsonValue,
   memoryRecord,
@@ -14,7 +15,6 @@ import {
   runAdmission,
   session,
   skill,
-  toolDescriptor,
   utcTimestamp,
   type ProblemDetails,
 } from "@der/domain";
@@ -29,8 +29,8 @@ export const enginesResponseSchema = z.object({
   engines: z.array(engineReadiness),
 });
 
-export const toolsResponseSchema = z.object({
-  tools: z.array(toolDescriptor),
+export const capabilitiesResponseSchema = z.object({
+  capabilities: z.array(capabilityDescriptor),
 });
 
 export const botsResponseSchema = z.object({
