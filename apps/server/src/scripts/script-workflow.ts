@@ -153,30 +153,35 @@ export function createScriptWorkflow(deps: ScriptExecutionDeps) {
         ): Promise<ExecuteResult> => {
           const driver = createRestateStepDriver(ctx, {
             wrapTerminalErrors: true,
+            plainErrors: true,
+          });
+          const boundedDriver = createRestateStepDriver(ctx, {
+            wrapTerminalErrors: true,
+            plainErrors: true,
             retry: STEP_RETRY,
           });
           const attemptEnded = ctx.request().attemptCompletedSignal;
           try {
             const result = await executeScriptRun(deps, driver, input.scriptRunId, {
               attemptEnded,
+              boundedDriver,
             });
             return result ?? cancelledResult();
           } catch (error) {
-            if (!(error instanceof restate.TerminalError) || attemptEnded.aborted) {
+            const engineSignal =
+              error instanceof restate.RestateError && !(error instanceof restate.TerminalError);
+            if (engineSignal || attemptEnded.aborted) {
               throw error;
             }
-            return ctx.run(
-              "script-fail",
-              async () => {
-                const row = await deps.scriptRuns.finish(
-                  input.scriptRunId,
-                  "failed",
-                  failedResult("capability", error.message),
-                );
-                return row.result ?? failedResult("capability", error.message);
-              },
-              STEP_RETRY,
-            );
+            const message = error instanceof Error ? error.message : String(error);
+            return driver.runStep("script-fail", async () => {
+              const row = await deps.scriptRuns.finish(
+                input.scriptRunId,
+                "failed",
+                failedResult("capability", message),
+              );
+              return row.result ?? failedResult("capability", message);
+            });
           }
         },
       ),

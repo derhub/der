@@ -129,10 +129,12 @@ export function createRestateStepDriver(
   options?: {
     readonly wrapTerminalErrors?: boolean;
     readonly retry?: Omit<restate.RunOptions<unknown>, "serde">;
+    readonly plainErrors?: boolean;
   },
 ): CoordinatorDriver {
   const wrapErrors = options?.wrapTerminalErrors ?? false;
   const retry = options?.retry;
+  const plainErrors = options?.plainErrors ?? false;
 
   return {
     runStep<T>(name: string, fn: () => Promise<T>): Promise<T> {
@@ -143,7 +145,7 @@ export function createRestateStepDriver(
           if (wrapErrors && error instanceof DomainError) {
             toRestateTerminalError(error);
           }
-          throw retry === undefined ? error : withStringStack(error);
+          throw plainErrors ? withStringStack(error) : error;
         }
       };
       return retry === undefined ? ctx.run(name, action) : ctx.run(name, action, retry);

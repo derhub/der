@@ -345,3 +345,119 @@ describe("run a call whose approval rule fails", () => {
     expect(server.store.getLatestApprovalForRun(owner.run.id)).toBeUndefined();
   }, 60_000);
 });
+
+function ledgerCapability(applied: string[]): Capability {
+  return defineCapability({
+    id: "ledger.post",
+    description: "Post an entry",
+    input: z.object({ text: z.string() }),
+    output: z.object({ posted: z.boolean() }),
+    effect: "write",
+    approval: "none",
+    async execute(input) {
+      applied.push(input.text);
+      return { posted: true };
+    },
+  }) as unknown as Capability;
+}
+
+const RETRY_THE_WRITE = `
+  const seen = [];
+  for (let i = 0; i < 2; i++) {
+    try { await der.ledger.post({ text: "entry" }); seen.push("ok"); } catch (e) { seen.push("caught"); }
+  }
+  return seen;
+`;
+
+describe("keep a write at most once when the store fails around it", () => {
+  it("store fault: a write whose completion cannot be recorded ends the script run interrupted with the effect unknown", async () => {
+    const { server, host } = await startDirectServer();
+    const applied: string[] = [];
+    host.catalog.add(ledgerCapability(applied));
+    const owner = await admitOwningRun(server, "store-fault-completion");
+    server.store.database.db.run(
+      "CREATE TRIGGER refuse_completion BEFORE UPDATE ON effects WHEN NEW.status = 'completed' BEGIN SELECT RAISE(ABORT, 'disk full'); END",
+    );
+    const scriptRun = await submitScript(server, owner, RETRY_THE_WRITE);
+
+    const result = await server.scriptRuns!.attach(scriptRun.id, AbortSignal.timeout(30_000));
+
+    expect(result).toEqual({
+      ok: false,
+      error: { kind: "capability", message: expect.stringContaining("disk full") },
+      logs: [],
+    });
+    expect(applied).toEqual(["entry"]);
+    expect(server.scriptRunStore.get(scriptRun.id)?.status).toBe("interrupted");
+    expect(server.store.getRun(owner.run.id)?.status).toBe("interrupted");
+    expect(
+      server.store.getEffect({
+        runId: owner.run.id,
+        operationKind: "capability",
+        operationId: "ledger.post",
+        canonicalArguments: { text: "entry" },
+        attemptId: `${scriptRun.id}:1`,
+      })?.status,
+    ).toBe("unknown");
+  }, 60_000);
+
+  it("store fault: a store that refuses every effect update never lets the script write twice", async () => {
+    const { server, host } = await startDirectServer();
+    const applied: string[] = [];
+    host.catalog.add(ledgerCapability(applied));
+    const owner = await admitOwningRun(server, "store-fault-refuse-all");
+    server.store.database.db.run(
+      "CREATE TRIGGER refuse_updates BEFORE UPDATE ON effects BEGIN SELECT RAISE(ABORT, 'disk full'); END",
+    );
+    const scriptRun = await submitScript(server, owner, RETRY_THE_WRITE);
+
+    const result = await server.scriptRuns!.attach(scriptRun.id, AbortSignal.timeout(30_000));
+
+    expect(result).toMatchObject({ ok: false });
+    expect(applied).toEqual(["entry"]);
+    expect(server.scriptRunStore.get(scriptRun.id)?.status).not.toBe("completed");
+  }, 60_000);
+
+  it("store fault: a later run of the same script after an interrupted one does not call the capability again", async () => {
+    const { server, host } = await startDirectServer();
+    const applied: string[] = [];
+    host.catalog.add(ledgerCapability(applied));
+    const owner = await admitOwningRun(server, "store-fault-rerun");
+    server.store.database.db.run(
+      "CREATE TRIGGER refuse_completion BEFORE UPDATE ON effects WHEN NEW.status = 'completed' BEGIN SELECT RAISE(ABORT, 'disk full'); END",
+    );
+    const first = await submitScript(server, owner, RETRY_THE_WRITE);
+    await server.scriptRuns!.attach(first.id, AbortSignal.timeout(30_000));
+    await server.scriptRunStore.markDelivered(first.id);
+
+    const second = await submitScript(server, owner, RETRY_THE_WRITE);
+    const result = await server.scriptRuns!.attach(second.id, AbortSignal.timeout(30_000));
+
+    expect(second.id).not.toBe(first.id);
+    expect(result).toMatchObject({ ok: false });
+    expect(applied).toEqual(["entry"]);
+  }, 60_000);
+});
+
+describe("end a script on a host failure instead of telling the script", () => {
+  it("not catchable: a host step that fails inside a call ends the script before its catch block calls again", async () => {
+    const { server, host } = await startDirectServer();
+    const applied: string[] = [];
+    host.catalog.add(ledgerCapability(applied));
+    const owner = await admitOwningRun(server, "not-catchable");
+    server.store.database.db.run(
+      "CREATE TRIGGER refuse_running BEFORE UPDATE ON script_runs WHEN NEW.status = 'running' BEGIN SELECT RAISE(ABORT, 'disk full'); END",
+    );
+    const scriptRun = await submitScript(
+      server,
+      owner,
+      `try { await der.ledger.post({ text: "entry" }); } catch (e) { await der.notes.read({ key: "after-catch" }); } return 1;`,
+    );
+
+    const result = await server.scriptRuns!.attach(scriptRun.id, AbortSignal.timeout(30_000));
+
+    expect(result).toMatchObject({ ok: false });
+    expect(host.reads).toEqual([]);
+    expect(applied).toEqual([]);
+  }, 60_000);
+});

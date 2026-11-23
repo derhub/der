@@ -574,6 +574,75 @@ describe("run a script", () => {
     }, 60_000);
   });
 
+  describe("host failure inside a call", () => {
+    const catchThenRead = `try { await der.a.b({}); } catch (e) { await der.after.catch({}); } return 1;`;
+
+    it("halts the script without a reply when the host asks to halt", async () => {
+      const calledIds: string[] = [];
+
+      const result = await runScript({
+        script: catchThenRead,
+        call: async (id) => {
+          calledIds.push(id);
+          return { halt: true };
+        },
+        limits: roomyLimits,
+        seed: 1,
+        now: START,
+      });
+
+      expect(result).toEqual({
+        ok: false,
+        error: { kind: "cancelled", message: "script halted by the host" },
+        logs: [],
+      });
+      expect(calledIds).toEqual(["a.b"]);
+    }, 60_000);
+
+    it("halts the script and rethrows when the host call throws", async () => {
+      const calledIds: string[] = [];
+
+      const failure = await runScript({
+        script: catchThenRead,
+        call: async (id) => {
+          calledIds.push(id);
+          throw new Error("store unavailable");
+        },
+        limits: roomyLimits,
+        seed: 1,
+        now: START,
+      }).catch((error: unknown) => error);
+
+      expect((failure as Error).message).toBe("store unavailable");
+      expect(calledIds).toEqual(["a.b"]);
+    }, 60_000);
+  });
+
+  describe("reported line", () => {
+    it.each([
+      ["a line beyond the safe integer range", "<input>:99999999999999999999:1"],
+      ["a line of zero", "<input>:0:1"],
+    ])(
+      "drops %s from a thrown value",
+      async (_name, stack) => {
+        const result = await runScript({
+          script: `throw { stack: "${stack}" };`,
+          call: noCalls,
+          limits: roomyLimits,
+          seed: 1,
+          now: START,
+        });
+
+        expect(result).toEqual({
+          ok: false,
+          error: { kind: "script", message: "[object Object]" },
+          logs: [],
+        });
+      },
+      60_000,
+    );
+  });
+
   describe("other limits", () => {
     it("ends a script that exceeds the call count as a limit error", async () => {
       const host = recordingHost([

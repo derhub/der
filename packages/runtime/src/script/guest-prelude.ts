@@ -1,8 +1,10 @@
 export const GUEST_PRELUDE = String.raw`(function (log, call, done, seed, now, source) {
   const AsyncFunction = Object.getPrototypeOf(async function () {}).constructor;
+  const ProxyConstructor = Proxy;
   const stringify = JSON.stringify;
   const parse = JSON.parse;
-  const bareObject = () => Object.create(null);
+  const create = Object.create;
+  const bareObject = () => create(null);
   const hostErrorOrdinals = new WeakMap();
   const ordinalOf = hostErrorOrdinals.get.bind(hostErrorOrdinals);
   const recordOrdinal = hostErrorOrdinals.set.bind(hostErrorOrdinals);
@@ -72,7 +74,7 @@ export const GUEST_PRELUDE = String.raw`(function (log, call, done, seed, now, s
   }
 
   function namespace(path) {
-    return new Proxy(function () {}, {
+    return new ProxyConstructor(function () {}, {
       get(_target, key) {
         return typeof key === "string" && key !== "then" ? namespace([...path, key]) : undefined;
       },

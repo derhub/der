@@ -526,3 +526,59 @@ describe("end a script run that hits an unexpected failure under Restate", () =>
     expect(server.scriptRunStore.get(scriptRun.id)?.status).toBe("failed");
   }, 120_000);
 });
+
+describe("keep a write at most once when the store fails around it under Restate", () => {
+  it("store fault: a write the store cannot record is not repeated and ends the script run interrupted once the store recovers", async () => {
+    const { server, host, owner } = await startOwned("restate-store-fault");
+    const applied: string[] = [];
+    host.catalog.add(
+      defineCapability({
+        id: "ledger.post",
+        description: "Post an entry",
+        input: z.object({ text: z.string() }),
+        output: z.object({ posted: z.boolean() }),
+        effect: "write",
+        approval: "none",
+        async execute(input) {
+          applied.push(input.text);
+          return { posted: true };
+        },
+      }) as unknown as Capability,
+    );
+    server.store.database.db.run(
+      "CREATE TRIGGER refuse_updates BEFORE UPDATE ON effects BEGIN SELECT RAISE(ABORT, 'disk full'); END",
+    );
+    const scriptRun = await submitScript(
+      server,
+      owner,
+      `
+        const seen = [];
+        for (let i = 0; i < 2; i++) {
+          try { await der.ledger.post({ text: "entry" }); seen.push("ok"); } catch (e) { seen.push("caught"); }
+        }
+        return seen;
+      `,
+    );
+    await waitUntil(async () => applied.length >= 1, { timeoutMs: 30_000, label: "first write" });
+    await Bun.sleep(4_000);
+
+    expect(applied).toEqual(["entry"]);
+    expect(server.scriptRunStore.get(scriptRun.id)?.status).toBe("running");
+    server.store.database.db.run("DROP TRIGGER refuse_updates");
+    const result = await server.scriptRuns!.attach(scriptRun.id, AbortSignal.timeout(60_000));
+
+    expect(result).toMatchObject({ ok: false, error: { kind: "capability" } });
+    expect(applied).toEqual(["entry"]);
+    expect(server.scriptRunStore.get(scriptRun.id)?.status).toBe("interrupted");
+    expect(server.store.getRun(owner.run.id)?.status).toBe("interrupted");
+    expect(
+      server.store.getEffect({
+        runId: owner.run.id,
+        operationKind: "capability",
+        operationId: "ledger.post",
+        canonicalArguments: { text: "entry" },
+        attemptId: `${scriptRun.id}:1`,
+      })?.status,
+    ).toBe("unknown");
+  }, 180_000);
+});

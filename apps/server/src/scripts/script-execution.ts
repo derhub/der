@@ -1,5 +1,6 @@
 import {
   DomainError,
+  executeResult,
   type CapabilityDescriptor,
   type Catalog,
   type EffectId,
@@ -11,6 +12,7 @@ import {
 } from "@der/domain";
 import {
   runScript,
+  type ScriptCallHalt,
   type ScriptCallReply,
   type ScriptLimits,
   type ScriptResult,
@@ -31,6 +33,7 @@ export interface ScriptExecutionDeps {
 export interface ScriptExecutionSignals {
   readonly cancel?: AbortSignal;
   readonly attemptEnded?: AbortSignal;
+  readonly boundedDriver?: CoordinatorDriver;
 }
 
 interface ScriptStart {
@@ -51,6 +54,7 @@ interface Halt {
   readonly call: string;
 }
 
+const HALT_SCRIPT: ScriptCallHalt = { halt: true };
 const PROMPT_INPUT_CHARS = 400;
 const INPUT_DIGEST_CHARS = 8;
 
@@ -100,8 +104,13 @@ export async function executeScriptRun(
   let ordinal = 0;
   let halt: Halt | undefined;
   let interrupted: { readonly effectId: EffectId; readonly detail: string } | undefined;
+  let hostFailure:
+    | { readonly error: unknown; readonly effect: EffectIdentity | undefined }
+    | undefined;
+  let writeInFlight: EffectIdentity | undefined;
+  const bounded = signals.boundedDriver ?? driver;
 
-  const start = await driver.runStep("script-start", async (): Promise<ScriptStart> => {
+  const start = await bounded.runStep("script-start", async (): Promise<ScriptStart> => {
     const scriptRun = deps.scriptRuns.get(scriptRunId);
     if (!scriptRun) {
       throw new DomainError({
@@ -129,6 +138,9 @@ export async function executeScriptRun(
     return finish(failure("capability", "owning Run no longer exists"));
   }
   const run: Run = start.run;
+  if (run.status === "interrupted" || run.status === "failed" || run.status === "cancelled") {
+    return finish(failure("capability", `owning Run ${run.id} has ended as ${run.status}`));
+  }
 
   const descriptors = new Map<string, CapabilityDescriptor>(
     deps.catalog.list().map((descriptor) => [descriptor.id, descriptor]),
@@ -147,7 +159,7 @@ export async function executeScriptRun(
     });
 
   const readStep = (name: string, id: string, input: JsonValue): Promise<CallStepResult> =>
-    driver.runStep(name, async (): Promise<CallStepResult> => {
+    bounded.runStep(name, async (): Promise<CallStepResult> => {
       if (isCancelled()) {
         return {
           kind: "reply",
@@ -262,7 +274,10 @@ export async function executeScriptRun(
     return { reply: { ok: false, error: { kind, message }, now: nowMs() } };
   };
 
-  const call = async (id: string, input: JsonValue): Promise<ScriptCallReply> => {
+  const serveCall = async (
+    id: string,
+    input: JsonValue,
+  ): Promise<ScriptCallReply | ScriptCallHalt> => {
     ordinal += 1;
     if (halt !== undefined) {
       return { ok: false, error: { kind: "cancelled", message: halt.message } };
@@ -279,7 +294,7 @@ export async function executeScriptRun(
         attemptId: `${scriptRunId}:${ordinal}`,
       };
       let approvalId: string | undefined;
-      const rule = await driver.runStep(
+      const rule = await bounded.runStep(
         `${name}:needs-approval`,
         async (): Promise<
           { readonly needsApproval: boolean } | { readonly failure: string; readonly now: number }
@@ -305,16 +320,27 @@ export async function executeScriptRun(
         }
         approvalId = asked.approvalId;
       }
+      writeInFlight = effect;
       step = await writeStep(name, id, input, effect, approvalId);
+      writeInFlight = undefined;
     } else {
       step = await readStep(name, id, input);
     }
     if (step.kind === "interrupted") {
       interrupted = { effectId: step.effectId, detail: step.detail };
       halt = { kind: "cancelled", message: step.detail, call: id };
-      return { ok: false, error: { kind: "cancelled", message: step.detail } };
+      return HALT_SCRIPT;
     }
     return step.reply;
+  };
+
+  const call = async (id: string, input: JsonValue): Promise<ScriptCallReply | ScriptCallHalt> => {
+    try {
+      return await serveCall(id, input);
+    } catch (error) {
+      hostFailure ??= { error, effect: writeInFlight };
+      return HALT_SCRIPT;
+    }
   };
 
   const result = await runScript({
@@ -328,13 +354,33 @@ export async function executeScriptRun(
   if (signals.attemptEnded?.aborted) {
     return undefined;
   }
+  if (hostFailure !== undefined) {
+    await recordInDoubtWrite(hostFailure.effect);
+    if (interrupted === undefined) {
+      throw hostFailure.error;
+    }
+  }
 
   return finish(await settle(result));
+
+  async function recordInDoubtWrite(effect: EffectIdentity | undefined): Promise<void> {
+    const recorded = effect === undefined ? undefined : await deps.store.getEffect(effect);
+    if (
+      recorded !== undefined &&
+      (recorded.status === "started" || recorded.status === "unknown")
+    ) {
+      interrupted = {
+        effectId: recorded.id,
+        detail: `Effect capability:${recorded.identity.operationId} (${recorded.identity.attemptId}) could not be recorded after the host failed: ${errorMessage(hostFailure?.error)}`,
+      };
+    }
+  }
 
   async function settle(scripted: ScriptResult): Promise<ExecuteResult> {
     if (interrupted !== undefined) {
       const detail = interrupted;
       await driver.runStep("script-interrupt-run", async () => {
+        await deps.store.markEffectUnknown(detail.effectId);
         await finalizeInterruptedUncertainStep(
           deps.now ? { store: deps.store, now: deps.now } : { store: deps.store },
           { run, effectId: detail.effectId, detail: detail.detail },
@@ -352,8 +398,11 @@ export async function executeScriptRun(
     return scripted;
   }
 
-  async function finish(outcome: ExecuteResult): Promise<ExecuteResult> {
-    const settled = await driver.runStep("script-finish", async () => {
+  async function finish(computed: ExecuteResult): Promise<ExecuteResult> {
+    const outcome = executeResult.safeParse(computed).success
+      ? computed
+      : failure("script", "script produced a result the host cannot store");
+    const settled = await bounded.runStep("script-finish", async () => {
       const row = await deps.scriptRuns.finish(
         scriptRunId,
         interrupted !== undefined ? "interrupted" : terminalStatusOf(outcome),

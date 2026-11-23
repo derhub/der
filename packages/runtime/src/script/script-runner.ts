@@ -52,9 +52,13 @@ export type ScriptResult =
       readonly logs: string[];
     };
 
+export interface ScriptCallHalt {
+  readonly halt: true;
+}
+
 export interface RunScriptOptions {
   readonly script: string;
-  readonly call: (id: string, input: JsonValue) => Promise<ScriptCallReply>;
+  readonly call: (id: string, input: JsonValue) => Promise<ScriptCallReply | ScriptCallHalt>;
   readonly limits: ScriptLimits;
   readonly seed: number;
   readonly now: number;
@@ -72,6 +76,7 @@ export class ScriptRunnerError extends Error {
 }
 
 const WORKER_URL = new URL("./script-worker.ts", import.meta.url);
+const HALTED_MESSAGE = "script halted by the host";
 const STALL_GRACE_MS = 2_000;
 const STALL_POLL_MS = 50;
 const STOP_REQUESTED = 1;
@@ -121,7 +126,7 @@ export async function runScript(options: RunScriptOptions): Promise<ScriptResult
   const stop = new SharedArrayBuffer(4);
   const worker = new Worker(WORKER_URL, { env: {} });
 
-  const outcome: { verdict?: ScriptResult; fatal?: ScriptRunnerError } = {};
+  const outcome: { verdict?: ScriptResult; fatal?: ScriptRunnerError; hostError?: unknown } = {};
   let resolveVerdict: () => void = () => {};
   const verdictSettled = new Promise<void>((resolve) => {
     resolveVerdict = resolve;
@@ -171,17 +176,17 @@ export async function runScript(options: RunScriptOptions): Promise<ScriptResult
       fail("limit", `call limit of ${limits.maxCalls} exceeded`);
       return;
     }
-    let reply: ScriptCallReply;
+    let reply: ScriptCallReply | ScriptCallHalt;
     try {
       reply = await options.call(message.id, message.input as JsonValue);
     } catch (error) {
-      reply = {
-        ok: false,
-        error: {
-          kind: "capability",
-          message: error instanceof Error ? error.message : String(error),
-        },
-      };
+      outcome.hostError = error;
+      fail("cancelled", HALTED_MESSAGE);
+      return;
+    }
+    if ("halt" in reply) {
+      fail("cancelled", HALTED_MESSAGE);
+      return;
     }
     if (outcome.verdict !== undefined) {
       return;
@@ -240,7 +245,9 @@ export async function runScript(options: RunScriptOptions): Promise<ScriptResult
       kind: "script",
       message:
         typeof error.message === "string" ? error.message : "script failed with an invalid error",
-      ...(Number.isInteger(error.line) ? { line: error.line as number } : {}),
+      ...(Number.isSafeInteger(error.line) && (error.line as number) > 0
+        ? { line: error.line as number }
+        : {}),
     };
   };
 
@@ -295,6 +302,9 @@ export async function runScript(options: RunScriptOptions): Promise<ScriptResult
   }
   if (outcome.fatal !== undefined) {
     throw outcome.fatal;
+  }
+  if (outcome.hostError !== undefined) {
+    throw outcome.hostError;
   }
   return outcome.verdict as ScriptResult;
 }
