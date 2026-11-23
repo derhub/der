@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it } from "bun:test";
 import * as z from "zod";
 import { defineCapability, formatUtcTimestamp, type Capability } from "@der/domain";
+import { ScriptRunBusyError } from "@der/storage";
 import { startServer, type RunningServer } from "#main";
 import { createTempDatabase, waitUntil } from "./fixtures/restate-harness";
 import {
@@ -18,7 +19,13 @@ afterEach(async () => {
   }
 });
 
-async function startDirectServer(options: { readonly scriptMaxCalls?: number } = {}) {
+async function startDirectServer(
+  options: {
+    readonly scriptMaxCalls?: number;
+    readonly scriptOutputBytes?: number;
+    readonly scriptActiveMs?: number;
+  } = {},
+) {
   const tempDb = createTempDatabase("der-script-");
   const host: NoteHost = createNoteHost();
   const server: RunningServer = await startServer({
@@ -34,6 +41,10 @@ async function startDirectServer(options: { readonly scriptMaxCalls?: number } =
       approvalTimeoutMs: 30_000,
       seedFixture: true,
       ...(options.scriptMaxCalls === undefined ? {} : { scriptMaxCalls: options.scriptMaxCalls }),
+      ...(options.scriptOutputBytes === undefined
+        ? {}
+        : { scriptOutputBytes: options.scriptOutputBytes }),
+      ...(options.scriptActiveMs === undefined ? {} : { scriptActiveMs: options.scriptActiveMs }),
     },
     catalog: host.catalog,
   });
@@ -433,7 +444,7 @@ describe("end a script on a host failure instead of telling the script", () => {
 });
 
 describe("refuse to start a script run while a write in the run is in doubt", () => {
-  it("in doubt: a second script run after a store fault calls no capability and says why", async () => {
+  it("in doubt: a second script run after a store fault interrupts the run and calls no capability", async () => {
     const { server, host } = await startDirectServer();
     const applied: string[] = [];
     host.catalog.add(ledgerCapability(applied));
@@ -454,20 +465,66 @@ describe("refuse to start a script run while a write in the run is in doubt", ()
       ok: false,
       error: {
         kind: "capability",
-        message: `A previous write in this Run, capability:ledger.post (${first.id}:1), has an unknown outcome, so no Script can run in this Run until an operator resolves it.`,
+        message: `The outcome of a previous write in this Run (capability:ledger.post, ${first.id}:1) is unknown, so the Run was interrupted.`,
       },
       logs: [],
     });
     expect(applied).toEqual(["entry"]);
+    expect(server.scriptRunStore.get(second.id)?.status).toBe("interrupted");
+    expect(server.store.getRun(owner.run.id)?.status).toBe("interrupted");
+    expect(
+      server.store
+        .readRunEventsAfter(owner.run.id, 0)
+        .map((event) => event.chunk as { type: string; code?: string })
+        .some((chunk) => chunk.type === "RUN_ERROR" && chunk.code === "effect.outcome_uncertain"),
+    ).toBe(true);
   }, 60_000);
 
-  it("concurrent: a script run starts normally while another script run in the same run has a write started and running", async () => {
+  it("in doubt: a finished run accepts no further script run and calls no capability", async () => {
+    const { server, host } = await startDirectServer();
+    const applied: string[] = [];
+    host.catalog.add(ledgerCapability(applied));
+    const owner = await admitOwningRun(server, "in-doubt-finished");
+    const doubtful = await server.store.beginEffect({
+      runId: owner.run.id,
+      operationKind: "capability",
+      operationId: "ledger.post",
+      canonicalArguments: { text: "entry" },
+      attemptId: "seed:1",
+    });
+    await server.store.markEffectUnknown(doubtful.effect.id);
+    const first = await submitScript(server, owner, `return 1;`);
+    await server.scriptRuns!.attach(first.id, AbortSignal.timeout(30_000));
+    await server.scriptRunStore.markDelivered(first.id);
+
+    const later = await submitScript(
+      server,
+      owner,
+      `await der.ledger.post({ text: "again" }); return 2;`,
+    );
+    const result = await server.scriptRuns!.attach(later.id, AbortSignal.timeout(30_000));
+
+    expect(result).toEqual({
+      ok: false,
+      error: {
+        kind: "capability",
+        message: `owning Run ${owner.run.id} has ended as interrupted`,
+      },
+      logs: [],
+    });
+    expect(applied).toEqual([]);
+  }, 60_000);
+});
+
+describe("run one script at a time in a run", () => {
+  it("one at a time: a different script sent while another is running is refused and calls no capability", async () => {
     const { server, host } = await startDirectServer();
     let release: () => void = () => {};
     const gate = new Promise<void>((resolve) => {
       release = resolve;
     });
     const started: string[] = [];
+    const applied: string[] = [];
     host.catalog.add(
       defineCapability({
         id: "ledger.post",
@@ -479,11 +536,12 @@ describe("refuse to start a script run while a write in the run is in doubt", ()
         async execute(input) {
           started.push(input.text);
           await gate;
+          applied.push(input.text);
           return { posted: true };
         },
       }) as unknown as Capability,
     );
-    const owner = await admitOwningRun(server, "concurrent-scripts");
+    const owner = await admitOwningRun(server, "one-at-a-time");
     const writing = await submitScript(
       server,
       owner,
@@ -494,23 +552,17 @@ describe("refuse to start a script run while a write in the run is in doubt", ()
       label: "write started",
     });
 
-    const reading = await submitScript(server, owner, `return await der.notes.read({ key: "a" });`);
-    const readResult = await server.scriptRuns!.attach(reading.id, AbortSignal.timeout(30_000));
+    const refused = await submitScript(
+      server,
+      owner,
+      `return await der.ledger.post({ text: "entry" });\n// different`,
+    ).catch((error: unknown) => error);
     release();
     const writeResult = await server.scriptRuns!.attach(writing.id, AbortSignal.timeout(30_000));
 
-    expect(readResult).toEqual({
-      ok: true,
-      result: { value: "value-a" },
-      logs: [],
-      truncated: false,
-    });
-    expect(writeResult).toEqual({
-      ok: true,
-      result: { posted: true },
-      logs: [],
-      truncated: false,
-    });
+    expect(refused).toBeInstanceOf(ScriptRunBusyError);
+    expect(writeResult).toEqual({ ok: true, result: { posted: true }, logs: [], truncated: false });
+    expect(applied).toEqual(["entry"]);
   }, 60_000);
 });
 
@@ -621,5 +673,239 @@ describe("report a result the store cannot hold", () => {
       error: { kind: "script", message: "script produced a result the host cannot store" },
       logs: [],
     });
+  }, 60_000);
+});
+
+function gateCapability(): {
+  readonly capability: Capability;
+  readonly reached: Promise<void>;
+  readonly release: () => void;
+} {
+  let release: () => void = () => {};
+  const gate = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  let markReached: () => void = () => {};
+  const reached = new Promise<void>((resolve) => {
+    markReached = resolve;
+  });
+  const capability = defineCapability({
+    id: "gate.wait",
+    description: "Wait for the test",
+    input: z.object({}),
+    output: z.object({ open: z.boolean() }),
+    effect: "read",
+    approval: "none",
+    async execute() {
+      markReached();
+      await gate;
+      return { open: true };
+    },
+  }) as unknown as Capability;
+  return { capability, reached, release };
+}
+
+const WAIT_THEN_WRITE = `await der.gate.wait({}); await der.ledger.post({ text: "entry" }); return 1;`;
+
+describe("refuse a write when the run changed under a running script", () => {
+  it("refuses: a write reached while the run has a write in doubt calls no capability and begins no effect", async () => {
+    const { server, host } = await startDirectServer();
+    const applied: string[] = [];
+    host.catalog.add(ledgerCapability(applied));
+    const gate = gateCapability();
+    host.catalog.add(gate.capability);
+    const owner = await admitOwningRun(server, "refuses-doubt");
+    const scriptRun = await submitScript(server, owner, WAIT_THEN_WRITE);
+    await gate.reached;
+    const seeded = await server.store.beginEffect({
+      runId: owner.run.id,
+      operationKind: "capability",
+      operationId: "ledger.post",
+      canonicalArguments: { text: "seeded" },
+      attemptId: "seed:1",
+    });
+    await server.store.markEffectUnknown(seeded.effect.id);
+    gate.release();
+
+    const result = await server.scriptRuns!.attach(scriptRun.id, AbortSignal.timeout(30_000));
+
+    expect(result).toEqual({
+      ok: false,
+      error: {
+        kind: "capability",
+        message:
+          "The outcome of a previous write in this Run (capability:ledger.post, seed:1) is unknown, so the Run was interrupted.",
+      },
+      logs: [],
+    });
+    expect(applied).toEqual([]);
+    expect(server.store.database.db.query("SELECT attempt_id FROM effects").all()).toEqual([
+      { attempt_id: "seed:1" },
+    ]);
+    expect(server.store.getRun(owner.run.id)?.status).toBe("interrupted");
+    expect(server.scriptRunStore.get(scriptRun.id)?.status).toBe("interrupted");
+  }, 60_000);
+
+  it("refuses: a write reached after the run ended calls no capability and begins no effect", async () => {
+    const { server, host } = await startDirectServer();
+    const applied: string[] = [];
+    host.catalog.add(ledgerCapability(applied));
+    const gate = gateCapability();
+    host.catalog.add(gate.capability);
+    const owner = await admitOwningRun(server, "refuses-ended");
+    const scriptRun = await submitScript(server, owner, WAIT_THEN_WRITE);
+    await gate.reached;
+    await server.store.finishRun({
+      runId: owner.run.id,
+      status: "cancelled",
+      terminalEvent: {
+        chunkKey: `${owner.run.id}:terminal`,
+        chunk: {
+          type: "RUN_ERROR",
+          message: "stopped",
+          code: "run.cancelled",
+          runId: owner.run.id,
+          threadId: owner.sessionId,
+        },
+      },
+    });
+    gate.release();
+
+    const result = await server.scriptRuns!.attach(scriptRun.id, AbortSignal.timeout(30_000));
+
+    expect(result).toEqual({
+      ok: false,
+      error: { kind: "capability", message: `owning Run ${owner.run.id} has ended as cancelled` },
+      logs: [],
+    });
+    expect(applied).toEqual([]);
+    expect(server.store.database.db.query("SELECT attempt_id FROM effects").all()).toEqual([]);
+  }, 60_000);
+});
+
+describe("let a write finish before the script run settles", () => {
+  it("outlives: a write in flight when the script hits its time limit is recorded before the script run ends", async () => {
+    const { server, host } = await startDirectServer({ scriptActiveMs: 400 });
+    const applied: string[] = [];
+    host.catalog.add(
+      defineCapability({
+        id: "ledger.post",
+        description: "Post an entry",
+        input: z.object({ text: z.string() }),
+        output: z.object({ posted: z.boolean() }),
+        effect: "write",
+        approval: "none",
+        async execute(input) {
+          await Bun.sleep(500);
+          applied.push(input.text);
+          throw new Error("socket reset after send");
+        },
+      }) as unknown as Capability,
+    );
+    const owner = await admitOwningRun(server, "outlives-limit");
+    const scriptRun = await submitScript(
+      server,
+      owner,
+      `der.ledger.post({ text: "entry" }); for (;;) {}`,
+    );
+
+    const result = await server.scriptRuns!.attach(scriptRun.id, AbortSignal.timeout(30_000));
+
+    expect(result).toMatchObject({ ok: false, error: { kind: "capability" } });
+    expect(applied).toEqual(["entry"]);
+    expect(
+      server.store.getEffect({
+        runId: owner.run.id,
+        operationKind: "capability",
+        operationId: "ledger.post",
+        canonicalArguments: { text: "entry" },
+        attemptId: `${scriptRun.id}:1`,
+      })?.status,
+    ).toBe("unknown");
+    expect(server.scriptRunStore.get(scriptRun.id)?.status).toBe("interrupted");
+    expect(server.store.getRun(owner.run.id)?.status).toBe("interrupted");
+  }, 60_000);
+});
+
+describe("cancel a script run whose write is in flight", () => {
+  it("cancel: the script run is not terminal until its write is recorded, and a later script is not refused", async () => {
+    const { server, host } = await startDirectServer();
+    const applied: string[] = [];
+    host.catalog.add(
+      defineCapability({
+        id: "ledger.post",
+        description: "Post an entry",
+        input: z.object({ text: z.string() }),
+        output: z.object({ posted: z.boolean() }),
+        effect: "write",
+        approval: "none",
+        async execute(input) {
+          await Bun.sleep(800);
+          applied.push(input.text);
+          return { posted: true };
+        },
+      }) as unknown as Capability,
+    );
+    const owner = await admitOwningRun(server, "cancel-in-flight");
+    const writing = await submitScript(
+      server,
+      owner,
+      `return await der.ledger.post({ text: "entry" });`,
+    );
+    await waitUntil(
+      async () =>
+        server.scriptRunStore.get(writing.id)?.status === "running" &&
+        server.store.database.db.query("SELECT 1 FROM effects").all().length === 1,
+      { timeoutMs: 10_000, label: "write started" },
+    );
+
+    await server.scriptRuns!.cancel(writing.id);
+
+    const effect = server.store.getEffect({
+      runId: owner.run.id,
+      operationKind: "capability",
+      operationId: "ledger.post",
+      canonicalArguments: { text: "entry" },
+      attemptId: `${writing.id}:1`,
+    });
+    expect(effect?.status).toBe("completed");
+    expect(server.scriptRunStore.get(writing.id)?.status).toBe("cancelled");
+    await server.scriptRunStore.markDelivered(writing.id);
+    const later = await submitScript(server, owner, `return 2;`);
+    expect(await server.scriptRuns!.attach(later.id, AbortSignal.timeout(30_000))).toEqual({
+      ok: true,
+      result: 2,
+      logs: [],
+      truncated: false,
+    });
+  }, 60_000);
+
+  it("cancel: a write that never returns is abandoned after the grace and the script run ends cancelled", async () => {
+    const { server, host } = await startDirectServer();
+    host.catalog.add(
+      defineCapability({
+        id: "ledger.post",
+        description: "Post an entry",
+        input: z.object({ text: z.string() }),
+        output: z.object({ posted: z.boolean() }),
+        effect: "write",
+        approval: "none",
+        execute: () => new Promise<{ posted: boolean }>(() => {}),
+      }) as unknown as Capability,
+    );
+    const owner = await admitOwningRun(server, "cancel-never-returns");
+    const writing = await submitScript(
+      server,
+      owner,
+      `return await der.ledger.post({ text: "entry" });`,
+    );
+    await waitUntil(
+      async () => server.store.database.db.query("SELECT 1 FROM effects").all().length === 1,
+      { timeoutMs: 10_000, label: "write started" },
+    );
+
+    await server.scriptRuns!.cancel(writing.id);
+
+    expect(server.scriptRunStore.get(writing.id)?.status).toBe("cancelled");
   }, 60_000);
 });

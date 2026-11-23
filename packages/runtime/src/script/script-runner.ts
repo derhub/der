@@ -56,9 +56,17 @@ export interface ScriptCallHalt {
   readonly halt: true;
 }
 
+export interface ScriptCallContext {
+  readonly settled: () => boolean;
+}
+
 export interface RunScriptOptions {
   readonly script: string;
-  readonly call: (id: string, input: JsonValue) => Promise<ScriptCallReply | ScriptCallHalt>;
+  readonly call: (
+    id: string,
+    input: JsonValue,
+    context: ScriptCallContext,
+  ) => Promise<ScriptCallReply | ScriptCallHalt>;
   readonly limits: ScriptLimits;
   readonly seed: number;
   readonly now: number;
@@ -137,6 +145,12 @@ export async function runScript(options: RunScriptOptions): Promise<ScriptResult
   let lastHeardAt = performance.now();
   let callQueue: Promise<void> = Promise.resolve();
   let returned = false;
+  let returnedResult: ScriptResult | undefined;
+  let aborted = false;
+  let markAborted: () => void = () => {};
+  const abortedSettled = new Promise<void>((resolve) => {
+    markAborted = resolve;
+  });
   const hostFailures = new Map<
     number,
     { kind: ScriptHostErrorKind; message: string; call: string }
@@ -157,16 +171,21 @@ export async function runScript(options: RunScriptOptions): Promise<ScriptResult
       return;
     }
     returned = true;
+    returnedResult = result;
     Atomics.store(new Int32Array(stop), 0, STOP_REQUESTED);
     worker.terminate();
-    const settle = (): void => finish(result);
+    const settle = (): void => finish(returnedResult ?? result);
     callQueue = callQueue.then(settle, settle);
   };
   const fail = (kind: ScriptErrorKind, message: string): void => {
     finish({ ok: false, error: { kind, message }, logs });
   };
 
-  const onAbort = (): void => fail("cancelled", "script cancelled");
+  const onAbort = (): void => {
+    aborted = true;
+    markAborted();
+    fail("cancelled", "script cancelled");
+  };
   signal?.addEventListener("abort", onAbort, { once: true });
 
   const stallWatch = setInterval(() => {
@@ -190,7 +209,9 @@ export async function runScript(options: RunScriptOptions): Promise<ScriptResult
     }
     let reply: ScriptCallReply | ScriptCallHalt;
     try {
-      reply = await options.call(message.id, message.input as JsonValue);
+      reply = await options.call(message.id, message.input as JsonValue, {
+        settled: () => outcome.verdict !== undefined,
+      });
     } catch (error) {
       outcome.hostError = error;
       fail("cancelled", HALTED_MESSAGE);
@@ -199,6 +220,17 @@ export async function runScript(options: RunScriptOptions): Promise<ScriptResult
     if ("halt" in reply) {
       fail("cancelled", HALTED_MESSAGE);
       return;
+    }
+    if (returned && !reply.ok && returnedResult?.ok) {
+      returnedResult = {
+        ok: false,
+        error: {
+          kind: isHostErrorKind(reply.error.kind) ? reply.error.kind : "capability",
+          message: reply.error.message,
+          call: message.id,
+        },
+        logs,
+      };
     }
     if (outcome.verdict !== undefined) {
       return;
@@ -317,6 +349,9 @@ export async function runScript(options: RunScriptOptions): Promise<ScriptResult
 
   try {
     await verdictSettled;
+    if (!aborted) {
+      await Promise.race([callQueue.catch(() => undefined), abortedSettled]);
+    }
   } finally {
     clearInterval(stallWatch);
     signal?.removeEventListener("abort", onAbort);

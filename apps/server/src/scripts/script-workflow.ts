@@ -38,12 +38,12 @@ function failedResult(
   return { ok: false, error: { kind, message }, logs: [] };
 }
 
-async function cancelScriptRun(deps: ScriptCancelDeps, scriptRunId: string): Promise<void> {
+async function requestScriptCancel(deps: ScriptCancelDeps, scriptRunId: string): Promise<boolean> {
   const scriptRun = deps.scriptRuns.get(scriptRunId);
   if (!scriptRun || isTerminalScriptRunStatus(scriptRun.status)) {
-    return;
+    return false;
   }
-  await deps.scriptRuns.finish(scriptRunId, "cancelled", cancelledResult());
+  await deps.scriptRuns.requestCancel(scriptRunId);
   const decidedAt = formatUtcTimestamp(deps.now ? deps.now() : new Date());
   for (const approval of deps.scriptRuns.listPendingApprovals(scriptRunId)) {
     await deps.decide({
@@ -55,6 +55,7 @@ async function cancelScriptRun(deps: ScriptCancelDeps, scriptRunId: string): Pro
       decidedAt,
     });
   }
+  return true;
 }
 
 function storedResult(
@@ -128,8 +129,16 @@ export function createDirectScriptRuns(
     },
 
     async cancel(scriptRunId: string): Promise<void> {
-      active.get(scriptRunId)?.controller.abort();
-      await cancelScriptRun(deps, scriptRunId);
+      const running = active.get(scriptRunId);
+      if (!(await requestScriptCancel(deps, scriptRunId))) {
+        return;
+      }
+      running?.controller.abort();
+      if (running) {
+        await running.task;
+      } else {
+        await deps.scriptRuns.finish(scriptRunId, "cancelled", cancelledResult());
+      }
     },
 
     async close(): Promise<void> {
@@ -227,6 +236,8 @@ export function createRestateScriptRuns(ingressUrl: string, deps: ScriptCancelDe
       }
     },
 
-    cancel: (scriptRunId: string) => cancelScriptRun(deps, scriptRunId),
+    async cancel(scriptRunId: string): Promise<void> {
+      await requestScriptCancel(deps, scriptRunId);
+    },
   };
 }

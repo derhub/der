@@ -68,6 +68,22 @@ export interface AcquireScriptRunOutcome {
   readonly created: boolean;
 }
 
+const CANCELLED_RESULT: ExecuteResult = {
+  ok: false,
+  error: { kind: "cancelled", message: "script cancelled" },
+  logs: [],
+};
+
+export class ScriptRunBusyError extends Error {
+  readonly blockedBy: ScriptRun;
+
+  constructor(blockedBy: ScriptRun) {
+    super(`ScriptRun ${blockedBy.id} is still ${blockedBy.status} in Run ${blockedBy.runId}.`);
+    this.name = "ScriptRunBusyError";
+    this.blockedBy = blockedBy;
+  }
+}
+
 export interface SqliteScriptRunsOptions {
   readonly database: SqliteDatabase;
 }
@@ -92,6 +108,17 @@ export class SqliteScriptRuns {
         .get(input.runId, digest);
       if (pending) {
         return { scriptRun: mapScriptRunRow(pending), created: false };
+      }
+
+      const active = db
+        .query<ScriptRunRow, [string]>(
+          `SELECT * FROM script_runs
+           WHERE run_id = ? AND status IN ('running', 'waiting_approval')
+           ORDER BY created_at ASC, occurrence ASC LIMIT 1`,
+        )
+        .get(input.runId);
+      if (active) {
+        throw new ScriptRunBusyError(mapScriptRunRow(active));
       }
 
       const latest = db
@@ -169,6 +196,29 @@ export class SqliteScriptRuns {
         id,
       );
     });
+  }
+
+  async requestCancel(id: string): Promise<void> {
+    const now = formatUtcTimestamp(this.database.now());
+    await this.database.inTransactionWithRetry((db) => {
+      db.query(
+        `UPDATE script_runs SET result_json = ?, updated_at = ?
+         WHERE id = ? AND status IN ('running', 'waiting_approval') AND result_json IS NULL`,
+      ).run(JSON.stringify(CANCELLED_RESULT), now, id);
+    });
+  }
+
+  isCancelRequested(id: string): boolean {
+    const row = this.database.db
+      .query<{ status: string; result_json: string | null }, [string]>(
+        "SELECT status, result_json FROM script_runs WHERE id = ?",
+      )
+      .get(id);
+    if (row === null) {
+      return false;
+    }
+    const active = row.status === "running" || row.status === "waiting_approval";
+    return row.status === "cancelled" || (active && row.result_json !== null);
   }
 
   async finish(

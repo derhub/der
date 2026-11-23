@@ -3,7 +3,12 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "bun:test";
 import type { ExecuteResult } from "@der/domain";
-import { openSqliteScriptRuns, openSqliteStore, type SqliteStore } from "@der/storage";
+import {
+  openSqliteScriptRuns,
+  openSqliteStore,
+  ScriptRunBusyError,
+  type SqliteStore,
+} from "@der/storage";
 
 const tempDirs: string[] = [];
 
@@ -89,12 +94,106 @@ describe("acquire a script run", () => {
   it("keeps different sources apart", async () => {
     const { scriptRuns, run, bot } = await openFixture();
     const one = await scriptRuns.acquire({ runId: run.id, botId: bot.id, source: "return 1" });
+    await scriptRuns.finish(one.scriptRun.id, "completed", done);
 
     const two = await scriptRuns.acquire({ runId: run.id, botId: bot.id, source: "return 2" });
 
     expect(two.created).toBe(true);
     expect(two.scriptRun.digest).not.toBe(one.scriptRun.digest);
     expect(two.scriptRun.occurrence).toBe(1);
+  });
+});
+
+describe("run one script at a time per run", () => {
+  it.each(["running", "waiting_approval"] as const)(
+    "refuses a different script while another is %s",
+    async (status) => {
+      const { scriptRuns, run, bot } = await openFixture();
+      const first = await scriptRuns.acquire({ runId: run.id, botId: bot.id, source: "return 1" });
+      await scriptRuns.setStatus(first.scriptRun.id, status);
+
+      const refused = await scriptRuns
+        .acquire({ runId: run.id, botId: bot.id, source: "return 2" })
+        .catch((error: unknown) => error);
+
+      expect(refused).toBeInstanceOf(ScriptRunBusyError);
+      expect((refused as ScriptRunBusyError).blockedBy.id).toBe(first.scriptRun.id);
+    },
+  );
+
+  it("creates one row when two different scripts are acquired at once", async () => {
+    const { scriptRuns, run, bot } = await openFixture();
+
+    const outcomes = await Promise.allSettled(
+      ["return 1", "return 2", "return 3"].map((source) =>
+        scriptRuns.acquire({ runId: run.id, botId: bot.id, source }),
+      ),
+    );
+
+    expect(outcomes.filter((outcome) => outcome.status === "fulfilled")).toHaveLength(1);
+    expect(scriptRuns.listUnfinished(run.id)).toHaveLength(1);
+  });
+
+  it("still returns the running script run for the identical script", async () => {
+    const { scriptRuns, run, bot } = await openFixture();
+    const first = await scriptRuns.acquire({ runId: run.id, botId: bot.id, source: "return 1" });
+
+    const again = await scriptRuns.acquire({ runId: run.id, botId: bot.id, source: "return 1" });
+
+    expect(again.scriptRun.id).toBe(first.scriptRun.id);
+    expect(again.created).toBe(false);
+  });
+
+  it("allows a different script in another run while one is running", async () => {
+    const { store, scriptRuns, run, bot } = await openFixture();
+    await scriptRuns.acquire({ runId: run.id, botId: bot.id, source: "return 1" });
+    const otherSession = store.createSession({ id: "sess-2", botId: bot.id, title: "Other" });
+    const other = await store.admit({
+      botId: bot.id,
+      sessionId: otherSession.id,
+      origin: "web",
+      idempotencyKey: "req-2",
+      input: { parts: [{ type: "text", text: "again" }] },
+    });
+
+    const outcome = await scriptRuns.acquire({
+      runId: other.run.id,
+      botId: bot.id,
+      source: "return 2",
+    });
+
+    expect(outcome.created).toBe(true);
+  });
+});
+
+describe("request a cancel without ending the script run", () => {
+  it("keeps the row active while reporting the cancel", async () => {
+    const { scriptRuns, run, bot } = await openFixture();
+    const { scriptRun } = await scriptRuns.acquire({
+      runId: run.id,
+      botId: bot.id,
+      source: "return 1",
+    });
+
+    await scriptRuns.requestCancel(scriptRun.id);
+
+    expect(scriptRuns.isCancelRequested(scriptRun.id)).toBe(true);
+    expect(scriptRuns.get(scriptRun.id)?.status).toBe("running");
+  });
+
+  it("does not report a cancel for a script run nobody cancelled or one that finished", async () => {
+    const { scriptRuns, run, bot } = await openFixture();
+    const { scriptRun } = await scriptRuns.acquire({
+      runId: run.id,
+      botId: bot.id,
+      source: "return 1",
+    });
+    expect(scriptRuns.isCancelRequested(scriptRun.id)).toBe(false);
+
+    await scriptRuns.finish(scriptRun.id, "completed", done);
+    await scriptRuns.requestCancel(scriptRun.id);
+
+    expect(scriptRuns.isCancelRequested(scriptRun.id)).toBe(false);
   });
 });
 
@@ -134,13 +233,13 @@ describe("finish a script run", () => {
 
   it("lists only unfinished script runs of the owning run", async () => {
     const { scriptRuns, run, bot } = await openFixture();
-    const open = await scriptRuns.acquire({ runId: run.id, botId: bot.id, source: "a" });
     const closed = await scriptRuns.acquire({ runId: run.id, botId: bot.id, source: "b" });
     await scriptRuns.finish(closed.scriptRun.id, "cancelled", {
       ok: false,
       error: { kind: "cancelled", message: "x" },
       logs: [],
     });
+    const open = await scriptRuns.acquire({ runId: run.id, botId: bot.id, source: "a" });
     await scriptRuns.setStatus(open.scriptRun.id, "waiting_approval");
 
     expect(scriptRuns.listUnfinished(run.id).map((entry) => [entry.id, entry.status])).toEqual([

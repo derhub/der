@@ -35,6 +35,8 @@ export function codeModeInstructions(catalog: Catalog): string {
     "- Modules and `import` are not available. `eval` and `Function` are unavailable. There are no timers.",
     "- `Date`, `Math.random` and `performance.now` return recorded values, so a Script replays the same way every time. Do not branch on them.",
     "- A write can need operator approval. `execute` then waits for the decision. A denied or expired approval comes back as `ok: false` with kind `denied` or `expired`.",
+    "- Scripts in a run are sequential: while one is still running, `execute` with a different Script returns `ok: false`. Wait for it, or send the same Script again to get its result.",
+    "- A call you do not `await` still runs to its end before the Script's result is reported, and a failure of it becomes the result.",
     "- If your `execute` call is cut off, call it again with the identical Script to pick the same run back up. After a result has been returned, the same Script runs again.",
     "",
     "Example:",

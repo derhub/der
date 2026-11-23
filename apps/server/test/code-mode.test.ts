@@ -250,6 +250,46 @@ describe("return a stored result without attaching", () => {
   }, 60_000);
 });
 
+describe("run one script at a time in a run", () => {
+  it("one at a time: a different script sent while another waits on an approval is refused with advice, and the first still completes", async () => {
+    const { server, host } = await startDirectServer();
+    const owner = await admitOwningRun(server, "code-mode-one-at-a-time");
+    const execute = executeToolFor(server, owner.run);
+    const first = callTool(execute, { script: PUBLISH });
+    const approval = await awaitPendingApproval(server, owner.run.id);
+
+    const refused = await callTool(execute, {
+      script: `return der.notes.publish({ text: "other" });`,
+    });
+    const again = callTool(execute, { script: PUBLISH });
+    await decide(server, approval, owner, "approved");
+
+    expect(refused).toEqual({
+      ok: false,
+      error: {
+        kind: "capability",
+        message:
+          "Another Script is still running in this run. Wait for it to finish, or send the same Script again to get its result.",
+      },
+      logs: [],
+    });
+    expect(await first).toEqual({
+      ok: true,
+      result: { published: true },
+      logs: [],
+      truncated: false,
+    });
+    expect(await again).toEqual({
+      ok: true,
+      result: { published: true },
+      logs: [],
+      truncated: false,
+    });
+    expect(host.published).toEqual(["release"]);
+    expect(scriptRunCount(server, owner.run.id)).toBe(1);
+  }, 60_000);
+});
+
 describe("repeat a script on purpose", () => {
   it("runs the same script again after its result was returned, giving two script runs and two effects", async () => {
     const { server, host } = await startDirectServer();

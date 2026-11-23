@@ -633,11 +633,19 @@ describe("refuse and settle at the edges of a script run under Restate", () => {
       ok: false,
       error: {
         kind: "capability",
-        message: `A previous write in this Run, capability:ledger.post (${earlier.id}:1), has an unknown outcome, so no Script can run in this Run until an operator resolves it.`,
+        message: `The outcome of a previous write in this Run (capability:ledger.post, ${earlier.id}:1) is unknown, so the Run was interrupted.`,
       },
       logs: [],
     });
     expect(applied).toEqual([]);
+    expect(server.scriptRunStore.get(later.id)?.status).toBe("interrupted");
+    expect(server.store.getRun(owner.run.id)?.status).toBe("interrupted");
+    expect(
+      server.store
+        .readRunEventsAfter(owner.run.id, 0)
+        .map((event) => event.chunk as { type: string; code?: string })
+        .some((chunk) => chunk.type === "RUN_ERROR" && chunk.code === "effect.outcome_uncertain"),
+    ).toBe(true);
   }, 120_000);
 
   it("without await: a write issued and not awaited runs and is recorded completed before the result is reported", async () => {
@@ -664,4 +672,48 @@ describe("refuse and settle at the edges of a script run under Restate", () => {
       })?.status,
     ).toBe("completed");
   }, 120_000);
+});
+
+describe("run one script at a time in a run under Restate", () => {
+  it("one at a time: a different script sent while another waits on an approval is refused and the first completes", async () => {
+    const { server, host, owner } = await startOwned("restate-one-at-a-time");
+    const execute = createExecuteTool({
+      run: owner.run,
+      scriptRunStore: server.scriptRunStore,
+      scriptRuns: server.scriptRuns!,
+      maxResultBytes: 65_536,
+    });
+    const call = (script: string) =>
+      execute.execute!({ script }, { signal: AbortSignal.timeout(90_000) });
+    const first = call(PUBLISH);
+    const approval = await awaitPendingApproval(server, owner.run.id);
+
+    const refused = await call(`return der.notes.publish({ text: "other" });`);
+    await server.coordinator.decide({
+      approvalId: approval.id,
+      botId: owner.botId,
+      sessionId: owner.sessionId,
+      runId: owner.run.id,
+      status: "approved",
+      actor: "operator",
+      decidedAt: formatUtcTimestamp(new Date()),
+    });
+
+    expect(refused).toEqual({
+      ok: false,
+      error: {
+        kind: "capability",
+        message:
+          "Another Script is still running in this run. Wait for it to finish, or send the same Script again to get its result.",
+      },
+      logs: [],
+    });
+    expect(await first).toEqual({
+      ok: true,
+      result: { published: true },
+      logs: [],
+      truncated: false,
+    });
+    expect(host.published).toEqual(["release"]);
+  }, 150_000);
 });

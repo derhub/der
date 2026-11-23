@@ -75,6 +75,8 @@ An id is dot-separated, with at least two segments, and every segment matches `[
 
 A denied or expired Approval ends the Script with error kind `denied` or `expired`.
 
+Scripts run one at a time per Run. A call a Script issues without `await` is still carried to its recorded outcome before the Script ends, and if it fails with a capability error that error becomes the Script's result. A `write` is refused, and the Run interrupted, when the Run has a write whose outcome is unknown.
+
 ### Errors
 
 - A `DomainError` thrown by a `write` is recorded as a failed Effect and reaches the Script as an error of kind `capability`. A Script can catch it.

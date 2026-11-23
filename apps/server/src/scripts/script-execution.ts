@@ -12,6 +12,7 @@ import {
 } from "@der/domain";
 import {
   runScript,
+  type ScriptCallContext,
   type ScriptCallHalt,
   type ScriptCallReply,
   type ScriptLimits,
@@ -28,6 +29,7 @@ export interface ScriptExecutionDeps {
   readonly approvals: Pick<RunCoordinator, "awaitApprovalWithDriver">;
   readonly limits: ScriptLimits;
   readonly now?: () => Date;
+  readonly inFlightGraceMs?: number;
 }
 
 export interface ScriptExecutionSignals {
@@ -42,11 +44,14 @@ interface ScriptStart {
   readonly run: Run | null;
   readonly seed: number;
   readonly now: number;
-  readonly writeInDoubt: string | null;
+  readonly writeInDoubt: { readonly effectId: EffectId; readonly detail: string } | null;
 }
 
 type CallStepResult =
   | { readonly kind: "reply"; readonly reply: ScriptCallReply }
+  | { readonly kind: "abandoned" }
+  | { readonly kind: "run-ended"; readonly detail: string }
+  | { readonly kind: "doubt"; readonly effectId: EffectId; readonly detail: string }
   | { readonly kind: "interrupted"; readonly effectId: EffectId; readonly detail: string };
 
 interface Halt {
@@ -55,6 +60,7 @@ interface Halt {
   readonly call: string;
 }
 
+const IN_FLIGHT_GRACE_MS = 10_000;
 const MAX_RESULT_DEPTH = 256;
 const HALT_SCRIPT: ScriptCallHalt = { halt: true };
 const PROMPT_INPUT_CHARS = 400;
@@ -71,6 +77,14 @@ function failure(
 
 export function cancelledResult(): ExecuteResult {
   return failure("cancelled", "script cancelled");
+}
+
+function isEndedRunStatus(status: Run["status"]): boolean {
+  return status === "interrupted" || status === "failed" || status === "cancelled";
+}
+
+function uncertainWriteDetail(identity: Pick<EffectIdentity, "operationId" | "attemptId">): string {
+  return `The outcome of a previous write in this Run (capability:${identity.operationId}, ${identity.attemptId}) is unknown, so the Run was interrupted.`;
 }
 
 function errorMessage(error: unknown): string {
@@ -102,7 +116,7 @@ export async function executeScriptRun(
   signals: ScriptExecutionSignals = {},
 ): Promise<ExecuteResult | undefined> {
   const nowMs = (): number => (deps.now ? deps.now() : new Date()).getTime();
-  const isCancelled = (): boolean => deps.scriptRuns.get(scriptRunId)?.status === "cancelled";
+  const isCancelled = (): boolean => deps.scriptRuns.isCancelRequested(scriptRunId);
   let ordinal = 0;
   let halt: Halt | undefined;
   let interrupted: { readonly effectId: EffectId; readonly detail: string } | undefined;
@@ -110,6 +124,7 @@ export async function executeScriptRun(
     | { readonly error: unknown; readonly effect: EffectIdentity | undefined }
     | undefined;
   let writeInFlight: EffectIdentity | undefined;
+  let runEnded: string | undefined;
   const bounded = signals.boundedDriver ?? driver;
 
   const start = await bounded.runStep("script-start", async (): Promise<ScriptStart> => {
@@ -130,7 +145,7 @@ export async function executeScriptRun(
       writeInDoubt:
         doubtful === undefined
           ? null
-          : `capability:${doubtful.identity.operationId} (${doubtful.identity.attemptId})`,
+          : { effectId: doubtful.id, detail: uncertainWriteDetail(doubtful.identity) },
       terminal: isTerminalScriptRunStatus(scriptRun.status) ? scriptRun.result : null,
       source: scriptRun.source,
       run,
@@ -145,16 +160,18 @@ export async function executeScriptRun(
     return finish(failure("capability", "owning Run no longer exists"));
   }
   const run: Run = start.run;
-  if (run.status === "interrupted" || run.status === "failed" || run.status === "cancelled") {
+  if (isEndedRunStatus(run.status)) {
     return finish(failure("capability", `owning Run ${run.id} has ended as ${run.status}`));
   }
 
   if (start.writeInDoubt !== null) {
+    interrupted = start.writeInDoubt;
     return finish(
-      failure(
-        "capability",
-        `A previous write in this Run, ${start.writeInDoubt}, has an unknown outcome, so no Script can run in this Run until an operator resolves it.`,
-      ),
+      await settle({
+        ok: false,
+        error: { kind: "capability", message: start.writeInDoubt.detail },
+        logs: [],
+      }),
     );
   }
 
@@ -209,6 +226,7 @@ export async function executeScriptRun(
     input: JsonValue,
     effect: EffectIdentity,
     approvalId: string | undefined,
+    context: ScriptCallContext,
   ): Promise<CallStepResult> =>
     driver.runStep(name, async (): Promise<CallStepResult> => {
       if (isCancelled()) {
@@ -219,6 +237,21 @@ export async function executeScriptRun(
             error: { kind: "cancelled", message: "script cancelled" },
             now: nowMs(),
           },
+        };
+      }
+      if (context.settled()) {
+        return { kind: "abandoned" };
+      }
+      const current = await deps.store.getRun(run.id);
+      if (current !== undefined && isEndedRunStatus(current.status)) {
+        return { kind: "run-ended", detail: `owning Run ${run.id} has ended as ${current.status}` };
+      }
+      const doubtful = await deps.store.findWriteInDoubt(run.id);
+      if (doubtful !== undefined && doubtful.identity.attemptId !== effect.attemptId) {
+        return {
+          kind: "doubt",
+          effectId: doubtful.id,
+          detail: uncertainWriteDetail(doubtful.identity),
         };
       }
       await deps.scriptRuns.setStatus(scriptRunId, "running");
@@ -293,6 +326,7 @@ export async function executeScriptRun(
   const serveCall = async (
     id: string,
     input: JsonValue,
+    context: ScriptCallContext,
   ): Promise<ScriptCallReply | ScriptCallHalt> => {
     ordinal += 1;
     if (halt !== undefined) {
@@ -329,6 +363,9 @@ export async function executeScriptRun(
           now: rule.now,
         };
       }
+      if (context.settled()) {
+        return HALT_SCRIPT;
+      }
       if (rule.needsApproval) {
         const asked = await askApproval(name, id, input, effect);
         if ("reply" in asked) {
@@ -337,26 +374,44 @@ export async function executeScriptRun(
         approvalId = asked.approvalId;
       }
       writeInFlight = effect;
-      step = await writeStep(name, id, input, effect, approvalId);
+      step = await writeStep(name, id, input, effect, approvalId, context);
       writeInFlight = undefined;
     } else {
       step = await readStep(name, id, input);
     }
-    if (step.kind === "interrupted") {
-      interrupted = { effectId: step.effectId, detail: step.detail };
-      halt = { kind: "cancelled", message: step.detail, call: id };
-      return HALT_SCRIPT;
+    switch (step.kind) {
+      case "reply":
+        return step.reply;
+      case "abandoned":
+        return HALT_SCRIPT;
+      case "run-ended":
+        runEnded ??= step.detail;
+        halt = { kind: "cancelled", message: step.detail, call: id };
+        return HALT_SCRIPT;
+      case "doubt":
+        interrupted ??= { effectId: step.effectId, detail: step.detail };
+        halt = { kind: "cancelled", message: step.detail, call: id };
+        return HALT_SCRIPT;
+      case "interrupted":
+        interrupted ??= { effectId: step.effectId, detail: step.detail };
+        halt = { kind: "cancelled", message: step.detail, call: id };
+        return HALT_SCRIPT;
     }
-    return step.reply;
   };
 
-  const call = async (id: string, input: JsonValue): Promise<ScriptCallReply | ScriptCallHalt> => {
-    try {
-      return await serveCall(id, input);
-    } catch (error) {
+  const inFlight = new Set<Promise<unknown>>();
+  const call = (
+    id: string,
+    input: JsonValue,
+    context: ScriptCallContext,
+  ): Promise<ScriptCallReply | ScriptCallHalt> => {
+    const served = serveCall(id, input, context).catch((error: unknown) => {
       hostFailure ??= { error, effect: writeInFlight };
       return HALT_SCRIPT;
-    }
+    });
+    inFlight.add(served);
+    void served.finally(() => inFlight.delete(served));
+    return served;
   };
 
   const result = await runScript({
@@ -370,6 +425,7 @@ export async function executeScriptRun(
   if (signals.attemptEnded?.aborted) {
     return undefined;
   }
+  await waitForCallsInFlight();
   if (hostFailure !== undefined) {
     interrupted = await resolveInDoubtWrite(hostFailure.effect, errorMessage(hostFailure.error));
     if (interrupted === undefined) {
@@ -399,6 +455,18 @@ export async function executeScriptRun(
     return doubt ?? undefined;
   }
 
+  async function waitForCallsInFlight(): Promise<void> {
+    if (inFlight.size === 0) {
+      return;
+    }
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const grace = new Promise<void>((resolve) => {
+      timer = setTimeout(resolve, deps.inFlightGraceMs ?? IN_FLIGHT_GRACE_MS);
+    });
+    await Promise.race([Promise.allSettled(inFlight), grace]);
+    clearTimeout(timer);
+  }
+
   async function settle(scripted: ScriptResult): Promise<ExecuteResult> {
     if (interrupted !== undefined) {
       const detail = interrupted;
@@ -411,6 +479,9 @@ export async function executeScriptRun(
         return null;
       });
       return failure("capability", detail.detail, scripted.logs);
+    }
+    if (runEnded !== undefined) {
+      return failure("capability", runEnded, scripted.logs);
     }
     if (halt !== undefined && halt.kind !== "cancelled") {
       return failure(halt.kind, halt.message, scripted.logs, halt.call);

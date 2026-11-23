@@ -14,6 +14,7 @@ export {
   digestScriptSource,
   isTerminalScriptRunStatus,
   openSqliteScriptRuns,
+  ScriptRunBusyError,
   SqliteScriptRuns,
   type AcquireScriptRunInput,
   type AcquireScriptRunOutcome,

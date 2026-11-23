@@ -2,6 +2,7 @@ export {
   runScript,
   ScriptRunnerError,
   type RunScriptOptions,
+  type ScriptCallContext,
   type ScriptCallHalt,
   type ScriptCallReply,
   type ScriptErrorKind,

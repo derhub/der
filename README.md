@@ -82,6 +82,9 @@ Each `execute` call creates a `ScriptRun` bound to the calling Run (`packages/st
 - Every capability call is a journaled step. After a server restart the guest starts again from the top and finished calls return their recorded results, together with the recorded clock and random seed, so the Script continues where it stopped.
 - A `write` call records an Effect (operation kind `capability`) before it runs. A completed Effect returns its recorded outcome instead of running again. If the outcome of a write is unknown, the Script ends with a `capability` error and status `interrupted`.
 - If the model's `execute` call is cut off, calling `execute` again with the identical Script re-attaches to the same ScriptRun and returns its result. After that result has been delivered, the same Script starts a new ScriptRun: repeating a Script on purpose works.
+- One Script runs at a time per Run. While a ScriptRun is running or waiting for an Approval, `execute` with a different Script returns `ok: false` and calls nothing; the identical Script attaches to the running one.
+- A call a Script issues without `await` still runs to its recorded outcome before the ScriptRun ends, and a failure of it becomes the result.
+- If a write's outcome is unknown, the Run is interrupted with `effect.outcome_uncertain` and no further Script runs in it.
 - A Script ends with its Run. When the Run finishes, unfinished ScriptRuns are cancelled and their pending Approvals expire.
 - A Script that does not replay the same calls on resume fails with kind `nondeterministic`.
 - With `DER_RESTATE_MODE=direct` there is no journal. A Script interrupted by a restart is not resumed; it is marked `interrupted`.

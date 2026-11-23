@@ -1,6 +1,6 @@
 import * as z from "zod";
 import type { ExecuteResult, JsonValue, Run } from "@der/domain";
-import { isTerminalScriptRunStatus, type SqliteScriptRuns } from "@der/storage";
+import { isTerminalScriptRunStatus, ScriptRunBusyError, type SqliteScriptRuns } from "@der/storage";
 import type { AnyTool } from "@tanstack/ai";
 import type { ScriptRuns } from "../scripts/script-workflow";
 
@@ -15,6 +15,8 @@ export interface ExecuteToolDeps {
 
 const encoder = new TextEncoder();
 const decoder = new TextDecoder();
+const ANOTHER_SCRIPT_RUNNING =
+  "Another Script is still running in this run. Wait for it to finish, or send the same Script again to get its result.";
 const LOGS_TRUNCATED = "[logs truncated]";
 
 function failure(
@@ -109,6 +111,9 @@ export function createExecuteTool(deps: ExecuteToolDeps): AnyTool {
       try {
         return fitResult(await runScript(deps, parsed.data.script, signal), deps.maxResultBytes);
       } catch (error) {
+        if (error instanceof ScriptRunBusyError) {
+          return failure("capability", ANOTHER_SCRIPT_RUNNING);
+        }
         if (signal.aborted) {
           return failure(
             "cancelled",

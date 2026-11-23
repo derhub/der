@@ -573,6 +573,89 @@ describe("run a script", () => {
     }, 60_000);
   });
 
+  describe("a call outlives the verdict", () => {
+    const limitCases: ReadonlyArray<readonly [string, string, ScriptLimits]> = [
+      [
+        "output limit",
+        `der.ledger.post({}); for (let i = 0; i < 3000000; i++) {} console.log("x".repeat(5000)); return 1;`,
+        { ...roomyLimits, outputBytes: 2_000 },
+      ],
+      ["time limit", `der.ledger.post({}); for (;;) {}`, { ...roomyLimits, activeMs: 300 }],
+      [
+        "memory limit",
+        `der.ledger.post({}); const keep = []; for (;;) keep.push(new Uint8Array(4_000_000).fill(1));`,
+        { ...roomyLimits, memoryBytes: 64 * MB },
+      ],
+    ];
+
+    it.each(limitCases)(
+      "returns only after the write in flight finished when the script hits its %s",
+      async (_name, script, limits) => {
+        let recorded = false;
+
+        const result = await runScript({
+          script,
+          call: async () => {
+            await new Promise((resolve) => setTimeout(resolve, 600));
+            recorded = true;
+            return { ok: true, value: null };
+          },
+          limits,
+          seed: 1,
+          now: START,
+        });
+
+        expect(result).toMatchObject({ ok: false, error: { kind: "limit" } });
+        expect(recorded).toBe(true);
+      },
+      60_000,
+    );
+
+    it("tells a call in flight that the verdict is set so it begins no further stage", async () => {
+      const seenSettled: boolean[] = [];
+
+      await runScript({
+        script: `der.ledger.post({}); for (let i = 0; i < 3000000; i++) {} console.log("x".repeat(5000)); return 1;`,
+        call: async (_id, _input, context) => {
+          seenSettled.push(context.settled());
+          await new Promise((resolve) => setTimeout(resolve, 300));
+          seenSettled.push(context.settled());
+          return { ok: true, value: null };
+        },
+        limits: { ...roomyLimits, outputBytes: 2_000 },
+        seed: 1,
+        now: START,
+      });
+
+      expect(seenSettled).toEqual([false, true]);
+    }, 60_000);
+
+    it("returns without waiting for the call when the signal aborts", async () => {
+      const controller = new AbortController();
+      let reached: () => void = () => {};
+      const callReached = new Promise<void>((resolve) => {
+        reached = resolve;
+      });
+
+      const running = runScript({
+        script: `der.ledger.post({}); for (let i = 0; i < 3000000; i++) {} console.log("x".repeat(5000)); return 1;`,
+        call: () => {
+          reached();
+          return new Promise<ScriptCallReply>(() => {});
+        },
+        limits: { ...roomyLimits, outputBytes: 2_000 },
+        seed: 1,
+        now: START,
+        signal: controller.signal,
+      });
+      await callReached;
+      await new Promise((resolve) => setTimeout(resolve, 300));
+      controller.abort();
+
+      expect(await running).toMatchObject({ ok: false, error: { kind: "limit" } });
+    }, 60_000);
+  });
+
   describe("calls issued without await", () => {
     it("lets a halt after the script returned win over its result", async () => {
       const result = await runScript({
@@ -608,10 +691,10 @@ describe("run a script", () => {
       expect((failure as Error).message).toBe("store unavailable");
     }, 60_000);
 
-    it("does not run calls queued behind a call that halted", async () => {
+    it("does not run calls queued behind a call that halted and reports the halt", async () => {
       const calledIds: string[] = [];
 
-      await runScript({
+      const result = await runScript({
         script: `der.first.call({}); der.second.call({}); return 1;`,
         call: async (id) => {
           calledIds.push(id);
@@ -624,7 +707,31 @@ describe("run a script", () => {
       });
       await new Promise((resolve) => setTimeout(resolve, 100));
 
+      expect(result).toEqual({
+        ok: false,
+        error: { kind: "cancelled", message: "script halted by the host" },
+        logs: [],
+      });
       expect(calledIds).toEqual(["first.call"]);
+    }, 60_000);
+
+    it("reports the capability error of a call issued without await instead of the script's own result", async () => {
+      const result = await runScript({
+        script: `der.x.y({}); return { posted: true };`,
+        call: async () => {
+          await new Promise((resolve) => setTimeout(resolve, 50));
+          return { ok: false, error: { kind: "capability", message: "insufficient funds" } };
+        },
+        limits: roomyLimits,
+        seed: 1,
+        now: START,
+      });
+
+      expect(result).toEqual({
+        ok: false,
+        error: { kind: "capability", message: "insufficient funds", call: "x.y" },
+        logs: [],
+      });
     }, 60_000);
 
     it("ends as cancelled when the signal aborts while a call is still pending", async () => {
