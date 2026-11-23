@@ -178,3 +178,16 @@ With two or more open tasks the `tasks.remove` call waits for an operator Approv
 ## Remote MCP tools
 
 `@der/mcp` (`integrations/mcp/src/mcp-tools.ts`) is an integration that uses `listCapabilities`. For each tool of each configured server it registers `mcp.<server>.<tool>`. Characters outside `[A-Za-z0-9_$]` in the server id or tool name become `_`, and a name that starts with a digit gets a leading `_`; two tools that map to the same id fail the integration with `mcp.duplicate_capability_id`. Every MCP capability is a `write` with `approval: "always"`, unless the tool is named in the server's `readOnlyTools` or the server sets `defaultRequiresApproval: false`. In both cases `approval` is `"none"`. A tool outside `allowedTools` (when set) is not registered. The server reads the server list from `DER_MCP_SERVERS_JSON`.
+
+## Run usage and context mode
+
+A Run (`GET /api/runs/:runId`) carries two extra fields:
+
+- `usage`: `null` until the Run finishes, then `inputTokens`, `cachedInputTokens`, `cacheWriteTokens`, `outputTokens` and `reportedCostUsd`. The cache fields and the cost are `null` when the engine does not report them.
+- `contextMode`: `"resumed"` or `"rebuilt"`; `null` for a Script Run. The README section "Session resume" says when a Run rebuilds.
+
+`reportedCostUsd` is the vendor's figure, cumulative per vendor session, so do not sum it across Runs.
+
+`GET /api/sessions/:sessionId/runs` lists the Session's Runs, newest first, as `{ runs }`. An unknown session returns `404` with code `session.not_found`.
+
+`GET /api/runs/:runId/events` can send a `CUSTOM` chunk named `der.attempt-reset` when the engine step starts over. Discard the text streamed so far for that Run and render the chunks that follow.
