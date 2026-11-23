@@ -7,16 +7,18 @@ import {
   type BotId,
   type Engine,
   type EngineKind,
+  type MaybePromise,
   type Routine,
   type RoutineId,
+  type RoutineSlot,
   type RoutineSlotDisposition,
+  type RoutineStore,
   type RunId,
+  type RunStore,
   type SessionId,
   type UtcTimestamp,
 } from "@der/domain";
 import { compiledParsers } from "@der/domain/compiled";
-import type { SqliteStore } from "@der/storage";
-import { openSqliteRoutines, type SqliteRoutines } from "@der/storage/routines";
 import type { RunWorkflowDefinition } from "./restate-workflows";
 
 const PROBLEM_MARKER = "__derProblem";
@@ -243,11 +245,35 @@ export interface RoutineTickResult {
   readonly nextSlot: UtcTimestamp | null;
 }
 
+export interface RoutineScheduleStore extends RoutineStore {
+  updateRoutine(
+    routineId: RoutineId,
+    patch: {
+      readonly name?: string;
+      readonly cron?: string;
+      readonly enabled?: boolean;
+      readonly engine?: EngineKind;
+      readonly prompt?: string;
+      readonly expectedRevision?: number;
+    },
+  ): Promise<Routine>;
+  hasActiveRun(sessionId: SessionId): MaybePromise<boolean>;
+  getSlot(routineId: RoutineId, slot: UtcTimestamp): MaybePromise<RoutineSlot | undefined>;
+  getLatestSlot(routineId: RoutineId): MaybePromise<RoutineSlot | undefined>;
+  recordSlot(input: {
+    readonly routineId: RoutineId;
+    readonly slot: UtcTimestamp;
+    readonly revision: number;
+    readonly disposition: RoutineSlotDisposition;
+    readonly runId: RunId | null;
+  }): Promise<{ readonly inserted: boolean; readonly slot: RoutineSlot }>;
+}
+
 export interface RoutineScheduleDeps {
-  readonly store?: SqliteStore;
-  readonly getStore?: () => SqliteStore;
-  readonly routines?: SqliteRoutines;
-  readonly getRoutines?: () => SqliteRoutines;
+  readonly store?: RunStore;
+  readonly getStore?: () => RunStore;
+  readonly routines?: RoutineScheduleStore;
+  readonly getRoutines?: () => RoutineScheduleStore;
   readonly engines: ReadonlyMap<EngineKind, Engine>;
   readonly now?: () => Date;
   readonly scheduleDelayCapMs?: number;
@@ -256,25 +282,20 @@ export interface RoutineScheduleDeps {
 const RunWorkflowApi: RunWorkflowDefinition = { name: "RunWorkflow" } as RunWorkflowDefinition;
 
 export function createRoutineScheduleObject(deps: RoutineScheduleDeps) {
-  let cachedRoutines: SqliteRoutines | undefined = deps.routines;
-
-  function resolveStore(): SqliteStore {
+  function resolveStore(): RunStore {
     const resolved = deps.store ?? deps.getStore?.();
     if (!resolved) {
-      throw new Error("RoutineSchedule requires a SqliteStore instance.");
+      throw new Error("RoutineSchedule requires a RunStore instance.");
     }
     return resolved;
   }
 
-  function resolveRoutines(): SqliteRoutines {
-    const explicit = deps.routines ?? deps.getRoutines?.();
-    if (explicit) {
-      return explicit;
+  function resolveRoutines(): RoutineScheduleStore {
+    const resolved = deps.routines ?? deps.getRoutines?.();
+    if (!resolved) {
+      throw new Error("RoutineSchedule requires a RoutineScheduleStore instance.");
     }
-    if (!cachedRoutines) {
-      cachedRoutines = openSqliteRoutines({ database: resolveStore().database });
-    }
-    return cachedRoutines;
+    return resolved;
   }
 
   function computeDelayMs(targetSlot: UtcTimestamp, nowMs: number): number {
@@ -322,7 +343,7 @@ export function createRoutineScheduleObject(deps: RoutineScheduleDeps) {
               });
             }
 
-            const existing = routines.getRoutine(routineId);
+            const existing = await routines.getRoutine(routineId);
             if (!existing) {
               throw new DomainError({
                 type: "https://der.invalid/problems/routine-not-found",
@@ -403,7 +424,7 @@ export function createRoutineScheduleObject(deps: RoutineScheduleDeps) {
         const routineId = ctx.key;
         const routine = await ctx.run(
           "load-routine",
-          () => resolveRoutines().getRoutine(routineId) ?? null,
+          async () => (await resolveRoutines().getRoutine(routineId)) ?? null,
         );
         const stateRevision = await ctx.get<number>("revision");
 
@@ -450,9 +471,9 @@ export function createRoutineScheduleObject(deps: RoutineScheduleDeps) {
               ? await ctx.run("clock-now", () => deps.now!().getTime())
               : await ctx.date.now();
 
-        const dueCheck = await ctx.run("resolve-due-slot", () => {
+        const dueCheck = await ctx.run("resolve-due-slot", async () => {
           const routines = resolveRoutines();
-          const latestRecorded = routines.getLatestSlot(routine.id);
+          const latestRecorded = await routines.getLatestSlot(routine.id);
           const afterExclusiveMs = latestRecorded
             ? Date.parse(latestRecorded.slot)
             : input.scheduledSlot !== undefined
@@ -462,7 +483,7 @@ export function createRoutineScheduleObject(deps: RoutineScheduleDeps) {
           const dueSlot = resolveLatestDueUtcSlot(routine.cron, nowMs, afterExclusiveMs);
           if (!dueSlot) {
             if (input.scheduledSlot !== undefined && Date.parse(input.scheduledSlot) <= nowMs) {
-              const existing = routines.getSlot(routine.id, input.scheduledSlot);
+              const existing = await routines.getSlot(routine.id, input.scheduledSlot);
               if (existing) {
                 return {
                   kind: "already_recorded" as const,
@@ -474,7 +495,7 @@ export function createRoutineScheduleObject(deps: RoutineScheduleDeps) {
             return { kind: "not_due" as const };
           }
 
-          const existing = routines.getSlot(routine.id, dueSlot);
+          const existing = await routines.getSlot(routine.id, dueSlot);
           if (existing) {
             return {
               kind: "already_recorded" as const,
@@ -565,7 +586,7 @@ export function createRoutineScheduleObject(deps: RoutineScheduleDeps) {
           const store = resolveStore();
           const routines = resolveRoutines();
 
-          const existing = routines.getSlot(routine.id, dueSlot);
+          const existing = await routines.getSlot(routine.id, dueSlot);
           if (existing) {
             return {
               disposition: existing.disposition,
@@ -574,7 +595,7 @@ export function createRoutineScheduleObject(deps: RoutineScheduleDeps) {
             };
           }
 
-          if (routines.hasActiveRun(routine.sessionId)) {
+          if (await routines.hasActiveRun(routine.sessionId)) {
             const skipped = await routines.recordSlot({
               routineId: routine.id,
               slot: dueSlot,
@@ -712,8 +733,7 @@ export function createRoutineScheduleClient(ingressUrl: string): RoutineSchedule
 }
 
 export interface DirectRoutineScheduleDeps {
-  readonly store: SqliteStore;
-  readonly routines: SqliteRoutines;
+  readonly routines: RoutineScheduleStore;
   readonly engines: ReadonlyMap<EngineKind, Engine>;
   readonly admitRun: (input: {
     readonly botId: BotId;
@@ -729,6 +749,7 @@ export interface DirectRoutineScheduleDeps {
 export function createDirectRoutineScheduleClient(
   deps: DirectRoutineScheduleDeps,
 ): RoutineScheduleClient {
+  const nowFn = deps.now ?? (() => new Date());
   const scheduledSlots = new Map<RoutineId, UtcTimestamp | null>();
 
   return {
@@ -765,7 +786,7 @@ export function createDirectRoutineScheduleClient(
           prompt: input.prompt,
         });
       } else {
-        const existing = deps.routines.getRoutine(routineId);
+        const existing = await deps.routines.getRoutine(routineId);
         if (!existing) {
           throw new DomainError({
             type: "https://der.invalid/problems/routine-not-found",
@@ -812,14 +833,14 @@ export function createDirectRoutineScheduleClient(
         return { routine, nextSlot: null };
       }
 
-      const nowMs = (deps.now ?? deps.store.database.now)().getTime();
+      const nowMs = nowFn().getTime();
       const nextSlot = nextUtcSlotAfter(routine.cron, nowMs) ?? null;
       scheduledSlots.set(routine.id, nextSlot);
       return { routine, nextSlot };
     },
 
     async tick(routineId: RoutineId, input: RoutineTickInput): Promise<RoutineTickResult> {
-      const routine = deps.routines.getRoutine(routineId);
+      const routine = await deps.routines.getRoutine(routineId);
       if (!routine || input.revision !== routine.revision) {
         return {
           routineId,
@@ -842,10 +863,8 @@ export function createDirectRoutineScheduleClient(
       }
 
       const nowMs =
-        input.nowOverride !== undefined
-          ? Date.parse(input.nowOverride)
-          : (deps.now ?? deps.store.database.now)().getTime();
-      const latestRecorded = deps.routines.getLatestSlot(routine.id);
+        input.nowOverride !== undefined ? Date.parse(input.nowOverride) : nowFn().getTime();
+      const latestRecorded = await deps.routines.getLatestSlot(routine.id);
       const afterExclusiveMs = latestRecorded
         ? Date.parse(latestRecorded.slot)
         : input.scheduledSlot !== undefined
@@ -866,7 +885,7 @@ export function createDirectRoutineScheduleClient(
         };
       }
 
-      const existingSlot = deps.routines.getSlot(routine.id, dueSlot);
+      const existingSlot = await deps.routines.getSlot(routine.id, dueSlot);
       if (existingSlot) {
         const nextSlot =
           nextUtcSlotAfter(routine.cron, Math.max(nowMs, Date.parse(dueSlot))) ?? null;
@@ -903,7 +922,7 @@ export function createDirectRoutineScheduleClient(
         };
       }
 
-      if (deps.routines.hasActiveRun(routine.sessionId)) {
+      if (await deps.routines.hasActiveRun(routine.sessionId)) {
         const skipped = await deps.routines.recordSlot({
           routineId: routine.id,
           slot: dueSlot,
@@ -952,7 +971,7 @@ export function createDirectRoutineScheduleClient(
     },
 
     async inspect(routineId: RoutineId) {
-      const routine = deps.routines.getRoutine(routineId);
+      const routine = await deps.routines.getRoutine(routineId);
       return {
         revision: routine?.revision ?? null,
         scheduledSlot: scheduledSlots.get(routineId) ?? null,

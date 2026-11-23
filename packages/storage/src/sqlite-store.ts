@@ -1,17 +1,16 @@
 import {
   formatUtcTimestamp,
   type Approval,
+  type ApprovalEffectStore,
   type ApprovalId,
   type ApprovalResolutionInput,
   type Bot,
   type BotId,
+  type BotStore,
   type ChannelBinding,
   type ChannelBindingId,
-  type ChannelCursor,
   type ChannelIntakeMetadata,
   type ChannelIntegration,
-  type ChannelReceipt,
-  type ChannelReceiptDisposition,
   type CreateBotInput,
   type CreateSessionInput,
   type DeliveryResult,
@@ -22,17 +21,22 @@ import {
   type JsonValue,
   type Message,
   type OutboxDeliveryState,
+  type OutboxDestination,
   type OutboxEvent,
   type OutboxEventId,
+  type OutboxStore,
   type Routine,
   type RoutineId,
+  type RoutineStore,
   type Run,
   type RunAdmission,
   type RunEvent,
   type RunId,
   type RunRequest,
+  type RunStore,
   type Session,
   type SessionId,
+  type SessionStore,
   type Store,
   type UpdateBotInput,
   type UtcTimestamp,
@@ -52,15 +56,11 @@ import {
   type RequestApprovalOutcome,
 } from "./approvals-effects";
 import {
-  findChannelBinding as findChannelBindingQuery,
-  getChannelCursor as getChannelCursorQuery,
-  getChannelReceipt as getChannelReceiptQuery,
   listChannelBindings as listChannelBindingsQuery,
   listDueOutboxEvents as listDueOutboxEventsQuery,
+  listOutboxDestinations as listOutboxDestinationsQuery,
   listOutboxEvents as listOutboxEventsQuery,
-  recordChannelReceipt as recordChannelReceiptCommand,
   recordOutboxDelivery as recordOutboxDeliveryCommand,
-  setChannelCursor as setChannelCursorCommand,
   upsertChannelBinding as upsertChannelBindingCommand,
   type UpsertChannelBindingInput,
 } from "./channel-outbox";
@@ -118,7 +118,16 @@ export interface CreateRoutineInput {
 const DEFAULT_MAX_EVENT_BATCH_SIZE = 16;
 const DEFAULT_REPLAY_PAGE_SIZE = 64;
 
-export class SqliteStore implements Store {
+export class SqliteStore
+  implements
+    Store,
+    BotStore,
+    SessionStore,
+    RunStore,
+    ApprovalEffectStore,
+    OutboxStore,
+    RoutineStore
+{
   readonly database: SqliteDatabase;
   private readonly maxEventBatchSize: number;
   private readonly replayPageSize: number;
@@ -487,44 +496,13 @@ export class SqliteStore implements Store {
     return listChannelBindingsQuery(this.database, filter);
   }
 
-  findChannelBinding(query: {
-    readonly integration: ChannelIntegration;
-    readonly externalChatId: string;
-    readonly externalActorId: string;
+  listOutboxDestinations(filter?: {
+    readonly botId?: BotId;
     readonly sessionId?: SessionId;
-  }): ChannelBinding | undefined {
-    return findChannelBindingQuery(this.database, query);
-  }
-
-  getChannelReceipt(
-    integration: ChannelIntegration,
-    consumer: string,
-    externalUpdateId: string,
-  ): ChannelReceipt | undefined {
-    return getChannelReceiptQuery(this.database, integration, consumer, externalUpdateId);
-  }
-
-  recordChannelReceipt(input: {
-    readonly integration: ChannelIntegration;
-    readonly consumer: string;
-    readonly externalUpdateId: string;
-    readonly disposition: ChannelReceiptDisposition;
-    readonly referenceId: string | null;
-    readonly nextCursor?: string;
-  }): Promise<ChannelReceipt> {
-    return recordChannelReceiptCommand(this.database, input);
-  }
-
-  getChannelCursor(integration: ChannelIntegration, consumer: string): ChannelCursor | undefined {
-    return getChannelCursorQuery(this.database, integration, consumer);
-  }
-
-  setChannelCursor(
-    integration: ChannelIntegration,
-    consumer: string,
-    position: string,
-  ): Promise<ChannelCursor> {
-    return setChannelCursorCommand(this.database, integration, consumer, position);
+    readonly kind?: string;
+    readonly enabledOnly?: boolean;
+  }): OutboxDestination[] {
+    return listOutboxDestinationsQuery(this.database, filter);
   }
 
   listOutboxEvents(filter?: {

@@ -1,9 +1,22 @@
 import * as z from "zod";
 import { cloudEvent } from "../protocol/cloud-events";
 import { utcTimestamp } from "../protocol/timestamp";
-import { id } from "./common";
+import { id, jsonValue } from "./common";
 
-export const channelIntegration = z.enum(["telegram", "fixture"]);
+export const outboxDestination = z.object({
+  id,
+  kind: z.string().min(1),
+  target: z.string().min(1),
+  botId: id,
+  sessionId: id,
+  enabled: z.boolean(),
+  metadata: z.record(z.string(), jsonValue).optional(),
+  createdAt: utcTimestamp,
+  updatedAt: utcTimestamp,
+});
+export type OutboxDestination = z.infer<typeof outboxDestination>;
+
+export const channelIntegration = z.string().trim().min(1);
 export type ChannelIntegration = z.infer<typeof channelIntegration>;
 
 export const channelBinding = z.object({

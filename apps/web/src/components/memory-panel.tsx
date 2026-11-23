@@ -1,34 +1,15 @@
+import { Badge } from "@astryxdesign/core/Badge";
+import { Button } from "@astryxdesign/core/Button";
+import { Card } from "@astryxdesign/core/Card";
+import { EmptyState } from "@astryxdesign/core/EmptyState";
+import { Heading } from "@astryxdesign/core/Heading";
+import { Selector } from "@astryxdesign/core/Selector";
+import { Text } from "@astryxdesign/core/Text";
+import { TextArea } from "@astryxdesign/core/TextArea";
 import { BrainIcon, RefreshCwIcon, SaveIcon } from "lucide-react";
 import { useCallback, useEffect, useState, type FormEvent } from "react";
 import type { Bot, ProblemDetails } from "@der/domain";
 import { ProblemAlert } from "@/components/problem-alert";
-import { Badge } from "@/components/ui/badge";
-import { Button } from "@/components/ui/button";
-import {
-  Card,
-  CardContent,
-  CardDescription,
-  CardFooter,
-  CardHeader,
-  CardTitle,
-} from "@/components/ui/card";
-import {
-  Empty,
-  EmptyDescription,
-  EmptyHeader,
-  EmptyMedia,
-  EmptyTitle,
-} from "@/components/ui/empty";
-import { Field, FieldDescription, FieldGroup, FieldLabel } from "@/components/ui/field";
-import {
-  Select,
-  SelectContent,
-  SelectGroup,
-  SelectItem,
-  SelectTrigger,
-  SelectValue,
-} from "@/components/ui/select";
-import { Textarea } from "@/components/ui/textarea";
 import type { OperatorApi } from "@/lib/operator-api";
 import { toOperatorProblem, type BotMemoryResponse } from "@/lib/schemas";
 
@@ -103,17 +84,11 @@ export function MemoryPanel({ api, bot, onAnnounce }: MemoryPanelProps) {
 
   if (!bot) {
     return (
-      <Empty>
-        <EmptyHeader>
-          <EmptyMedia>
-            <BrainIcon />
-          </EmptyMedia>
-          <EmptyTitle>No bot selected</EmptyTitle>
-          <EmptyDescription>
-            Select a bot from the sidebar to view or edit its Memory.
-          </EmptyDescription>
-        </EmptyHeader>
-      </Empty>
+      <EmptyState
+        icon={<BrainIcon className="size-6" aria-hidden="true" />}
+        title="No bot selected"
+        description="Select a bot from the sidebar to view or edit its Memory."
+      />
     );
   }
 
@@ -125,104 +100,98 @@ export function MemoryPanel({ api, bot, onAnnounce }: MemoryPanelProps) {
     activeVersion !== undefined &&
     activeVersion !== latestVersion;
 
+  const versionOptions = [
+    { value: "latest", label: "Latest version" },
+    ...(memoryState?.versions ?? []).map((entry) => ({
+      value: String(entry.version),
+      label: `v${entry.version} (${entry.updatedAt.slice(0, 19)}Z)`,
+    })),
+  ];
+
   return (
     <div className="flex flex-col gap-4">
       <div className="flex flex-wrap items-center justify-between gap-3">
         <div className="flex flex-col gap-0.5">
-          <h2 className="text-base font-semibold tracking-tight">Memory for {bot.name}</h2>
-          <p className="text-xs text-muted-foreground">
+          <Heading level={2}>Memory for {bot.name}</Heading>
+          <Text type="supporting" as="p">
             Authoritative bot-scoped Markdown in SQLite, atomically projected to disk.
-          </p>
+          </Text>
         </div>
 
         <div className="flex items-center gap-2">
-          <div className="w-44">
-            <Select value={selectedVersion} onValueChange={(v) => void handleVersionChange(v)}>
-              <SelectTrigger aria-label="Memory version">
-                <SelectValue placeholder="Latest version" />
-              </SelectTrigger>
-              <SelectContent>
-                <SelectGroup>
-                  <SelectItem value="latest">Latest version</SelectItem>
-                  {(memoryState?.versions ?? []).map((entry) => (
-                    <SelectItem key={entry.version} value={String(entry.version)}>
-                      v{entry.version} ({entry.updatedAt.slice(0, 19)}Z)
-                    </SelectItem>
-                  ))}
-                </SelectGroup>
-              </SelectContent>
-            </Select>
-          </div>
+          <Selector
+            label="Memory version"
+            isLabelHidden
+            size="sm"
+            width={192}
+            value={selectedVersion}
+            options={versionOptions}
+            onChange={(value) => void handleVersionChange(value)}
+            placeholder="Latest version"
+          />
 
           <Button
-            variant="outline"
+            variant="secondary"
             size="sm"
+            label="Refresh"
+            icon={<RefreshCwIcon className="size-3.5" aria-hidden="true" />}
+            isDisabled={loading}
             onClick={() =>
               void loadMemory(
                 bot.id,
                 selectedVersion === "latest" ? undefined : Number(selectedVersion),
               )
             }
-            disabled={loading}
-          >
-            <RefreshCwIcon data-icon="inline-start" />
-            Refresh
-          </Button>
+          />
         </div>
       </div>
 
       {problem ? <ProblemAlert problem={problem} onDismiss={() => setProblem(null)} /> : null}
 
       <Card>
-        <form onSubmit={handleSave}>
-          <CardHeader>
+        <form onSubmit={handleSave} className="flex flex-col gap-4">
+          <div className="flex flex-col gap-1">
             <div className="flex flex-wrap items-center justify-between gap-2">
-              <CardTitle>Markdown source</CardTitle>
+              <Heading level={3}>Markdown source</Heading>
               <div className="flex items-center gap-2">
                 {activeVersion !== undefined ? (
-                  <Badge variant="secondary" className="font-mono">
-                    v{activeVersion}
-                  </Badge>
+                  <Badge variant="neutral" label={`v${activeVersion}`} />
                 ) : (
-                  <Badge variant="outline">Not written yet</Badge>
+                  <Badge variant="neutral" label="Not written yet" />
                 )}
                 {isViewingHistorical ? (
-                  <Badge variant="warn">Viewing historical revision</Badge>
+                  <Badge variant="warning" label="Viewing historical revision" />
                 ) : null}
               </div>
             </div>
-            <CardDescription>
+            <Text type="supporting" as="p">
               {memoryState?.memory
                 ? `Last updated at ${memoryState.memory.updatedAt}`
                 : "Write initial bot memory. Saving uses optimistic concurrency against the latest version."}
-            </CardDescription>
-          </CardHeader>
+            </Text>
+          </div>
 
-          <CardContent>
-            <FieldGroup>
-              <Field>
-                <FieldLabel htmlFor="bot-memory-editor">Bot memory Markdown</FieldLabel>
-                <Textarea
-                  id="bot-memory-editor"
-                  value={draft}
-                  onChange={(event) => setDraft(event.target.value)}
-                  rows={14}
-                  placeholder="# Preferences&#10;- Keep answers concise."
-                  className="font-mono text-xs leading-relaxed"
-                />
-                <FieldDescription>
-                  Saving writes a new version using expectedVersion={latestVersion ?? 0}.
-                </FieldDescription>
-              </Field>
-            </FieldGroup>
-          </CardContent>
+          <TextArea
+            id="bot-memory-editor"
+            label="Bot memory Markdown"
+            description={`Saving writes a new version using expectedVersion=${latestVersion ?? 0}.`}
+            value={draft}
+            onChange={setDraft}
+            rows={14}
+            placeholder={"# Preferences\n- Keep answers concise."}
+            width="100%"
+            controlClassName="font-mono text-xs leading-relaxed"
+          />
 
-          <CardFooter>
-            <Button type="submit" disabled={saving || loading}>
-              <SaveIcon data-icon="inline-start" />
-              {saving ? "Saving..." : "Save memory"}
-            </Button>
-          </CardFooter>
+          <div className="flex justify-end">
+            <Button
+              type="submit"
+              variant="primary"
+              label={saving ? "Saving..." : "Save memory"}
+              icon={<SaveIcon className="size-4" aria-hidden="true" />}
+              isDisabled={saving || loading}
+            />
+          </div>
         </form>
       </Card>
     </div>

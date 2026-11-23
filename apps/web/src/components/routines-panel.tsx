@@ -1,38 +1,19 @@
+import { Badge, type BadgeVariant } from "@astryxdesign/core/Badge";
+import { Button } from "@astryxdesign/core/Button";
+import { Card } from "@astryxdesign/core/Card";
+import { Dialog, DialogHeader } from "@astryxdesign/core/Dialog";
+import { EmptyState } from "@astryxdesign/core/EmptyState";
+import { Heading } from "@astryxdesign/core/Heading";
+import { Layout, LayoutContent, LayoutFooter } from "@astryxdesign/core/Layout";
+import { Selector } from "@astryxdesign/core/Selector";
+import { Switch } from "@astryxdesign/core/Switch";
+import { Text } from "@astryxdesign/core/Text";
+import { TextArea } from "@astryxdesign/core/TextArea";
+import { TextInput } from "@astryxdesign/core/TextInput";
 import { CalendarClockIcon, PlusIcon, RefreshCwIcon } from "lucide-react";
 import { useCallback, useEffect, useState, type FormEvent } from "react";
 import type { Bot, EngineKind, ProblemDetails, Routine, Session } from "@der/domain";
 import { ProblemAlert } from "@/components/problem-alert";
-import { Badge } from "@/components/ui/badge";
-import { Button } from "@/components/ui/button";
-import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
-import {
-  Dialog,
-  DialogContent,
-  DialogDescription,
-  DialogFooter,
-  DialogHeader,
-  DialogTitle,
-} from "@/components/ui/dialog";
-import {
-  Empty,
-  EmptyContent,
-  EmptyDescription,
-  EmptyHeader,
-  EmptyMedia,
-  EmptyTitle,
-} from "@/components/ui/empty";
-import { Field, FieldDescription, FieldGroup, FieldLabel } from "@/components/ui/field";
-import { Input } from "@/components/ui/input";
-import {
-  Select,
-  SelectContent,
-  SelectGroup,
-  SelectItem,
-  SelectTrigger,
-  SelectValue,
-} from "@/components/ui/select";
-import { Switch } from "@/components/ui/switch";
-import { Textarea } from "@/components/ui/textarea";
 import type { OperatorApi } from "@/lib/operator-api";
 import { toOperatorProblem, type RoutineDetailResponse } from "@/lib/schemas";
 import { cn } from "@/lib/utils";
@@ -46,17 +27,17 @@ export interface RoutinesPanelProps {
 
 function dispositionBadgeVariant(
   disposition: RoutineDetailResponse["slots"][number]["disposition"],
-): "ready" | "warn" | "danger" | "secondary" {
-  if (disposition === "completed" || disposition === "admitted") return "ready";
+): BadgeVariant {
+  if (disposition === "completed" || disposition === "admitted") return "success";
   if (
     disposition === "failed" ||
     disposition === "interrupted" ||
     disposition === "blocked_ineligible"
   ) {
-    return "danger";
+    return "error";
   }
-  if (disposition === "skipped_active_run") return "warn";
-  return "secondary";
+  if (disposition === "skipped_active_run") return "warning";
+  return "neutral";
 }
 
 export function RoutinesPanel({ api, bot, sessions, onAnnounce }: RoutinesPanelProps) {
@@ -192,72 +173,78 @@ export function RoutinesPanel({ api, bot, sessions, onAnnounce }: RoutinesPanelP
 
   if (!bot) {
     return (
-      <Empty>
-        <EmptyHeader>
-          <EmptyMedia>
-            <CalendarClockIcon />
-          </EmptyMedia>
-          <EmptyTitle>No bot selected</EmptyTitle>
-          <EmptyDescription>
-            Select a bot to inspect and configure its UTC Routines.
-          </EmptyDescription>
-        </EmptyHeader>
-      </Empty>
+      <EmptyState
+        icon={<CalendarClockIcon className="size-6" aria-hidden="true" />}
+        title="No bot selected"
+        description="Select a bot to inspect and configure its UTC Routines."
+      />
     );
   }
+
+  const sessionOptions = sessions.map((entry) => ({
+    value: entry.id,
+    label: entry.title,
+  }));
+
+  const engineOptions = bot.allowedEngines.map((kind) => ({
+    value: kind,
+    label: kind,
+  }));
 
   return (
     <div className="flex flex-col gap-5">
       <div className="flex flex-wrap items-center justify-between gap-3">
         <div className="flex flex-col gap-0.5">
-          <h2 className="text-base font-semibold tracking-tight">Routines for {bot.name}</h2>
-          <p className="text-xs text-muted-foreground">
+          <Heading level={2}>Routines for {bot.name}</Heading>
+          <Text type="supporting" as="p">
             Durable UTC cron schedules backed by Restate Virtual Objects and unattended engine
             checks.
-          </p>
+          </Text>
         </div>
 
         <div className="flex items-center gap-2">
           <Button
-            variant="outline"
+            variant="secondary"
             size="sm"
+            label="Refresh"
+            icon={<RefreshCwIcon className="size-3.5" aria-hidden="true" />}
+            isDisabled={loading}
             onClick={() => void loadRoutines(bot.id)}
-            disabled={loading}
-          >
-            <RefreshCwIcon data-icon="inline-start" />
-            Refresh
-          </Button>
-          <Button size="sm" onClick={openCreateDialog} disabled={sessions.length === 0}>
-            <PlusIcon data-icon="inline-start" />
-            New routine
-          </Button>
+          />
+          <Button
+            variant="primary"
+            size="sm"
+            label="New routine"
+            icon={<PlusIcon className="size-3.5" aria-hidden="true" />}
+            isDisabled={sessions.length === 0}
+            onClick={openCreateDialog}
+          />
         </div>
       </div>
 
       {problem ? <ProblemAlert problem={problem} onDismiss={() => setProblem(null)} /> : null}
 
       {routines.length === 0 ? (
-        <Empty>
-          <EmptyHeader>
-            <EmptyMedia>
-              <CalendarClockIcon />
-            </EmptyMedia>
-            <EmptyTitle>No routines scheduled</EmptyTitle>
-            <EmptyDescription>
-              {sessions.length === 0
-                ? "Create a session first, then schedule a UTC routine against it."
-                : "Schedule a recurring UTC prompt for an unattended-eligible engine."}
-            </EmptyDescription>
-          </EmptyHeader>
-          {sessions.length > 0 ? (
-            <EmptyContent>
-              <Button size="sm" onClick={openCreateDialog}>
-                <PlusIcon data-icon="inline-start" />
-                New routine
-              </Button>
-            </EmptyContent>
-          ) : null}
-        </Empty>
+        <EmptyState
+          icon={<CalendarClockIcon className="size-6" aria-hidden="true" />}
+          title="No routines scheduled"
+          description={
+            sessions.length === 0
+              ? "Create a session first, then schedule a UTC routine against it."
+              : "Schedule a recurring UTC prompt for an unattended-eligible engine."
+          }
+          actions={
+            sessions.length > 0 ? (
+              <Button
+                variant="primary"
+                size="sm"
+                label="New routine"
+                icon={<PlusIcon className="size-3.5" aria-hidden="true" />}
+                onClick={openCreateDialog}
+              />
+            ) : undefined
+          }
+        />
       ) : (
         <div className="grid gap-4 lg:grid-cols-[22rem_minmax(0,1fr)]">
           <ul className="flex flex-col gap-2" aria-label="Bot routines">
@@ -268,37 +255,34 @@ export function RoutinesPanel({ api, bot, sessions, onAnnounce }: RoutinesPanelP
                   key={entry.id}
                   className={cn(
                     "flex flex-col gap-2.5 rounded-lg border p-3.5 transition-colors",
-                    isSelected ? "border-primary bg-accent/50" : "border-border bg-card",
+                    isSelected ? "border-border-strong bg-accent-muted" : "border-border bg-card",
                   )}
                 >
                   <div className="flex items-start justify-between gap-2">
                     <button
                       type="button"
                       onClick={() => setSelectedRoutineId(entry.id)}
-                      className="flex flex-col items-start gap-0.5 text-left focus-visible:outline-2 focus-visible:outline-ring"
+                      className="flex flex-col items-start gap-0.5 text-left focus-visible:outline-2 focus-visible:outline-info"
                     >
                       <span className="text-sm font-semibold">{entry.name}</span>
-                      <span className="font-mono text-xs text-muted-foreground">
-                        {entry.cron} UTC
-                      </span>
+                      <span className="font-mono text-xs text-secondary">{entry.cron} UTC</span>
                     </button>
                     <Switch
-                      checked={entry.enabled}
-                      disabled={togglingId === entry.id}
-                      aria-label={`Toggle routine ${entry.name}`}
-                      onCheckedChange={(checked) => void handleToggle(entry, checked)}
+                      label={`Toggle routine ${entry.name}`}
+                      isLabelHidden
+                      size="sm"
+                      value={entry.enabled}
+                      isDisabled={togglingId === entry.id}
+                      onChange={(checked) => void handleToggle(entry, checked)}
                     />
                   </div>
                   <div className="flex flex-wrap items-center gap-1.5">
-                    <Badge variant={entry.enabled ? "ready" : "secondary"}>
-                      {entry.enabled ? "Enabled" : "Paused"}
-                    </Badge>
-                    <Badge variant="outline" className="font-mono">
-                      {entry.engine}
-                    </Badge>
-                    <Badge variant="outline" className="font-mono">
-                      rev {entry.revision}
-                    </Badge>
+                    <Badge
+                      variant={entry.enabled ? "success" : "neutral"}
+                      label={entry.enabled ? "Enabled" : "Paused"}
+                    />
+                    <Badge variant="neutral" label={entry.engine} />
+                    <Badge variant="neutral" label={`rev ${entry.revision}`} />
                   </div>
                 </li>
               );
@@ -306,32 +290,35 @@ export function RoutinesPanel({ api, bot, sessions, onAnnounce }: RoutinesPanelP
           </ul>
 
           <Card>
-            <CardHeader>
-              <CardTitle>{detail?.routine.name ?? "Routine detail"}</CardTitle>
-              <CardDescription className="font-mono text-xs">
-                {detail
-                  ? `${detail.routine.cron} UTC · session ${detail.routine.sessionId} · rev ${detail.routine.revision}`
-                  : "Select a routine to inspect its prompt and recorded UTC slots."}
-              </CardDescription>
-            </CardHeader>
-            <CardContent className="flex flex-col gap-4">
+            <div className="flex flex-col gap-4">
+              <div className="flex flex-col gap-1">
+                <Heading level={3}>{detail?.routine.name ?? "Routine detail"}</Heading>
+                <Text type="code" color="secondary" as="p">
+                  {detail
+                    ? `${detail.routine.cron} UTC · session ${detail.routine.sessionId} · rev ${detail.routine.revision}`
+                    : "Select a routine to inspect its prompt and recorded UTC slots."}
+                </Text>
+              </div>
+
               {detail ? (
                 <>
                   <div className="flex flex-col gap-1">
-                    <span className="text-xs font-medium text-muted-foreground">Prompt</span>
-                    <p className="rounded-md border border-border bg-muted/40 px-3 py-2 text-sm leading-relaxed">
+                    <Text type="label" color="secondary">
+                      Prompt
+                    </Text>
+                    <p className="rounded-md border border-border bg-muted px-3 py-2 text-sm leading-relaxed">
                       {detail.routine.prompt}
                     </p>
                   </div>
 
                   <div className="flex flex-col gap-2">
-                    <span className="text-xs font-medium text-muted-foreground">
+                    <Text type="label" color="secondary">
                       Recorded UTC slots ({detail.slots.length})
-                    </span>
+                    </Text>
                     {detail.slots.length === 0 ? (
-                      <p className="text-xs text-muted-foreground">
+                      <Text type="supporting" as="p">
                         No UTC slots have fired yet for this routine.
-                      </p>
+                      </Text>
                     ) : (
                       <ul className="flex flex-col gap-1.5">
                         {detail.slots.map((slot) => (
@@ -341,11 +328,12 @@ export function RoutinesPanel({ api, bot, sessions, onAnnounce }: RoutinesPanelP
                           >
                             <span className="font-mono">{slot.slot}</span>
                             <div className="flex items-center gap-2">
-                              <Badge variant={dispositionBadgeVariant(slot.disposition)}>
-                                {slot.disposition}
-                              </Badge>
+                              <Badge
+                                variant={dispositionBadgeVariant(slot.disposition)}
+                                label={slot.disposition}
+                              />
                               {slot.runId ? (
-                                <span className="font-mono text-[11px] text-muted-foreground">
+                                <span className="font-mono text-xs text-secondary">
                                   run {slot.runId}
                                 </span>
                               ) : null}
@@ -357,122 +345,109 @@ export function RoutinesPanel({ api, bot, sessions, onAnnounce }: RoutinesPanelP
                   </div>
                 </>
               ) : null}
-            </CardContent>
+            </div>
           </Card>
         </div>
       )}
 
-      <Dialog open={createOpen} onOpenChange={setCreateOpen}>
-        <DialogContent>
-          <DialogHeader>
-            <DialogTitle>Create UTC routine</DialogTitle>
-            <DialogDescription>
-              Enabled routines verify unattended engine eligibility before scheduling.
-            </DialogDescription>
-          </DialogHeader>
+      <Dialog isOpen={createOpen} onOpenChange={setCreateOpen} purpose="form" width={480}>
+        <form onSubmit={handleCreate}>
+          <Layout
+            height="auto"
+            header={
+              <DialogHeader
+                title="Create UTC routine"
+                subtitle="Enabled routines verify unattended engine eligibility before scheduling."
+                onOpenChange={setCreateOpen}
+                hasDivider
+              />
+            }
+            content={
+              <LayoutContent isScrollable={false}>
+                <div className="flex flex-col gap-4">
+                  {formProblem ? (
+                    <ProblemAlert problem={formProblem} onDismiss={() => setFormProblem(null)} />
+                  ) : null}
 
-          <form onSubmit={handleCreate} className="flex flex-col gap-4">
-            {formProblem ? (
-              <ProblemAlert problem={formProblem} onDismiss={() => setFormProblem(null)} />
-            ) : null}
+                  <TextInput
+                    id="routine-name-input"
+                    label="Name"
+                    value={name}
+                    onChange={setName}
+                    placeholder="Morning check"
+                    isRequired
+                    width="100%"
+                  />
 
-            <FieldGroup>
-              <Field>
-                <FieldLabel htmlFor="routine-name-input">Name</FieldLabel>
-                <Input
-                  id="routine-name-input"
-                  value={name}
-                  onChange={(event) => setName(event.target.value)}
-                  placeholder="Morning check"
-                  required
-                />
-              </Field>
+                  <Selector
+                    id="routine-session-select"
+                    label="Target session"
+                    value={sessionId}
+                    options={sessionOptions}
+                    onChange={setSessionId}
+                    placeholder="Choose session"
+                    width="100%"
+                  />
 
-              <Field>
-                <FieldLabel htmlFor="routine-session-select">Target session</FieldLabel>
-                <Select value={sessionId} onValueChange={setSessionId}>
-                  <SelectTrigger id="routine-session-select">
-                    <SelectValue placeholder="Choose session" />
-                  </SelectTrigger>
-                  <SelectContent>
-                    <SelectGroup>
-                      {sessions.map((entry) => (
-                        <SelectItem key={entry.id} value={entry.id}>
-                          {entry.title}
-                        </SelectItem>
-                      ))}
-                    </SelectGroup>
-                  </SelectContent>
-                </Select>
-              </Field>
+                  <TextInput
+                    id="routine-cron-input"
+                    label="UTC cron expression"
+                    description="Evaluated strictly in UTC."
+                    value={cron}
+                    onChange={setCron}
+                    placeholder="0 8 * * *"
+                    isRequired
+                    width="100%"
+                    controlClassName="font-mono text-xs"
+                  />
 
-              <Field>
-                <FieldLabel htmlFor="routine-cron-input">UTC cron expression</FieldLabel>
-                <Input
-                  id="routine-cron-input"
-                  value={cron}
-                  onChange={(event) => setCron(event.target.value)}
-                  placeholder="0 8 * * *"
-                  className="font-mono text-xs"
-                  required
-                />
-                <FieldDescription>Evaluated strictly in UTC.</FieldDescription>
-              </Field>
+                  <Selector
+                    id="routine-engine-select"
+                    label="Engine"
+                    value={engine}
+                    options={engineOptions}
+                    onChange={(value) => setEngine(value as EngineKind)}
+                    placeholder="Choose engine"
+                    width="100%"
+                  />
 
-              <Field>
-                <FieldLabel htmlFor="routine-engine-select">Engine</FieldLabel>
-                <Select value={engine} onValueChange={(v) => setEngine(v as EngineKind)}>
-                  <SelectTrigger id="routine-engine-select">
-                    <SelectValue placeholder="Choose engine" />
-                  </SelectTrigger>
-                  <SelectContent>
-                    <SelectGroup>
-                      {bot.allowedEngines.map((kind) => (
-                        <SelectItem key={kind} value={kind}>
-                          {kind}
-                        </SelectItem>
-                      ))}
-                    </SelectGroup>
-                  </SelectContent>
-                </Select>
-              </Field>
+                  <Switch
+                    id="routine-enabled-switch"
+                    label="Enable schedule immediately"
+                    labelPosition="start"
+                    labelSpacing="spread"
+                    value={enabled}
+                    onChange={setEnabled}
+                    width="100%"
+                  />
 
-              <Field orientation="horizontal">
-                <FieldLabel htmlFor="routine-enabled-switch">
-                  Enable schedule immediately
-                </FieldLabel>
-                <Switch
-                  id="routine-enabled-switch"
-                  checked={enabled}
-                  onCheckedChange={setEnabled}
-                />
-              </Field>
-
-              <Field>
-                <FieldLabel htmlFor="routine-prompt-input">Prompt</FieldLabel>
-                <Textarea
-                  id="routine-prompt-input"
-                  value={prompt}
-                  onChange={(event) => setPrompt(event.target.value)}
-                  placeholder="Summarize overnight sensor alerts."
-                  required
-                />
-              </Field>
-            </FieldGroup>
-
-            <DialogFooter>
-              <Button variant="outline" onClick={() => setCreateOpen(false)}>
-                Cancel
-              </Button>
-              <Button
-                type="submit"
-                disabled={saving || name.trim().length === 0 || prompt.trim().length === 0}
-              >
-                {saving ? "Scheduling..." : "Create routine"}
-              </Button>
-            </DialogFooter>
-          </form>
-        </DialogContent>
+                  <TextArea
+                    id="routine-prompt-input"
+                    label="Prompt"
+                    value={prompt}
+                    onChange={setPrompt}
+                    placeholder="Summarize overnight sensor alerts."
+                    isRequired
+                    width="100%"
+                  />
+                </div>
+              </LayoutContent>
+            }
+            footer={
+              <LayoutFooter hasDivider>
+                <div className="flex justify-end gap-2">
+                  <Button variant="secondary" label="Cancel" onClick={() => setCreateOpen(false)} />
+                  <Button
+                    type="submit"
+                    variant="primary"
+                    label={saving ? "Scheduling..." : "Create routine"}
+                    isDisabled={saving || name.trim().length === 0 || prompt.trim().length === 0}
+                  />
+                </div>
+              </LayoutFooter>
+            }
+          />
+        </form>
       </Dialog>
     </div>
   );

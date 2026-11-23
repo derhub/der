@@ -6,6 +6,8 @@ export {
   effectOperationKind,
   effectRecord,
   effectStatus,
+  persistedEffectIdentity,
+  persistedEffectOperationKind,
   type Approval,
   type ApprovalDecision,
   type ApprovalResolutionInput,
@@ -13,6 +15,8 @@ export {
   type EffectOperationKind,
   type EffectRecord,
   type EffectStatus,
+  type PersistedEffectIdentity,
+  type PersistedEffectOperationKind,
 } from "./approval";
 export {
   bot,
@@ -32,6 +36,7 @@ export {
   channelUpdatePayload,
   deliveryResult,
   outboxDeliveryState,
+  outboxDestination,
   outboxEvent,
   type ChannelBinding,
   type ChannelCursor,
@@ -42,6 +47,7 @@ export {
   type ChannelUpdatePayload,
   type DeliveryResult,
   type OutboxDeliveryState,
+  type OutboxDestination,
   type OutboxEvent,
 } from "./channel";
 export {
@@ -97,6 +103,7 @@ export {
 } from "./routine";
 export {
   channelIntakeMetadata,
+  persistedRunOrigin,
   run,
   runAdmission,
   runEvent,
@@ -105,6 +112,7 @@ export {
   runStatus,
   terminalRunStatus,
   type ChannelIntakeMetadata,
+  type PersistedRunOrigin,
   type Run,
   type RunAdmission,
   type RunEvent,

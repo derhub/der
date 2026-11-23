@@ -1,36 +1,19 @@
+import { Badge } from "@astryxdesign/core/Badge";
+import { Button } from "@astryxdesign/core/Button";
+import { CheckboxInput } from "@astryxdesign/core/CheckboxInput";
+import { Dialog, DialogHeader } from "@astryxdesign/core/Dialog";
+import { Divider } from "@astryxdesign/core/Divider";
+import { Heading } from "@astryxdesign/core/Heading";
+import { IconButton } from "@astryxdesign/core/IconButton";
+import { Layout, LayoutContent, LayoutFooter } from "@astryxdesign/core/Layout";
+import { Selector } from "@astryxdesign/core/Selector";
+import { Text } from "@astryxdesign/core/Text";
+import { TextArea } from "@astryxdesign/core/TextArea";
+import { TextInput } from "@astryxdesign/core/TextInput";
 import { BotIcon, MessageSquareIcon, PencilIcon, PlusIcon } from "lucide-react";
 import { useState, type FormEvent } from "react";
 import type { Bot, EngineKind, ProblemDetails, Session } from "@der/domain";
 import { ProblemAlert } from "@/components/problem-alert";
-import { Badge } from "@/components/ui/badge";
-import { Button } from "@/components/ui/button";
-import {
-  Dialog,
-  DialogContent,
-  DialogDescription,
-  DialogFooter,
-  DialogHeader,
-  DialogTitle,
-} from "@/components/ui/dialog";
-import {
-  Field,
-  FieldDescription,
-  FieldGroup,
-  FieldLabel,
-  FieldLegend,
-  FieldSet,
-} from "@/components/ui/field";
-import { Input } from "@/components/ui/input";
-import {
-  Select,
-  SelectContent,
-  SelectGroup,
-  SelectItem,
-  SelectTrigger,
-  SelectValue,
-} from "@/components/ui/select";
-import { Separator } from "@/components/ui/separator";
-import { Textarea } from "@/components/ui/textarea";
 import type { OperatorApi } from "@/lib/operator-api";
 import { toOperatorProblem } from "@/lib/schemas";
 import { cn } from "@/lib/utils";
@@ -186,39 +169,51 @@ export function OperatorSidebar({
     }
   }
 
+  const allEngineOptions = ALL_ENGINES.map((kind) => ({ value: kind, label: kind }));
+  const sessionEngineOptions = [
+    { value: "default", label: `Bot default (${selectedBot?.defaultEngine ?? "fixture"})` },
+    ...(selectedBot?.allowedEngines ?? ALL_ENGINES).map((kind) => ({
+      value: kind,
+      label: kind,
+    })),
+  ];
+
   return (
     <aside
       aria-label="Bots and sessions"
-      className="flex h-full w-full flex-col border-r border-sidebar-border bg-sidebar text-sidebar-foreground md:w-72 md:shrink-0"
+      className="flex h-full w-full flex-col border-r border-border bg-surface text-primary md:w-72 md:shrink-0"
     >
       <div className="flex items-center justify-between gap-2 px-4 py-3.5">
         <div className="flex items-center gap-2.5">
           <img src="/der-mark.svg" alt="" className="size-7 rounded-md" />
           <div className="flex flex-col">
             <span className="text-sm font-semibold tracking-tight leading-none">der</span>
-            <span className="text-[11px] text-muted-foreground">Operator console</span>
+            <Text type="supporting">Operator console</Text>
           </div>
         </div>
-        <Button size="sm" variant="outline" onClick={openCreateBot}>
-          <PlusIcon data-icon="inline-start" />
-          New bot
-        </Button>
+        <Button
+          size="sm"
+          variant="secondary"
+          label="New bot"
+          icon={<PlusIcon className="size-3.5" aria-hidden="true" />}
+          onClick={openCreateBot}
+        />
       </div>
 
-      <Separator />
+      <Divider />
 
       <div className="flex flex-1 flex-col gap-5 overflow-y-auto px-3 py-4">
         <section aria-labelledby="sidebar-bots-heading" className="flex flex-col gap-2">
           <div className="flex items-center justify-between px-1">
-            <h2 id="sidebar-bots-heading" className="text-xs font-semibold text-muted-foreground">
+            <Heading level={2} id="sidebar-bots-heading" color="secondary">
               Bots ({bots.length})
-            </h2>
+            </Heading>
           </div>
 
           {bots.length === 0 ? (
-            <p className="px-2 py-2 text-xs text-muted-foreground">
+            <Text type="supporting" as="p" className="px-2 py-2">
               No bots yet. Create one to start a scoped session.
-            </p>
+            </Text>
           ) : (
             <ul className="flex flex-col gap-1">
               {bots.map((entry) => {
@@ -230,29 +225,25 @@ export function OperatorSidebar({
                       onClick={() => onSelectBot(entry.id)}
                       aria-current={isSelected ? "true" : undefined}
                       className={cn(
-                        "flex min-w-0 flex-1 items-center justify-between gap-2 rounded-md px-2.5 py-2 text-left text-sm transition-colors focus-visible:outline-2 focus-visible:outline-ring",
+                        "flex min-w-0 flex-1 items-center justify-between gap-2 rounded-md px-2.5 py-2 text-left text-sm transition-colors focus-visible:outline-2 focus-visible:outline-info",
                         isSelected
-                          ? "bg-card font-medium text-foreground shadow-2xs ring-1 ring-border"
-                          : "text-foreground/85 hover:bg-card/60",
+                          ? "bg-card font-medium text-primary shadow-sm ring-1 ring-border"
+                          : "text-secondary hover:bg-card/60 hover:text-primary",
                       )}
                     >
                       <span className="flex min-w-0 items-center gap-2">
-                        <BotIcon className="size-4 shrink-0 text-primary" aria-hidden="true" />
+                        <BotIcon className="size-4 shrink-0 text-accent" aria-hidden="true" />
                         <span className="truncate">{entry.name}</span>
                       </span>
-                      <Badge variant="secondary" className="font-mono text-[10px]">
-                        {entry.defaultEngine}
-                      </Badge>
+                      <Badge variant="neutral" label={entry.defaultEngine} />
                     </button>
-                    <Button
-                      size="icon"
+                    <IconButton
+                      size="sm"
                       variant="ghost"
-                      className="size-8 shrink-0"
-                      aria-label={`Edit bot ${entry.name}`}
+                      label={`Edit bot ${entry.name}`}
+                      icon={<PencilIcon className="size-3.5" aria-hidden="true" />}
                       onClick={() => openEditBot(entry)}
-                    >
-                      <PencilIcon className="size-3.5" />
-                    </Button>
+                    />
                   </li>
                 );
               })}
@@ -260,36 +251,31 @@ export function OperatorSidebar({
           )}
         </section>
 
-        <Separator />
+        <Divider />
 
         <section aria-labelledby="sidebar-sessions-heading" className="flex flex-col gap-2">
           <div className="flex items-center justify-between px-1">
-            <h2
-              id="sidebar-sessions-heading"
-              className="text-xs font-semibold text-muted-foreground"
-            >
+            <Heading level={2} id="sidebar-sessions-heading" color="secondary">
               Sessions ({sessions.length})
-            </h2>
+            </Heading>
             <Button
               size="sm"
               variant="ghost"
-              disabled={!selectedBot}
+              label="New session"
+              icon={<PlusIcon className="size-3.5" aria-hidden="true" />}
+              isDisabled={!selectedBot}
               onClick={openCreateSession}
-              className="h-7 px-2 text-xs"
-            >
-              <PlusIcon data-icon="inline-start" />
-              New session
-            </Button>
+            />
           </div>
 
           {!selectedBot ? (
-            <p className="px-2 py-2 text-xs text-muted-foreground">
+            <Text type="supporting" as="p" className="px-2 py-2">
               Select a bot to inspect its sessions.
-            </p>
+            </Text>
           ) : sessions.length === 0 ? (
-            <p className="px-2 py-2 text-xs text-muted-foreground">
+            <Text type="supporting" as="p" className="px-2 py-2">
               No sessions in {selectedBot.name}.
-            </p>
+            </Text>
           ) : (
             <ul className="flex flex-col gap-1">
               {sessions.map((entry) => {
@@ -301,10 +287,10 @@ export function OperatorSidebar({
                       onClick={() => onSelectSession(entry.id)}
                       aria-current={isSelected ? "true" : undefined}
                       className={cn(
-                        "flex w-full items-center justify-between gap-2 rounded-md px-2.5 py-2 text-left text-sm transition-colors focus-visible:outline-2 focus-visible:outline-ring",
+                        "flex w-full items-center justify-between gap-2 rounded-md px-2.5 py-2 text-left text-sm transition-colors focus-visible:outline-2 focus-visible:outline-info",
                         isSelected
-                          ? "bg-accent font-medium text-accent-foreground"
-                          : "text-foreground/85 hover:bg-card/60",
+                          ? "bg-accent-muted font-medium text-primary"
+                          : "text-secondary hover:bg-card/60 hover:text-primary",
                       )}
                     >
                       <span className="flex min-w-0 items-center gap-2">
@@ -312,9 +298,7 @@ export function OperatorSidebar({
                         <span className="truncate">{entry.title}</span>
                       </span>
                       {entry.engine ? (
-                        <span className="font-mono text-[10px] text-muted-foreground">
-                          {entry.engine}
-                        </span>
+                        <span className="font-mono text-xs text-secondary">{entry.engine}</span>
                       ) : null}
                     </button>
                   </li>
@@ -325,182 +309,179 @@ export function OperatorSidebar({
         </section>
       </div>
 
-      <Dialog open={botDialogOpen} onOpenChange={setBotDialogOpen}>
-        <DialogContent>
-          <DialogHeader>
-            <DialogTitle>{editingBot ? `Edit bot ${editingBot.name}` : "Create bot"}</DialogTitle>
-            <DialogDescription>
-              Configure persona, default engine, and allowed BYO engines for this bot scope.
-            </DialogDescription>
-          </DialogHeader>
+      <Dialog isOpen={botDialogOpen} onOpenChange={setBotDialogOpen} purpose="form" width={480}>
+        <form onSubmit={handleBotSubmit}>
+          <Layout
+            height="auto"
+            header={
+              <DialogHeader
+                title={editingBot ? `Edit bot ${editingBot.name}` : "Create bot"}
+                subtitle="Configure persona, default engine, and allowed BYO engines for this bot scope."
+                onOpenChange={setBotDialogOpen}
+                hasDivider
+              />
+            }
+            content={
+              <LayoutContent isScrollable={false}>
+                <div className="flex flex-col gap-4">
+                  {botProblem ? (
+                    <ProblemAlert problem={botProblem} onDismiss={() => setBotProblem(null)} />
+                  ) : null}
 
-          <form onSubmit={handleBotSubmit} className="flex flex-col gap-4">
-            {botProblem ? (
-              <ProblemAlert problem={botProblem} onDismiss={() => setBotProblem(null)} />
-            ) : null}
+                  <TextInput
+                    id="bot-name-input"
+                    label="Name"
+                    value={botName}
+                    onChange={setBotName}
+                    placeholder="Home Ops"
+                    isRequired
+                    width="100%"
+                  />
 
-            <FieldGroup>
-              <Field>
-                <FieldLabel htmlFor="bot-name-input">Name</FieldLabel>
-                <Input
-                  id="bot-name-input"
-                  value={botName}
-                  onChange={(event) => setBotName(event.target.value)}
-                  placeholder="Home Ops"
-                  required
-                />
-              </Field>
+                  <TextArea
+                    id="bot-persona-input"
+                    label="Persona"
+                    value={botPersona}
+                    onChange={setBotPersona}
+                    placeholder="Direct, verification-first operator assistant."
+                    width="100%"
+                  />
 
-              <Field>
-                <FieldLabel htmlFor="bot-persona-input">Persona</FieldLabel>
-                <Textarea
-                  id="bot-persona-input"
-                  value={botPersona}
-                  onChange={(event) => setBotPersona(event.target.value)}
-                  placeholder="Direct, verification-first operator assistant."
-                />
-              </Field>
+                  <Selector
+                    id="bot-default-engine"
+                    label="Default engine"
+                    value={botDefaultEngine}
+                    options={allEngineOptions}
+                    onChange={(value) => {
+                      const next = value as EngineKind;
+                      setBotDefaultEngine(next);
+                      if (!botAllowedEngines.includes(next)) {
+                        setBotAllowedEngines((prev) => [...prev, next]);
+                      }
+                    }}
+                    placeholder="Choose engine"
+                    width="100%"
+                  />
 
-              <Field>
-                <FieldLabel htmlFor="bot-default-engine">Default engine</FieldLabel>
-                <Select
-                  value={botDefaultEngine}
-                  onValueChange={(value) => {
-                    const next = value as EngineKind;
-                    setBotDefaultEngine(next);
-                    if (!botAllowedEngines.includes(next)) {
-                      setBotAllowedEngines((prev) => [...prev, next]);
-                    }
-                  }}
-                >
-                  <SelectTrigger id="bot-default-engine">
-                    <SelectValue placeholder="Choose engine" />
-                  </SelectTrigger>
-                  <SelectContent>
-                    <SelectGroup>
+                  <fieldset className="flex flex-col gap-2">
+                    <legend className="text-sm font-medium text-primary">Allowed engines</legend>
+                    <Text type="supporting" as="p">
+                      Sessions and runs for this bot can only use checked engines.
+                    </Text>
+                    <div className="flex flex-wrap gap-3">
                       {ALL_ENGINES.map((kind) => (
-                        <SelectItem key={kind} value={kind}>
-                          {kind}
-                        </SelectItem>
-                      ))}
-                    </SelectGroup>
-                  </SelectContent>
-                </Select>
-              </Field>
-
-              <FieldSet>
-                <FieldLegend>Allowed engines</FieldLegend>
-                <FieldDescription>
-                  Sessions and runs for this bot can only use checked engines.
-                </FieldDescription>
-                <div className="flex flex-wrap gap-2">
-                  {ALL_ENGINES.map((kind) => {
-                    const checked = botAllowedEngines.includes(kind);
-                    return (
-                      <label
-                        key={kind}
-                        className={cn(
-                          "inline-flex items-center gap-2 rounded-md border px-2.5 py-1.5 text-xs font-mono",
-                          checked
-                            ? "border-primary bg-accent text-accent-foreground"
-                            : "border-border bg-card",
-                        )}
-                      >
-                        <input
-                          type="checkbox"
-                          checked={checked}
+                        <CheckboxInput
+                          key={kind}
+                          label={kind}
+                          size="sm"
+                          value={botAllowedEngines.includes(kind)}
                           onChange={() => toggleAllowedEngine(kind)}
-                          className="accent-primary"
                         />
-                        {kind}
-                      </label>
-                    );
-                  })}
+                      ))}
+                    </div>
+                  </fieldset>
+
+                  <TextInput
+                    id="bot-workspace-input"
+                    label="Workspace path (optional)"
+                    value={botWorkspacePath}
+                    onChange={setBotWorkspacePath}
+                    placeholder="/data/workspaces/home-ops"
+                    width="100%"
+                    controlClassName="font-mono text-xs"
+                  />
                 </div>
-              </FieldSet>
-
-              <Field>
-                <FieldLabel htmlFor="bot-workspace-input">Workspace path (optional)</FieldLabel>
-                <Input
-                  id="bot-workspace-input"
-                  value={botWorkspacePath}
-                  onChange={(event) => setBotWorkspacePath(event.target.value)}
-                  placeholder="/data/workspaces/home-ops"
-                  className="font-mono text-xs"
-                />
-              </Field>
-            </FieldGroup>
-
-            <DialogFooter>
-              <Button variant="outline" onClick={() => setBotDialogOpen(false)}>
-                Cancel
-              </Button>
-              <Button type="submit" disabled={botSaving || botName.trim().length === 0}>
-                {botSaving ? "Saving..." : editingBot ? "Save changes" : "Create bot"}
-              </Button>
-            </DialogFooter>
-          </form>
-        </DialogContent>
+              </LayoutContent>
+            }
+            footer={
+              <LayoutFooter hasDivider>
+                <div className="flex justify-end gap-2">
+                  <Button
+                    variant="secondary"
+                    label="Cancel"
+                    onClick={() => setBotDialogOpen(false)}
+                  />
+                  <Button
+                    type="submit"
+                    variant="primary"
+                    label={botSaving ? "Saving..." : editingBot ? "Save changes" : "Create bot"}
+                    isDisabled={botSaving || botName.trim().length === 0}
+                  />
+                </div>
+              </LayoutFooter>
+            }
+          />
+        </form>
       </Dialog>
 
-      <Dialog open={sessionDialogOpen} onOpenChange={setSessionDialogOpen}>
-        <DialogContent>
-          <DialogHeader>
-            <DialogTitle>Create session</DialogTitle>
-            <DialogDescription>
-              Start a new scoped message history under {selectedBot?.name ?? "the selected bot"}.
-            </DialogDescription>
-          </DialogHeader>
+      <Dialog
+        isOpen={sessionDialogOpen}
+        onOpenChange={setSessionDialogOpen}
+        purpose="form"
+        width={440}
+      >
+        <form onSubmit={handleSessionSubmit}>
+          <Layout
+            height="auto"
+            header={
+              <DialogHeader
+                title="Create session"
+                subtitle={`Start a new scoped message history under ${selectedBot?.name ?? "the selected bot"}.`}
+                onOpenChange={setSessionDialogOpen}
+                hasDivider
+              />
+            }
+            content={
+              <LayoutContent isScrollable={false}>
+                <div className="flex flex-col gap-4">
+                  {sessionProblem ? (
+                    <ProblemAlert
+                      problem={sessionProblem}
+                      onDismiss={() => setSessionProblem(null)}
+                    />
+                  ) : null}
 
-          <form onSubmit={handleSessionSubmit} className="flex flex-col gap-4">
-            {sessionProblem ? (
-              <ProblemAlert problem={sessionProblem} onDismiss={() => setSessionProblem(null)} />
-            ) : null}
+                  <TextInput
+                    id="session-title-input"
+                    label="Title"
+                    value={sessionTitle}
+                    onChange={setSessionTitle}
+                    placeholder="Evening maintenance"
+                    isRequired
+                    width="100%"
+                  />
 
-            <FieldGroup>
-              <Field>
-                <FieldLabel htmlFor="session-title-input">Title</FieldLabel>
-                <Input
-                  id="session-title-input"
-                  value={sessionTitle}
-                  onChange={(event) => setSessionTitle(event.target.value)}
-                  placeholder="Evening maintenance"
-                  required
-                />
-              </Field>
-
-              <Field>
-                <FieldLabel htmlFor="session-engine-select">Engine override</FieldLabel>
-                <Select value={sessionEngine} onValueChange={setSessionEngine}>
-                  <SelectTrigger id="session-engine-select">
-                    <SelectValue placeholder="Bot default" />
-                  </SelectTrigger>
-                  <SelectContent>
-                    <SelectGroup>
-                      <SelectItem value="default">
-                        Bot default ({selectedBot?.defaultEngine ?? "fixture"})
-                      </SelectItem>
-                      {(selectedBot?.allowedEngines ?? ALL_ENGINES).map((kind) => (
-                        <SelectItem key={kind} value={kind}>
-                          {kind}
-                        </SelectItem>
-                      ))}
-                    </SelectGroup>
-                  </SelectContent>
-                </Select>
-              </Field>
-            </FieldGroup>
-
-            <DialogFooter>
-              <Button variant="outline" onClick={() => setSessionDialogOpen(false)}>
-                Cancel
-              </Button>
-              <Button type="submit" disabled={sessionSaving || sessionTitle.trim().length === 0}>
-                {sessionSaving ? "Creating..." : "Create session"}
-              </Button>
-            </DialogFooter>
-          </form>
-        </DialogContent>
+                  <Selector
+                    id="session-engine-select"
+                    label="Engine override"
+                    value={sessionEngine}
+                    options={sessionEngineOptions}
+                    onChange={setSessionEngine}
+                    placeholder="Bot default"
+                    width="100%"
+                  />
+                </div>
+              </LayoutContent>
+            }
+            footer={
+              <LayoutFooter hasDivider>
+                <div className="flex justify-end gap-2">
+                  <Button
+                    variant="secondary"
+                    label="Cancel"
+                    onClick={() => setSessionDialogOpen(false)}
+                  />
+                  <Button
+                    type="submit"
+                    variant="primary"
+                    label={sessionSaving ? "Creating..." : "Create session"}
+                    isDisabled={sessionSaving || sessionTitle.trim().length === 0}
+                  />
+                </div>
+              </LayoutFooter>
+            }
+          />
+        </form>
       </Dialog>
     </aside>
   );

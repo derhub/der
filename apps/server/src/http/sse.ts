@@ -1,17 +1,20 @@
+import type { Context } from "hono";
+import { streamSSE } from "hono/streaming";
 import {
   formatSseComment,
-  formatSseEvent,
   parseSseCursor,
-  sseHeaders,
+  SSE_CACHE_CONTROL,
+  SSE_CONTENT_TYPE,
+  SSE_EVENT_NAME,
   type RunId,
+  type RunStore,
 } from "@der/domain";
-import type { SqliteStore } from "@der/storage";
 import { problemResponse } from "./problem";
 
-const encoder = new TextEncoder();
+export type SseRunStore = Pick<RunStore, "getRunStreamState" | "readRunEventsAfter">;
 
 export interface SseStreamOptions {
-  readonly store: SqliteStore;
+  readonly runs: SseRunStore;
   readonly pollIntervalMs: number;
   readonly keepAliveMs: number;
 }
@@ -42,14 +45,13 @@ function waitAbortable(ms: number, signal: AbortSignal): Promise<void> {
   });
 }
 
-export function handleRunEventsSse(
-  request: Request,
-  url: URL,
+export async function handleRunEventsSse(
+  c: Context,
   runId: RunId,
   options: SseStreamOptions,
-): Response {
+): Promise<Response> {
   const instance = `/api/runs/${runId}/events`;
-  const streamState = options.store.getRunStreamState(runId);
+  const streamState = await options.runs.getRunStreamState(runId);
   if (!streamState) {
     return problemResponse({
       type: "https://der.invalid/problems/run-not-found",
@@ -61,8 +63,9 @@ export function handleRunEventsSse(
     });
   }
 
+  const url = new URL(c.req.url);
   const cursorResult = parseSseCursor({
-    lastEventId: request.headers.get("last-event-id"),
+    lastEventId: c.req.header("last-event-id") ?? null,
     after: url.searchParams.get("after"),
     highWaterMark: streamState.highWaterMark,
     terminalSequence: streamState.terminalSequence,
@@ -85,102 +88,91 @@ export function handleRunEventsSse(
 
   let cursor = cursorResult.after;
   let closed = false;
+  const localAbort = new AbortController();
+  const abortSignal = AbortSignal.any([c.req.raw.signal, localAbort.signal]);
 
-  const stream = new ReadableStream<Uint8Array>({
-    async start(controller) {
-      let lastActivityAt = Date.now();
-      const abortSignal = request.signal;
-
-      try {
-        while (!closed && !abortSignal.aborted) {
-          const events = options.store.readRunEventsAfter(runId, cursor);
-          if (events.length > 0) {
-            for (const event of events) {
-              if (closed || abortSignal.aborted) {
-                return;
-              }
-              controller.enqueue(
-                encoder.encode(formatSseEvent({ id: event.sequence, data: event.chunk })),
-              );
-              cursor = event.sequence;
-              lastActivityAt = Date.now();
-              if (event.isTerminal) {
-                closed = true;
-                controller.close();
-                return;
-              }
-            }
-            continue;
-          }
-
-          const latestState = options.store.getRunStreamState(runId);
-          if (!latestState) {
-            const errorFrame = formatSseEvent({
-              data: {
-                type: "RUN_ERROR",
-                message: `Run ${runId} is no longer available.`,
-                code: "run.not_found",
-                runId,
-              },
-            });
-            controller.enqueue(encoder.encode(errorFrame));
-            closed = true;
-            controller.close();
-            return;
-          }
-
-          if (
-            latestState.terminalSequence !== undefined &&
-            cursor >= latestState.terminalSequence
-          ) {
-            closed = true;
-            controller.close();
-            return;
-          }
-
-          if (isTerminalStatus(latestState.status) && latestState.terminalSequence === undefined) {
-            closed = true;
-            controller.close();
-            return;
-          }
-
-          const now = Date.now();
-          if (now - lastActivityAt >= options.keepAliveMs) {
-            controller.enqueue(encoder.encode(formatSseComment("keep-alive")));
-            lastActivityAt = now;
-          }
-
-          await waitAbortable(options.pollIntervalMs, abortSignal);
-        }
-
-        if (!closed) {
-          closed = true;
-          controller.close();
-        }
-      } catch (error) {
-        if (!closed) {
-          const message = error instanceof Error ? error.message : "Stream failure.";
-          const errorFrame = formatSseEvent({
-            data: {
-              type: "RUN_ERROR",
-              message,
-              code: "sse.stream_error",
-              runId,
-            },
-          });
-          controller.enqueue(encoder.encode(errorFrame));
-          closed = true;
-          controller.close();
-        }
-      }
-    },
-    cancel() {
+  const response = streamSSE(c, async (stream) => {
+    stream.onAbort(() => {
       closed = true;
-    },
+      localAbort.abort();
+    });
+
+    let lastActivityAt = Date.now();
+
+    try {
+      while (!closed && !stream.aborted && !abortSignal.aborted) {
+        const events = await options.runs.readRunEventsAfter(runId, cursor);
+        if (events.length > 0) {
+          for (const event of events) {
+            if (closed || stream.aborted || abortSignal.aborted) {
+              return;
+            }
+            await stream.writeSSE({
+              id: String(event.sequence),
+              event: SSE_EVENT_NAME,
+              data: JSON.stringify(event.chunk),
+            });
+            cursor = event.sequence;
+            lastActivityAt = Date.now();
+            if (event.isTerminal) {
+              closed = true;
+              return;
+            }
+          }
+          continue;
+        }
+
+        const latestState = await options.runs.getRunStreamState(runId);
+        if (!latestState) {
+          await stream.writeSSE({
+            event: SSE_EVENT_NAME,
+            data: JSON.stringify({
+              type: "RUN_ERROR",
+              message: `Run ${runId} is no longer available.`,
+              code: "run.not_found",
+              runId,
+            }),
+          });
+          closed = true;
+          return;
+        }
+
+        if (latestState.terminalSequence !== undefined && cursor >= latestState.terminalSequence) {
+          closed = true;
+          return;
+        }
+
+        if (isTerminalStatus(latestState.status) && latestState.terminalSequence === undefined) {
+          closed = true;
+          return;
+        }
+
+        const now = Date.now();
+        if (now - lastActivityAt >= options.keepAliveMs) {
+          await stream.write(formatSseComment("keep-alive"));
+          lastActivityAt = now;
+        }
+
+        await waitAbortable(options.pollIntervalMs, abortSignal);
+      }
+    } catch (error) {
+      if (!closed && !stream.aborted) {
+        const message = error instanceof Error ? error.message : "Stream failure.";
+        await stream.writeSSE({
+          event: SSE_EVENT_NAME,
+          data: JSON.stringify({
+            type: "RUN_ERROR",
+            message,
+            code: "sse.stream_error",
+            runId,
+          }),
+        });
+        closed = true;
+      }
+    }
   });
 
-  return new Response(stream, {
-    status: 200,
-    headers: sseHeaders(),
-  });
+  response.headers.set("content-type", SSE_CONTENT_TYPE);
+  response.headers.set("cache-control", SSE_CACHE_CONTROL);
+  return response;
 }

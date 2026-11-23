@@ -1,4 +1,4 @@
-import type { EffectIdentity, JsonValue, ToolResult } from "@der/domain";
+import type { EffectIdentity, JsonValue, PersistedEffectIdentity, ToolResult } from "@der/domain";
 import { compiledParsers } from "@der/domain/compiled";
 
 export type ApprovalVerifier = (effect: EffectIdentity) => Promise<boolean> | boolean;
@@ -30,7 +30,10 @@ function canonicalizeValue(value: JsonValue): string {
   return `{${entries.join(",")}}`;
 }
 
-export function effectIdentityMatches(a: EffectIdentity, b: EffectIdentity): boolean {
+export function effectIdentityMatches(
+  a: PersistedEffectIdentity,
+  b: PersistedEffectIdentity,
+): boolean {
   return (
     a.runId === b.runId &&
     a.operationKind === b.operationKind &&

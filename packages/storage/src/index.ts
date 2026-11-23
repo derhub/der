@@ -4,6 +4,7 @@ export {
   applyMigrations,
   CORE_MIGRATION,
   CORE_MIGRATIONS,
+  OUTBOX_DESTINATIONS_MIGRATION,
   type StorageMigration,
 } from "./migrations";
 export {

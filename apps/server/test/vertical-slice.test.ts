@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, it } from "bun:test";
+import { Hono } from "hono";
 import {
   PROBLEM_DETAILS_MEDIA_TYPE,
   SSE_CACHE_CONTROL,
@@ -23,14 +24,14 @@ import {
 
 const cleanups: (() => Promise<void> | void)[] = [];
 
-function startVerticalSliceServer(options?: {
+async function startVerticalSliceServer(options?: {
   readonly approvalTimeoutMs?: number;
   readonly seedFixture?: boolean;
   readonly now?: () => Date;
 }) {
   const tempDb: TempDatabaseHandle = createTempDatabase("der-vertical-");
   const tools = createFixtureTools();
-  const running: RunningServer = startServer({
+  const running: RunningServer = await startServer({
     config: {
       host: "127.0.0.1",
       port: 0,
@@ -70,7 +71,7 @@ afterEach(async () => {
 
 describe("serve operator bot, session, health, engine, and origin checks", () => {
   it("serves healthz, redacted engine readiness, bots, sessions, history, and rejects disallowed origins with strict Problem Details", async () => {
-    const { server } = startVerticalSliceServer({ seedFixture: false });
+    const { server } = await startVerticalSliceServer({ seedFixture: false });
 
     const healthRes = await fetch(`${server.url}/healthz`);
     expect(healthRes.status).toBe(200);
@@ -173,7 +174,7 @@ describe("serve operator bot, session, health, engine, and origin checks", () =>
 
 describe("enforce exact approval scope, decision replay, key conflicts, and SSE resume through HTTP 204", () => {
   it("runs a fixture approval end to end, enforces scope and key conflicts, and streams SSE with cursor resume and terminal 204", async () => {
-    const { server, tools } = startVerticalSliceServer({ seedFixture: true });
+    const { server, tools } = await startVerticalSliceServer({ seedFixture: true });
     const sessionId = server.seededFixture!.session.id;
     const botId = server.seededFixture!.bot.id;
 
@@ -387,7 +388,7 @@ describe("enforce exact approval scope, decision replay, key conflicts, and SSE 
   });
 
   it("expires a timed-out approval and interrupts runs on uncertain effects", async () => {
-    const { server, tools } = startVerticalSliceServer({
+    const { server, tools } = await startVerticalSliceServer({
       approvalTimeoutMs: 120,
       seedFixture: true,
     });
@@ -433,7 +434,7 @@ describe("enforce exact approval scope, decision replay, key conflicts, and SSE 
     );
     expect(tools.applied).toHaveLength(0);
 
-    const uncertainServer = startVerticalSliceServer({
+    const uncertainServer = await startVerticalSliceServer({
       approvalTimeoutMs: 5_000,
       seedFixture: true,
     });
@@ -493,7 +494,7 @@ describe("enforce exact approval scope, decision replay, key conflicts, and SSE 
 
   it("rejects a backdated client decidedAt after the approval deadline with 409 approval.expired", async () => {
     let nowMs = Date.parse("2026-11-22T18:00:00.000Z");
-    const { server, tools } = startVerticalSliceServer({
+    const { server, tools } = await startVerticalSliceServer({
       approvalTimeoutMs: 60_000,
       seedFixture: true,
       now: () => new Date(nowMs),
@@ -544,13 +545,13 @@ describe("enforce exact approval scope, decision replay, key conflicts, and SSE 
   });
 
   it("omits SSE id on post-header error frames so reconnect resumes cleanly from the last committed cursor", async () => {
-    const { server } = startVerticalSliceServer({ seedFixture: true });
+    const { server } = await startVerticalSliceServer({ seedFixture: true });
     const botId = server.seededFixture!.bot.id;
     const sessionId = server.seededFixture!.session.id;
     const { run } = await server.store.admit({
       botId,
       sessionId,
-      origin: "http",
+      origin: "web",
       idempotencyKey: "sse-err-key-1",
       input: { parts: [{ type: "text", text: "stream test" }] },
     });
@@ -575,12 +576,17 @@ describe("enforce exact approval scope, decision replay, key conflicts, and SSE 
       },
     );
 
+    const sseApp = new Hono();
+    sseApp.get("/api/runs/:runId/events", (c) =>
+      handleRunEventsSse(c, c.req.param("runId"), {
+        runs: flakyStore,
+        pollIntervalMs: 10,
+        keepAliveMs: 2_000,
+      }),
+    );
+
     const firstUrl = new URL(`${server.url}/api/runs/${run.id}/events`);
-    const firstResponse = handleRunEventsSse(new Request(firstUrl), firstUrl, run.id, {
-      store: flakyStore,
-      pollIntervalMs: 10,
-      keepAliveMs: 2_000,
-    });
+    const firstResponse = await sseApp.fetch(new Request(firstUrl));
     expect(firstResponse.status).toBe(200);
     const firstFrames = await collectSseFrames(firstResponse);
 

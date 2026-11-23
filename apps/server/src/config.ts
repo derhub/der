@@ -1,5 +1,5 @@
 import * as z from "zod";
-import { engineKind, id, type EngineKind } from "@der/domain";
+import { engineKind, type EngineKind } from "@der/domain";
 import { compileSchema } from "@der/domain/compiled";
 import type { McpServerConfig } from "@der/mcp";
 
@@ -101,36 +101,6 @@ const mcpServerConfigSchema = z.object({
   redactedSecrets: z.array(z.string().min(1)).optional(),
 });
 
-const homeAssistantConfigSchema = z.object({
-  baseUrl: z.string().url(),
-  token: z.string().min(1),
-  allowedServices: z.array(z.string().min(1)).default([]),
-  allowedEntities: z.array(z.string().min(1)).optional(),
-  timeoutMs: z.number().int().positive().default(15_000),
-});
-
-const telegramBindingConfigSchema = z.object({
-  id: id.optional(),
-  externalChatId: z.string().min(1),
-  externalActorId: z.string().min(1),
-  botId: id,
-  sessionId: id,
-  enabled: z.boolean().default(true),
-});
-
-const telegramConfigSchema = z.object({
-  botToken: z.string().min(1),
-  apiBaseUrl: z.string().url().default("https://api.telegram.org"),
-  consumer: z.string().min(1).default("telegram-default"),
-  pollTimeoutSeconds: z.number().int().min(0).max(50).default(25),
-  pollInitialBackoffMs: z.number().int().positive().default(1_000),
-  pollMaxBackoffMs: z.number().int().positive().default(30_000),
-  outboxPollIntervalMs: z.number().int().positive().default(500),
-  outboxInitialBackoffMs: z.number().int().positive().default(1_000),
-  outboxMaxBackoffMs: z.number().int().positive().default(60_000),
-  bindings: z.array(telegramBindingConfigSchema).default([]),
-});
-
 const engineImagesSchema = z.object({
   codex: z.string().min(1).default("der-engine-codex:latest"),
   claudeCode: z.string().min(1).default("der-engine-claude-code:latest"),
@@ -194,8 +164,9 @@ const serverConfigSchema = z
     wasmerAllowedRoots: z.array(z.string().min(1)).default([]),
     wasmerMaxTimeoutMs: z.number().int().positive().default(30_000),
     mcpServers: z.array(mcpServerConfigSchema).default([]),
-    homeAssistant: homeAssistantConfigSchema.optional(),
-    telegram: telegramConfigSchema.optional(),
+    outboxPollIntervalMs: z.number().int().positive().default(500),
+    outboxInitialBackoffMs: z.number().int().positive().default(1_000),
+    outboxMaxBackoffMs: z.number().int().positive().default(60_000),
   })
   .superRefine((value, ctx) => {
     if (value.dockerEgressNetwork !== undefined && value.dockerEgressProxyUrl === undefined) {
@@ -272,108 +243,6 @@ function parseOptionalMcpServers(raw: string | undefined): ServerConfig["mcpServ
   return z.array(mcpServerConfigSchema).parse(decoded);
 }
 
-function parseOptionalHomeAssistant(
-  env: Record<string, string | undefined>,
-): ServerConfig["homeAssistant"] | undefined {
-  const baseUrl = env["DER_HOME_ASSISTANT_URL"]?.trim();
-  const token = env["DER_HOME_ASSISTANT_TOKEN"]?.trim();
-  if (!baseUrl && !token) {
-    return undefined;
-  }
-  if (!baseUrl || !token) {
-    throw new RangeError(
-      "Home Assistant configuration requires both DER_HOME_ASSISTANT_URL and DER_HOME_ASSISTANT_TOKEN.",
-    );
-  }
-  const allowedServices = parseOptionalCsv(env["DER_HOME_ASSISTANT_ALLOWED_SERVICES"]) ?? [];
-  const allowedEntities = parseOptionalCsv(env["DER_HOME_ASSISTANT_ALLOWED_ENTITIES"]);
-  const timeoutMs = parseOptionalInt(
-    env["DER_HOME_ASSISTANT_TIMEOUT_MS"],
-    "DER_HOME_ASSISTANT_TIMEOUT_MS",
-  );
-  return homeAssistantConfigSchema.parse({
-    baseUrl,
-    token,
-    allowedServices,
-    ...(allowedEntities !== undefined ? { allowedEntities } : {}),
-    ...(timeoutMs !== undefined ? { timeoutMs } : {}),
-  });
-}
-
-function parseOptionalTelegramBindings(
-  raw: string | undefined,
-): z.infer<typeof telegramBindingConfigSchema>[] | undefined {
-  if (raw === undefined || raw.trim() === "") {
-    return undefined;
-  }
-  let decoded: unknown;
-  try {
-    decoded = JSON.parse(raw);
-  } catch {
-    throw new RangeError("Configuration DER_TELEGRAM_BINDINGS_JSON must be valid JSON.");
-  }
-  return z.array(telegramBindingConfigSchema).parse(decoded);
-}
-
-function parseOptionalTelegram(
-  env: Record<string, string | undefined>,
-): ServerConfig["telegram"] | undefined {
-  const enabled = parseOptionalBoolean(env["DER_TELEGRAM_ENABLED"], "DER_TELEGRAM_ENABLED");
-  const botToken = env["DER_TELEGRAM_BOT_TOKEN"]?.trim();
-  if (enabled === false) {
-    return undefined;
-  }
-  if (enabled === undefined && !botToken) {
-    return undefined;
-  }
-  if (!botToken) {
-    throw new RangeError(
-      "Telegram configuration requires DER_TELEGRAM_BOT_TOKEN when DER_TELEGRAM_ENABLED is true.",
-    );
-  }
-
-  const apiBaseUrl = env["DER_TELEGRAM_API_BASE_URL"]?.trim();
-  const consumer = env["DER_TELEGRAM_CONSUMER"]?.trim();
-  const pollTimeoutSeconds = parseOptionalInt(
-    env["DER_TELEGRAM_POLL_TIMEOUT_SECONDS"],
-    "DER_TELEGRAM_POLL_TIMEOUT_SECONDS",
-  );
-  const pollInitialBackoffMs = parseOptionalInt(
-    env["DER_TELEGRAM_POLL_INITIAL_BACKOFF_MS"],
-    "DER_TELEGRAM_POLL_INITIAL_BACKOFF_MS",
-  );
-  const pollMaxBackoffMs = parseOptionalInt(
-    env["DER_TELEGRAM_POLL_MAX_BACKOFF_MS"],
-    "DER_TELEGRAM_POLL_MAX_BACKOFF_MS",
-  );
-  const outboxPollIntervalMs = parseOptionalInt(
-    env["DER_TELEGRAM_OUTBOX_POLL_INTERVAL_MS"],
-    "DER_TELEGRAM_OUTBOX_POLL_INTERVAL_MS",
-  );
-  const outboxInitialBackoffMs = parseOptionalInt(
-    env["DER_TELEGRAM_OUTBOX_INITIAL_BACKOFF_MS"],
-    "DER_TELEGRAM_OUTBOX_INITIAL_BACKOFF_MS",
-  );
-  const outboxMaxBackoffMs = parseOptionalInt(
-    env["DER_TELEGRAM_OUTBOX_MAX_BACKOFF_MS"],
-    "DER_TELEGRAM_OUTBOX_MAX_BACKOFF_MS",
-  );
-  const bindings = parseOptionalTelegramBindings(env["DER_TELEGRAM_BINDINGS_JSON"]);
-
-  return telegramConfigSchema.parse({
-    botToken,
-    ...(apiBaseUrl ? { apiBaseUrl } : {}),
-    ...(consumer ? { consumer } : {}),
-    ...(pollTimeoutSeconds !== undefined ? { pollTimeoutSeconds } : {}),
-    ...(pollInitialBackoffMs !== undefined ? { pollInitialBackoffMs } : {}),
-    ...(pollMaxBackoffMs !== undefined ? { pollMaxBackoffMs } : {}),
-    ...(outboxPollIntervalMs !== undefined ? { outboxPollIntervalMs } : {}),
-    ...(outboxInitialBackoffMs !== undefined ? { outboxInitialBackoffMs } : {}),
-    ...(outboxMaxBackoffMs !== undefined ? { outboxMaxBackoffMs } : {}),
-    ...(bindings !== undefined ? { bindings } : {}),
-  });
-}
-
 export function parseServerConfig(
   overrides?: Partial<ServerConfig>,
   env: Record<string, string | undefined> = process.env,
@@ -409,8 +278,18 @@ export function parseServerConfig(
     "DER_WASMER_MAX_TIMEOUT_MS",
   );
   const mcpServers = parseOptionalMcpServers(env["DER_MCP_SERVERS_JSON"]);
-  const homeAssistant = parseOptionalHomeAssistant(env);
-  const telegram = parseOptionalTelegram(env);
+  const outboxPollIntervalMs = parseOptionalInt(
+    env["DER_OUTBOX_POLL_INTERVAL_MS"],
+    "DER_OUTBOX_POLL_INTERVAL_MS",
+  );
+  const outboxInitialBackoffMs = parseOptionalInt(
+    env["DER_OUTBOX_INITIAL_BACKOFF_MS"],
+    "DER_OUTBOX_INITIAL_BACKOFF_MS",
+  );
+  const outboxMaxBackoffMs = parseOptionalInt(
+    env["DER_OUTBOX_MAX_BACKOFF_MS"],
+    "DER_OUTBOX_MAX_BACKOFF_MS",
+  );
 
   const rawRestateMode = env["DER_RESTATE_MODE"]?.trim();
   if (
@@ -503,8 +382,9 @@ export function parseServerConfig(
     ...(wasmerAllowedRoots !== undefined ? { wasmerAllowedRoots } : {}),
     ...(wasmerMaxTimeoutMs !== undefined ? { wasmerMaxTimeoutMs } : {}),
     ...(mcpServers !== undefined ? { mcpServers } : {}),
-    ...(homeAssistant !== undefined ? { homeAssistant } : {}),
-    ...(telegram !== undefined ? { telegram } : {}),
+    ...(outboxPollIntervalMs !== undefined ? { outboxPollIntervalMs } : {}),
+    ...(outboxInitialBackoffMs !== undefined ? { outboxInitialBackoffMs } : {}),
+    ...(outboxMaxBackoffMs !== undefined ? { outboxMaxBackoffMs } : {}),
   };
 
   return compiledServerConfig.parse({

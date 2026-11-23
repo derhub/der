@@ -1,16 +1,12 @@
+import { Badge, type BadgeVariant } from "@astryxdesign/core/Badge";
+import { Button } from "@astryxdesign/core/Button";
+import { Card } from "@astryxdesign/core/Card";
+import { EmptyState } from "@astryxdesign/core/EmptyState";
+import { Heading } from "@astryxdesign/core/Heading";
+import { Text } from "@astryxdesign/core/Text";
 import { CheckCircle2Icon, RefreshCwIcon, ShieldAlertIcon, WrenchIcon } from "lucide-react";
 import type { EngineReadiness, ProblemDetails, ToolDescriptor } from "@der/domain";
 import { ProblemAlert } from "@/components/problem-alert";
-import { Badge } from "@/components/ui/badge";
-import { Button } from "@/components/ui/button";
-import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
-import {
-  Empty,
-  EmptyDescription,
-  EmptyHeader,
-  EmptyMedia,
-  EmptyTitle,
-} from "@/components/ui/empty";
 import type { HealthResponse } from "@/lib/schemas";
 
 export interface ReadinessPanelProps {
@@ -22,18 +18,16 @@ export interface ReadinessPanelProps {
   readonly onRefresh: () => void;
 }
 
-function interactiveBadgeVariant(
-  state: EngineReadiness["interactive"],
-): "ready" | "warn" | "danger" {
-  if (state === "ready") return "ready";
-  if (state === "login_required") return "warn";
-  return "danger";
+function interactiveBadgeVariant(state: EngineReadiness["interactive"]): BadgeVariant {
+  if (state === "ready") return "success";
+  if (state === "login_required") return "warning";
+  return "error";
 }
 
-function unattendedBadgeVariant(state: EngineReadiness["unattended"]): "ready" | "warn" | "danger" {
-  if (state === "ready") return "ready";
-  if (state === "unverified") return "warn";
-  return "danger";
+function unattendedBadgeVariant(state: EngineReadiness["unattended"]): BadgeVariant {
+  if (state === "ready") return "success";
+  if (state === "unverified") return "warning";
+  return "error";
 }
 
 export function ReadinessPanel({
@@ -48,80 +42,86 @@ export function ReadinessPanel({
     <div className="flex flex-col gap-5">
       <div className="flex flex-wrap items-center justify-between gap-3">
         <div className="flex flex-col gap-0.5">
-          <h2 className="text-base font-semibold tracking-tight">Readiness and host tools</h2>
-          <p className="text-xs text-muted-foreground">
+          <Heading level={2}>Readiness and host tools</Heading>
+          <Text type="supporting" as="p">
             Server process health, rootless sandbox isolation verification, and BYO engine
             eligibility.
-          </p>
+          </Text>
         </div>
-        <Button variant="outline" size="sm" onClick={onRefresh} disabled={loading}>
-          <RefreshCwIcon data-icon="inline-start" />
-          {loading ? "Checking..." : "Refresh diagnostics"}
-        </Button>
+        <Button
+          variant="secondary"
+          size="sm"
+          label={loading ? "Checking..." : "Refresh diagnostics"}
+          icon={<RefreshCwIcon className="size-3.5" aria-hidden="true" />}
+          isDisabled={loading}
+          onClick={onRefresh}
+        />
       </div>
 
       {problem ? <ProblemAlert problem={problem} onRetry={onRefresh} /> : null}
 
       <Card>
-        <CardHeader>
+        <div className="flex flex-col gap-1.5">
           <div className="flex items-center justify-between gap-2">
-            <CardTitle>Process health</CardTitle>
-            <Badge variant={health?.status === "ok" ? "ready" : "danger"}>
-              {health?.status === "ok" ? "Healthy" : "Unavailable"}
-            </Badge>
+            <Heading level={3}>Process health</Heading>
+            <Badge
+              variant={health?.status === "ok" ? "success" : "error"}
+              label={health?.status === "ok" ? "Healthy" : "Unavailable"}
+            />
           </div>
-          <CardDescription>
+          <Text type="supporting" as="p">
             {health
               ? `Last server clock reading: ${health.timestamp}`
               : "Health check has not succeeded yet."}
-          </CardDescription>
-        </CardHeader>
+          </Text>
+        </div>
       </Card>
 
       <section aria-labelledby="engines-heading" className="flex flex-col gap-3">
-        <h3 id="engines-heading" className="text-sm font-semibold">
+        <Heading level={3} id="engines-heading">
           BYO engines ({engines.length})
-        </h3>
+        </Heading>
         {engines.length === 0 ? (
-          <Empty>
-            <EmptyHeader>
-              <EmptyMedia>
-                <ShieldAlertIcon />
-              </EmptyMedia>
-              <EmptyTitle>No engines reported</EmptyTitle>
-              <EmptyDescription>
-                Check server configuration for enabled BYO engines or fixture mode.
-              </EmptyDescription>
-            </EmptyHeader>
-          </Empty>
+          <EmptyState
+            icon={<ShieldAlertIcon className="size-6" aria-hidden="true" />}
+            title="No engines reported"
+            description="Check server configuration for enabled BYO engines or fixture mode."
+          />
         ) : (
           <div className="grid gap-3 md:grid-cols-2">
             {engines.map((entry) => (
               <Card key={entry.engine}>
-                <CardHeader>
+                <div className="flex flex-col gap-3">
                   <div className="flex flex-wrap items-center justify-between gap-2">
-                    <CardTitle className="font-mono">{entry.engine}</CardTitle>
-                    <Badge variant={entry.isolationVerified ? "ready" : "danger"}>
-                      {entry.isolationVerified ? (
-                        <CheckCircle2Icon aria-hidden="true" />
-                      ) : (
-                        <ShieldAlertIcon aria-hidden="true" />
-                      )}
-                      {entry.isolationVerified ? "Isolation verified" : "Isolation blocked"}
-                    </Badge>
+                    <Text type="code" weight="semibold">
+                      {entry.engine}
+                    </Text>
+                    <Badge
+                      variant={entry.isolationVerified ? "success" : "error"}
+                      icon={
+                        entry.isolationVerified ? (
+                          <CheckCircle2Icon className="size-3.5" aria-hidden="true" />
+                        ) : (
+                          <ShieldAlertIcon className="size-3.5" aria-hidden="true" />
+                        )
+                      }
+                      label={entry.isolationVerified ? "Isolation verified" : "Isolation blocked"}
+                    />
                   </div>
-                  <div className="flex flex-wrap items-center gap-2 pt-1">
-                    <Badge variant={interactiveBadgeVariant(entry.interactive)}>
-                      Interactive: {entry.interactive}
-                    </Badge>
-                    <Badge variant={unattendedBadgeVariant(entry.unattended)}>
-                      Unattended: {entry.unattended}
-                    </Badge>
+
+                  <div className="flex flex-wrap items-center gap-2">
+                    <Badge
+                      variant={interactiveBadgeVariant(entry.interactive)}
+                      label={`Interactive: ${entry.interactive}`}
+                    />
+                    <Badge
+                      variant={unattendedBadgeVariant(entry.unattended)}
+                      label={`Unattended: ${entry.unattended}`}
+                    />
                   </div>
-                </CardHeader>
-                <CardContent className="flex flex-col gap-3">
+
                   {entry.reasons.length > 0 ? (
-                    <ul className="flex flex-col gap-1 text-xs text-muted-foreground">
+                    <ul className="flex flex-col gap-1 text-xs text-secondary">
                       {entry.reasons.map((reason, idx) => (
                         <li key={`${entry.engine}-reason-${idx}`} className="leading-relaxed">
                           {reason}
@@ -129,18 +129,18 @@ export function ReadinessPanel({
                       ))}
                     </ul>
                   ) : (
-                    <p className="text-xs text-muted-foreground">
+                    <Text type="supporting" as="p">
                       All readiness and isolation checks passed.
-                    </p>
+                    </Text>
                   )}
 
                   {entry.loginGuidance ? (
-                    <div className="rounded-md border border-status-warn/30 bg-status-warn-surface px-3 py-2 text-xs text-status-warn">
+                    <div className="rounded-md border border-warning bg-warning-muted px-3 py-2 text-xs text-on-warning-muted">
                       <p className="font-medium">Login guidance</p>
-                      <p className="mt-1 font-mono text-[11px] break-all">{entry.loginGuidance}</p>
+                      <p className="mt-1 font-mono text-xs break-all">{entry.loginGuidance}</p>
                     </div>
                   ) : null}
-                </CardContent>
+                </div>
               </Card>
             ))}
           </div>
@@ -148,44 +148,37 @@ export function ReadinessPanel({
       </section>
 
       <section aria-labelledby="tools-heading" className="flex flex-col gap-3">
-        <h3 id="tools-heading" className="text-sm font-semibold">
+        <Heading level={3} id="tools-heading">
           Registered host tools ({tools.length})
-        </h3>
+        </Heading>
         {tools.length === 0 ? (
-          <Empty>
-            <EmptyHeader>
-              <EmptyMedia>
-                <WrenchIcon />
-              </EmptyMedia>
-              <EmptyTitle>No host tools registered</EmptyTitle>
-              <EmptyDescription>
-                Configure MCP servers, Home Assistant, Docker, or Wasmer tools on the server.
-              </EmptyDescription>
-            </EmptyHeader>
-          </Empty>
+          <EmptyState
+            icon={<WrenchIcon className="size-6" aria-hidden="true" />}
+            title="No host tools registered"
+            description="Configure MCP servers, Docker, or Wasmer tools on the server."
+          />
         ) : (
           <div className="grid gap-3 md:grid-cols-2">
             {tools.map((tool) => (
               <Card key={`${tool.kind}:${tool.id}`}>
-                <CardHeader>
+                <div className="flex flex-col gap-2">
                   <div className="flex flex-wrap items-center justify-between gap-2">
-                    <CardTitle>{tool.name}</CardTitle>
+                    <Heading level={4}>{tool.name}</Heading>
                     <div className="flex items-center gap-1.5">
-                      <Badge variant="secondary" className="font-mono">
-                        {tool.kind}
-                      </Badge>
-                      <Badge variant={tool.requiresApproval ? "warn" : "ready"}>
-                        {tool.requiresApproval ? "Approval required" : "Read-only"}
-                      </Badge>
+                      <Badge variant="neutral" label={tool.kind} />
+                      <Badge
+                        variant={tool.requiresApproval ? "warning" : "success"}
+                        label={tool.requiresApproval ? "Approval required" : "Read-only"}
+                      />
                     </div>
                   </div>
-                  <CardDescription className="font-mono text-[11px]">{tool.id}</CardDescription>
-                </CardHeader>
-                <CardContent>
-                  <p className="text-xs text-muted-foreground leading-relaxed">
+                  <Text type="code" color="secondary" as="p">
+                    {tool.id}
+                  </Text>
+                  <Text type="supporting" as="p">
                     {tool.description}
-                  </p>
-                </CardContent>
+                  </Text>
+                </div>
               </Card>
             ))}
           </div>

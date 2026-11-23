@@ -9,7 +9,6 @@ COPY packages/domain/package.json packages/domain/package.json
 COPY packages/storage/package.json packages/storage/package.json
 COPY packages/runtime/package.json packages/runtime/package.json
 COPY integrations/mcp/package.json integrations/mcp/package.json
-COPY integrations/telegram/package.json integrations/telegram/package.json
 COPY apps/server/package.json apps/server/package.json
 COPY apps/web/package.json apps/web/package.json
 

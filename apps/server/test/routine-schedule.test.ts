@@ -118,7 +118,7 @@ describe("RoutineSchedule Restate Virtual Object", () => {
     ]);
 
     let routinesStore!: ReturnType<typeof openSqliteRoutines>;
-    const server = startServer({
+    const server = await startServer({
       config: {
         host: "127.0.0.1",
         port: 0,
@@ -152,7 +152,7 @@ describe("RoutineSchedule Restate Virtual Object", () => {
     routinesStore = openSqliteRoutines({ database: server.store.database });
     cleanups.push(() => server.close());
 
-    await registerRestateDeployment(restate.adminUrl, server.restateUrl, { force: true });
+    await registerRestateDeployment(restate.adminUrl, server.restateUrl!, { force: true });
 
     const bot = server.store.createBot({
       id: "bot-sched",
@@ -228,7 +228,7 @@ describe("RoutineSchedule Restate Virtual Object", () => {
     const activeRun = await server.store.admit({
       botId: bot.id,
       sessionId: session.id,
-      origin: "http",
+      origin: "web",
       idempotencyKey: "interactive-blocker-1",
       engine: "fixture",
       input: { parts: [{ type: "text", text: "lamp-blocking" }] },
@@ -289,7 +289,7 @@ describe("RoutineSchedule Restate Virtual Object", () => {
     ]);
 
     let routinesStore!: ReturnType<typeof openSqliteRoutines>;
-    const server = startServer({
+    const server = await startServer({
       config: {
         host: "127.0.0.1",
         port: 0,
@@ -323,7 +323,7 @@ describe("RoutineSchedule Restate Virtual Object", () => {
     routinesStore = openSqliteRoutines({ database: server.store.database });
     cleanups.push(() => server.close());
 
-    await registerRestateDeployment(restate.adminUrl, server.restateUrl, { force: true });
+    await registerRestateDeployment(restate.adminUrl, server.restateUrl!, { force: true });
 
     const bot = server.store.createBot({
       id: "bot-elig",
@@ -409,7 +409,7 @@ describe("RoutineSchedule Restate Virtual Object", () => {
     ]);
 
     let routinesStore!: ReturnType<typeof openSqliteRoutines>;
-    const server = startServer({
+    const server = await startServer({
       config: {
         host: "127.0.0.1",
         port: 0,
@@ -440,7 +440,7 @@ describe("RoutineSchedule Restate Virtual Object", () => {
     routinesStore = openSqliteRoutines({ database: server.store.database });
     cleanups.push(() => server.close());
 
-    await registerRestateDeployment(restate.adminUrl, server.restateUrl, { force: true });
+    await registerRestateDeployment(restate.adminUrl, server.restateUrl!, { force: true });
 
     const bot = server.store.createBot({
       id: "bot-delay",

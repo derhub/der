@@ -132,8 +132,8 @@ describe("Build future Run context with compaction while retaining source Messag
           {
             type: "tool-call",
             toolCallId: "call-1",
-            toolName: "home_assistant.get_state",
-            arguments: { entityId: "light.desk" },
+            toolName: "notes.search_notes",
+            arguments: { query: "desk" },
           },
         ],
         runId: "run-1",
@@ -149,7 +149,7 @@ describe("Build future Run context with compaction while retaining source Messag
           {
             type: "tool-result",
             toolCallId: "call-1",
-            toolName: "home_assistant.get_state",
+            toolName: "notes.search_notes",
             outcome: { state: "on" },
             isError: false,
           },
@@ -166,8 +166,8 @@ describe("Build future Run context with compaction while retaining source Messag
         id: "call-1",
         type: "function",
         function: {
-          name: "home_assistant.get_state",
-          arguments: '{"entityId":"light.desk"}',
+          name: "notes.search_notes",
+          arguments: '{"query":"desk"}',
         },
       },
     ]);

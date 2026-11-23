@@ -1,46 +1,47 @@
 import { mkdirSync } from "node:fs";
 import { resolve } from "node:path";
-import type {
-  Approval,
-  ApprovalResolutionInput,
-  Bot,
-  BotId,
-  ChannelBinding,
-  ChannelIntakeMetadata,
-  ChannelIntegration,
-  EffectIdentity,
-  Engine,
-  EngineKind,
-  EngineReadiness,
-  MemoryRecord,
-  MemoryWriteInput,
-  Message,
-  Messaging,
-  OutboxEvent,
-  Routine,
-  RoutineId,
-  Run,
-  RunAdmission,
-  RunId,
-  RunRequest,
-  Sandbox,
-  Session,
-  SessionId,
-  Skill,
-  ToolOperation,
-  ToolResult,
-  Tools,
+import * as z from "zod";
+import {
+  defineIntegration,
+  defineTool,
+  IntegrationRegistry,
+  sandboxRequest,
+  type Approval,
+  type ApprovalResolutionInput,
+  type Bot,
+  type BotId,
+  type ChannelBinding,
+  type ChannelIntakeMetadata,
+  type EffectIdentity,
+  type Engine,
+  type EngineKind,
+  type EngineReadiness,
+  type Integration,
+  type MemoryRecord,
+  type MemoryWriteInput,
+  type Message,
+  type OutboxEvent,
+  type OutboxSink,
+  type Routine,
+  type RoutineId,
+  type Run,
+  type RunAdmission,
+  type RunId,
+  type RunRequest,
+  type Sandbox,
+  type Session,
+  type SessionId,
+  type Skill,
+  type ToolResult,
+  type Tools,
 } from "@der/domain";
 import type { AnyTool } from "@tanstack/ai";
 import { compiledParsers } from "@der/domain/compiled";
 import {
-  createHomeAssistantTools,
-  createHostTools,
-  createMcpTools,
+  createMcpIntegration,
   deniedToolResult,
   effectIdentityMatches,
   type ApprovalVerifier,
-  type McpToolsHandle,
 } from "@der/mcp";
 import { buildRunContext, createSkillCatalog, type SkillCatalog } from "@der/runtime/context";
 import {
@@ -81,27 +82,19 @@ import {
   type SqliteMemory,
 } from "@der/storage/memory";
 import { openSqliteRoutines, type SqliteRoutines } from "@der/storage/routines";
-import {
-  createTelegramMessaging,
-  redactTelegramSecret,
-  type TelegramMessaging,
-} from "@der/telegram";
 import { parseServerConfig, type ServerConfig } from "./config";
-import { createHttpHandler, type ExtraHttpHandler } from "./http/index";
-import {
-  createMessagingRuntime,
-  type ChannelCallbackAcknowledger,
-  type MessagingRuntime,
-} from "./messaging/index";
+import { createHttpApp, type ExtraHttpHandler } from "./http/index";
+import { createOutboxSender, type OutboxSender } from "./messaging/index";
 import {
   createDirectRoutineScheduleClient,
-  createDirectWorkflow,
+  createDirectWorkflowDriver,
   createFixtureEngine,
   createFixtureTools,
   createRestateFetchHandler,
-  createRestateWorkflowClient,
+  createRestateWorkflowDriver,
   createRoutineScheduleClient,
   createRoutineScheduleObject,
+  createRunCoordinator,
   executeApprovedEffectStep,
   finalizeInterruptedUncertainStep,
   UncertainEffectError,
@@ -110,7 +103,7 @@ import {
   type ConfigureRoutineResult,
   type DurableWorkflow,
   type RoutineScheduleClient,
-  type WorkflowDeps,
+  type RunCoordinator,
 } from "./workflows/index";
 
 export interface SeededFixtureRecords {
@@ -186,13 +179,14 @@ export interface CreateServerOptions {
   readonly now?: () => Date;
   readonly engines?: ReadonlyMap<EngineKind, Engine>;
   readonly tools?: Tools;
+  readonly integrations?: readonly Integration[];
   readonly skills?: SkillCatalog;
   readonly commandRunner?: CommandRunner;
   readonly probeEngineAuth?: (engine: OfficialEngineKind) => Promise<EngineAuthProbeResult>;
   readonly extraRestateServices?: readonly AnyRestateService[];
   readonly extraHttpHandler?: ExtraHttpHandler;
   readonly reconcileEffect?: (effect: EffectIdentity) => Promise<ToolResult | undefined>;
-  readonly telegramMessaging?: TelegramMessaging;
+  readonly outboxSinks?: readonly OutboxSink[];
 }
 
 export interface RunningServer {
@@ -203,12 +197,13 @@ export interface RunningServer {
   readonly skills: SkillCatalog;
   readonly tools: Tools;
   readonly engines: ReadonlyMap<EngineKind, Engine>;
+  readonly coordinator: RunCoordinator;
   readonly workflow: DurableWorkflow;
   readonly routineSchedule: RoutineScheduleClient;
-  readonly messaging?: MessagingRuntime;
+  readonly outbox: OutboxSender;
   readonly commands: ServerCommands;
   readonly url: string;
-  readonly restateUrl: string;
+  readonly restateUrl?: string;
   readonly seededFixture?: SeededFixtureRecords;
   readonly close: () => Promise<void>;
 }
@@ -266,54 +261,95 @@ function createStoreApprovalVerifier(store: SqliteStore): ApprovalVerifier {
   };
 }
 
-function createSandboxToolsAdapter(input: {
+const fixtureToolInputSchema = z.record(z.string(), z.unknown());
+
+function createFixtureIntegration(): Integration {
+  const fixtureTools = createFixtureTools();
+  return defineIntegration({
+    id: "fixture",
+    setup() {
+      return {
+        tools: [
+          defineTool({
+            id: "fixture.apply",
+            operationKind: "fixture",
+            name: "Fixture Apply",
+            description: "Applies one deterministic credential-free fixture effect.",
+            inputSchema: fixtureToolInputSchema,
+            descriptorInputSchema: {
+              type: "object",
+              properties: {
+                target: { type: "string" },
+                mode: { type: "string" },
+              },
+            },
+            approval: "always",
+            execute: async (_input, ctx) => fixtureTools.invoke({ effect: ctx.effect }),
+          }),
+          defineTool({
+            id: "fixture.uncertain",
+            operationKind: "fixture",
+            name: "Fixture Uncertain",
+            description: "Simulates a dispatched effect whose upstream response is lost.",
+            inputSchema: fixtureToolInputSchema,
+            descriptorInputSchema: {
+              type: "object",
+              properties: {
+                target: { type: "string" },
+                mode: { type: "string" },
+              },
+            },
+            approval: "always",
+            execute: async (_input, ctx) => fixtureTools.invoke({ effect: ctx.effect }),
+          }),
+        ],
+      };
+    },
+  });
+}
+
+function createSandboxIntegration(input: {
   readonly kind: "docker" | "wasmer";
   readonly descriptor: typeof DOCKER_TOOL_DESCRIPTOR;
   readonly sandbox: Sandbox;
   readonly verifyApproval: ApprovalVerifier;
-}): Tools {
-  return {
-    async list() {
-      return [input.descriptor];
+}): Integration {
+  return defineIntegration({
+    id: `sandbox.${input.kind}`,
+    setup() {
+      return {
+        tools: [
+          defineTool({
+            id: input.descriptor.id,
+            operationKind: input.kind,
+            name: input.descriptor.name,
+            description: input.descriptor.description,
+            inputSchema: sandboxRequest,
+            descriptorInputSchema: input.descriptor.inputSchema,
+            approval: "always",
+            execute: async (parsedRequest, ctx) => {
+              const authorized = await input.verifyApproval(ctx.effect);
+              if (!authorized) {
+                return deniedToolResult(
+                  "tool.approval_required",
+                  `Exact-operation approval is required for ${input.descriptor.id}.`,
+                );
+              }
+              const result = await input.sandbox.execute(parsedRequest);
+              return compiledParsers.toolResult.parse({
+                ok: result.exitCode === 0 && !result.timedOut,
+                isError: result.exitCode !== 0 || result.timedOut,
+                outcome: result,
+                ...(result.timedOut
+                  ? { detail: `${input.kind} sandbox execution timed out.` }
+                  : {}),
+              });
+            },
+          }),
+        ],
+      };
     },
-    async invoke(operation: ToolOperation): Promise<ToolResult> {
-      const parsedOp = compiledParsers.toolOperation.safeParse(operation);
-      if (!parsedOp.success) {
-        return deniedToolResult(
-          "tool.invalid_arguments",
-          `Invalid sandbox tool operation: ${parsedOp.error.message}`,
-        );
-      }
-      const { effect } = parsedOp.data;
-      if (effect.operationKind !== input.kind || effect.operationId !== input.descriptor.id) {
-        return deniedToolResult(
-          "tool.unrecognized_operation",
-          `Operation "${effect.operationKind}:${effect.operationId}" is not handled by ${input.kind} sandbox.`,
-        );
-      }
-      const authorized = await input.verifyApproval(effect);
-      if (!authorized) {
-        return deniedToolResult(
-          "tool.approval_required",
-          `Exact-operation approval is required for ${input.descriptor.id}.`,
-        );
-      }
-      const parsedRequest = compiledParsers.sandboxRequest.safeParse(effect.canonicalArguments);
-      if (!parsedRequest.success) {
-        return deniedToolResult(
-          "tool.invalid_arguments",
-          `Invalid ${input.kind} sandbox request arguments: ${parsedRequest.error.message}`,
-        );
-      }
-      const result = await input.sandbox.execute(parsedRequest.data);
-      return compiledParsers.toolResult.parse({
-        ok: result.exitCode === 0 && !result.timedOut,
-        isError: result.exitCode !== 0 || result.timedOut,
-        outcome: result,
-        ...(result.timedOut ? { detail: `${input.kind} sandbox execution timed out.` } : {}),
-      });
-    },
-  };
+  });
 }
 
 const SHADOW_HOME_AUTH_MARKERS: Readonly<Record<OfficialEngineKind, readonly string[]>> = {
@@ -498,8 +534,8 @@ function createContextLoader(input: {
   readonly store: SqliteStore;
   readonly memory: SqliteMemory;
   readonly skills: SkillCatalog;
-  readonly getTools: () => Tools;
-  readonly getWorkflow: () => DurableWorkflow;
+  readonly tools: Tools;
+  readonly coordinator: RunCoordinator;
   readonly reconcileEffect?: (effect: EffectIdentity) => Promise<ToolResult | undefined>;
   readonly maxTokens: number;
 }): LoadEngineRunInput {
@@ -522,32 +558,12 @@ function createContextLoader(input: {
       },
     });
 
-    const approvalBroker: ApprovalBroker = {
-      async requestApproval(req) {
-        const wf = input.getWorkflow();
-        if (!wf.awaitApproval) {
-          return {
-            status: "denied",
-            approvalId: `appr_unavailable_${crypto.randomUUID().slice(0, 8)}`,
-            effect: req.effect,
-            reason: "Durable approval broker is unavailable on this workflow.",
-          };
-        }
-        return wf.awaitApproval(
-          {
-            run,
-            effect: req.effect,
-            prompt: req.prompt,
-          },
-          req.signal,
-        );
-      },
-    };
+    const approvalBroker = input.coordinator.createApprovalBroker(run);
 
     const hostTools = await buildEngineHostTools({
       run,
       store: input.store,
-      tools: input.getTools(),
+      tools: input.tools,
       approvalBroker,
       ...(input.reconcileEffect ? { reconcileEffect: input.reconcileEffect } : {}),
     });
@@ -693,7 +709,7 @@ export async function registerDeploymentWithRestate(options: {
   );
 }
 
-export function startServer(options: CreateServerOptions = {}): RunningServer {
+export async function startServer(options: CreateServerOptions = {}): Promise<RunningServer> {
   const config = parseServerConfig(options.config);
   const ownsStore = options.store === undefined;
   const store =
@@ -704,393 +720,409 @@ export function startServer(options: CreateServerOptions = {}): RunningServer {
       ...(options.now ? { now: options.now } : {}),
     });
 
-  const projection = createMemoryProjection(config.memoryProjectionDir);
-  const memory = openSqliteMemory({ database: store.database, projection });
-  const routines = openSqliteRoutines({ database: store.database });
-  const skills = options.skills ?? createSkillCatalog({ rootDir: config.skillsRootDir });
-  const workspaceHostPath = resolve(config.workspaceRootDir);
-  mkdirSync(workspaceHostPath, { recursive: true });
+  let integrationRegistry: IntegrationRegistry | undefined;
+  let closeDirectDriver: (() => void) | undefined;
+  let restateServer: ReturnType<typeof Bun.serve> | undefined;
+  let httpServer: ReturnType<typeof Bun.serve> | undefined;
+  let outbox: ReturnType<typeof createOutboxSender> | undefined;
 
-  const seededFixture = config.seedFixture ? seedFixtureRecords(store) : undefined;
-  const runner = options.commandRunner ?? bunCommandRunner;
-  let tools!: Tools;
-  let workflow!: DurableWorkflow;
-  const loadRunInput = createContextLoader({
-    store,
-    memory,
-    skills,
-    getTools: () => tools,
-    getWorkflow: () => workflow,
-    ...(options.reconcileEffect ? { reconcileEffect: options.reconcileEffect } : {}),
-    maxTokens: config.contextMaxTokens,
-  });
+  try {
+    const projection = createMemoryProjection(config.memoryProjectionDir);
+    const memory = openSqliteMemory({ database: store.database, projection });
+    const routines = openSqliteRoutines({ database: store.database });
+    const skills = options.skills ?? createSkillCatalog({ rootDir: config.skillsRootDir });
+    const workspaceHostPath = resolve(config.workspaceRootDir);
+    mkdirSync(workspaceHostPath, { recursive: true });
 
-  const engines = new Map<EngineKind, Engine>(options.engines);
-  if (options.engines === undefined) {
-    const requested = new Set<EngineKind>(config.enabledEngines);
-    if (config.seedFixture) {
-      requested.add("fixture");
-    }
-    for (const kind of requested) {
-      if (kind === "fixture") {
-        engines.set("fixture", createFixtureEngine(store));
-      } else {
-        engines.set(
-          kind,
-          buildOfficialEngine({
-            kind,
-            config,
-            workspaceHostPath,
-            loadRunInput,
-            runner,
-            ...(options.probeEngineAuth !== undefined
-              ? { probeEngineAuth: options.probeEngineAuth }
-              : {}),
-          }),
-        );
+    const seededFixture = config.seedFixture ? seedFixtureRecords(store) : undefined;
+    const runner = options.commandRunner ?? bunCommandRunner;
+    const hasFixtureEngine =
+      options.engines !== undefined
+        ? options.engines.has("fixture") || config.seedFixture
+        : config.enabledEngines.includes("fixture") || config.seedFixture;
+
+    let tools: Tools;
+    if (options.tools !== undefined) {
+      tools = options.tools;
+    } else {
+      const verifyApproval = createStoreApprovalVerifier(store);
+      integrationRegistry = new IntegrationRegistry({ verifyApproval });
+
+      if (hasFixtureEngine) {
+        integrationRegistry.registerSync(createFixtureIntegration());
       }
-    }
-  } else if (config.seedFixture && !engines.has("fixture")) {
-    engines.set("fixture", createFixtureEngine(store));
-  }
 
-  let mcpHandle: McpToolsHandle | undefined;
-  if (options.tools !== undefined) {
-    tools = options.tools;
-  } else {
-    const verifyApproval = createStoreApprovalVerifier(store);
-    const providers: Tools[] = [];
-
-    if (engines.has("fixture")) {
-      providers.push(createFixtureTools());
-    }
-
-    const dockerSandbox = createDockerSandbox({
-      dockerHost: config.dockerHost,
-      dockerBinary: config.dockerBinary,
-      image: config.engineImages.codex,
-      engine: "codex",
-      user: config.dockerUser,
-      workspaceHostPath,
-      allowedWorkspaceRoots: [workspaceHostPath],
-      shadowHome: DEFAULT_ENGINE_SHADOW_HOMES.codex,
-      ...(config.dockerEgressNetwork !== undefined && config.dockerEgressProxyUrl !== undefined
-        ? {
-            egressNetwork: {
-              networkName: config.dockerEgressNetwork,
-              allowedHosts: APPROVED_VENDOR_EGRESS.codex,
-              egressProxyUrl: config.dockerEgressProxyUrl,
-            },
-          }
-        : {}),
-      limits: {
-        cpus: config.dockerCpus,
-        memoryMb: config.dockerMemoryMb,
-        pidsLimit: config.dockerPidsLimit,
-      },
-      runner,
-    });
-    providers.push(
-      createSandboxToolsAdapter({
-        kind: "docker",
-        descriptor: DOCKER_TOOL_DESCRIPTOR,
-        sandbox: dockerSandbox,
-        verifyApproval,
-      }),
-    );
-
-    const wasmerRoots =
-      config.wasmerAllowedRoots.length > 0 ? config.wasmerAllowedRoots : [workspaceHostPath];
-    const wasmerSandbox = createDockerWasmerSandbox({
-      dockerHost: config.dockerHost,
-      dockerBinary: config.dockerBinary,
-      image: config.wasmerRunnerImage,
-      user: config.dockerUser,
-      limits: {
-        cpus: config.dockerCpus,
-        memoryMb: config.dockerMemoryMb,
-        pidsLimit: config.dockerPidsLimit,
-      },
-      allowedHostRoots: wasmerRoots,
-      maxTimeoutMs: config.wasmerMaxTimeoutMs,
-      runner,
-    });
-    providers.push(
-      createSandboxToolsAdapter({
-        kind: "wasmer",
-        descriptor: WASMER_TOOL_DESCRIPTOR,
-        sandbox: wasmerSandbox,
-        verifyApproval,
-      }),
-    );
-
-    if (config.mcpServers.length > 0) {
-      mcpHandle = createMcpTools({
-        servers: toMcpServerConfigs(config.mcpServers),
-        verifyApproval,
+      const dockerSandbox = createDockerSandbox({
+        dockerHost: config.dockerHost,
+        dockerBinary: config.dockerBinary,
+        image: config.engineImages.codex,
+        engine: "codex",
+        user: config.dockerUser,
+        workspaceHostPath,
+        allowedWorkspaceRoots: [workspaceHostPath],
+        shadowHome: DEFAULT_ENGINE_SHADOW_HOMES.codex,
+        ...(config.dockerEgressNetwork !== undefined && config.dockerEgressProxyUrl !== undefined
+          ? {
+              egressNetwork: {
+                networkName: config.dockerEgressNetwork,
+                allowedHosts: APPROVED_VENDOR_EGRESS.codex,
+                egressProxyUrl: config.dockerEgressProxyUrl,
+              },
+            }
+          : {}),
+        limits: {
+          cpus: config.dockerCpus,
+          memoryMb: config.dockerMemoryMb,
+          pidsLimit: config.dockerPidsLimit,
+        },
+        runner,
       });
-      providers.push(mcpHandle);
-    }
-
-    if (config.homeAssistant !== undefined) {
-      providers.push(
-        createHomeAssistantTools({
-          baseUrl: config.homeAssistant.baseUrl,
-          token: config.homeAssistant.token,
-          allowedServices: config.homeAssistant.allowedServices,
-          ...(config.homeAssistant.allowedEntities !== undefined
-            ? { allowedEntities: config.homeAssistant.allowedEntities }
-            : {}),
-          timeoutMs: config.homeAssistant.timeoutMs,
+      integrationRegistry.registerSync(
+        createSandboxIntegration({
+          kind: "docker",
+          descriptor: DOCKER_TOOL_DESCRIPTOR,
+          sandbox: dockerSandbox,
           verifyApproval,
         }),
       );
+
+      const wasmerRoots =
+        config.wasmerAllowedRoots.length > 0 ? config.wasmerAllowedRoots : [workspaceHostPath];
+      const wasmerSandbox = createDockerWasmerSandbox({
+        dockerHost: config.dockerHost,
+        dockerBinary: config.dockerBinary,
+        image: config.wasmerRunnerImage,
+        user: config.dockerUser,
+        limits: {
+          cpus: config.dockerCpus,
+          memoryMb: config.dockerMemoryMb,
+          pidsLimit: config.dockerPidsLimit,
+        },
+        allowedHostRoots: wasmerRoots,
+        maxTimeoutMs: config.wasmerMaxTimeoutMs,
+        runner,
+      });
+      integrationRegistry.registerSync(
+        createSandboxIntegration({
+          kind: "wasmer",
+          descriptor: WASMER_TOOL_DESCRIPTOR,
+          sandbox: wasmerSandbox,
+          verifyApproval,
+        }),
+      );
+
+      if (config.mcpServers.length > 0) {
+        integrationRegistry.registerSync(
+          createMcpIntegration({
+            servers: toMcpServerConfigs(config.mcpServers),
+            verifyApproval,
+          }),
+        );
+      }
+
+      for (const integration of options.integrations ?? []) {
+        await integrationRegistry.register(integration);
+      }
+
+      await integrationRegistry.start();
+      tools = integrationRegistry;
     }
 
-    tools = createHostTools(providers);
-  }
+    const engines = new Map<EngineKind, Engine>(options.engines);
+    const clockNow = options.now ?? (() => store.database.now());
 
-  const workflowDeps: WorkflowDeps = {
-    store,
-    engines,
-    tools,
-    approvalTimeoutMs: config.approvalTimeoutMs,
-    ...(options.reconcileEffect ? { reconcileEffect: options.reconcileEffect } : {}),
-  };
+    let coordinator: RunCoordinator;
+    let routineSchedule: RoutineScheduleClient;
 
-  let closeDirectWorkflow: (() => void) | undefined;
-  let routineSchedule: RoutineScheduleClient;
-  if (config.restateMode === "direct") {
-    const direct = createDirectWorkflow(workflowDeps);
-    workflow = direct;
-    closeDirectWorkflow = direct.close;
-    routineSchedule = createDirectRoutineScheduleClient({
-      store,
-      routines,
-      engines,
-      ...(options.now ? { now: options.now } : {}),
-      admitRun: async (input) => {
-        const admitted = await direct.admit({
-          botId: input.botId,
-          sessionId: input.sessionId,
-          origin: "routine",
-          idempotencyKey: `routine:${input.routineId}:${input.routineSlot}`,
-          engine: input.engine,
-          input: { parts: [{ type: "text", text: input.prompt }] },
-          routineId: input.routineId,
-          routineSlot: input.routineSlot,
-        });
-        return { runId: admitted.run.id };
-      },
-    });
-  } else {
-    workflow = createRestateWorkflowClient(config.restateIngressUrl);
-    routineSchedule = createRoutineScheduleClient(config.restateIngressUrl);
-  }
-
-  const extraServices = [...(options.extraRestateServices ?? [])];
-  if (!hasRestateServiceNamed(extraServices, "RoutineSchedule")) {
-    extraServices.push(
-      createRoutineScheduleObject({
+    if (config.restateMode === "direct") {
+      const directDriver = createDirectWorkflowDriver({ now: clockNow });
+      coordinator = createRunCoordinator({
         store,
+        engines,
+        tools,
+        driver: directDriver,
+        approvalTimeoutMs: config.approvalTimeoutMs,
+        now: clockNow,
+        ...(options.reconcileEffect ? { reconcileEffect: options.reconcileEffect } : {}),
+      });
+      directDriver.setRunner((runId) => coordinator.executeRun(runId, directDriver));
+      closeDirectDriver = () => directDriver.close();
+
+      routineSchedule = createDirectRoutineScheduleClient({
         routines,
         engines,
-        ...(options.now ? { now: options.now } : {}),
-      }),
-    );
-  }
-
-  const restateFetchHandler = createRestateFetchHandler(workflowDeps, extraServices);
-
-  const restateServer = Bun.serve({
-    hostname: config.restateHost,
-    port: config.restateListen,
-    fetch: (request) => restateFetchHandler(request),
-  });
-
-  const httpHandler = createHttpHandler({
-    store,
-    memory,
-    routines,
-    skills,
-    tools,
-    workflow,
-    routineSchedule,
-    engines,
-    config,
-    ...(options.extraHttpHandler ? { extraHttpHandler: options.extraHttpHandler } : {}),
-  });
-
-  const httpServer = Bun.serve({
-    hostname: config.host,
-    port: config.port,
-    fetch: httpHandler,
-  });
-
-  let telegramAbort: AbortController | undefined;
-  let messagingRuntime: MessagingRuntime | undefined;
-  const telegramConfig = config.telegram;
-
-  if (telegramConfig !== undefined || options.telegramMessaging !== undefined) {
-    if (telegramConfig !== undefined) {
-      for (const configuredBinding of telegramConfig.bindings) {
-        const targetSession = store.getSession(configuredBinding.sessionId);
-        if (targetSession === undefined || targetSession.botId !== configuredBinding.botId) {
-          console.warn(
-            `skipping Telegram binding for session "${configuredBinding.sessionId}" and bot "${configuredBinding.botId}": session not found in bot scope`,
-          );
-          continue;
-        }
-        store.upsertChannelBinding({
-          ...(configuredBinding.id !== undefined ? { id: configuredBinding.id } : {}),
-          integration: "telegram",
-          externalChatId: configuredBinding.externalChatId,
-          externalActorId: configuredBinding.externalActorId,
-          botId: configuredBinding.botId,
-          sessionId: configuredBinding.sessionId,
-          enabled: configuredBinding.enabled,
-        });
-      }
-    }
-
-    let telegramAdapter: TelegramMessaging | undefined;
-    if (options.telegramMessaging !== undefined) {
-      telegramAdapter = options.telegramMessaging;
-    } else if (telegramConfig !== undefined) {
-      telegramAbort = new AbortController();
-      telegramAdapter = createTelegramMessaging({
-        botToken: telegramConfig.botToken,
-        apiBaseUrl: telegramConfig.apiBaseUrl,
-        pollTimeoutSeconds: telegramConfig.pollTimeoutSeconds,
-        initialBackoffMs: telegramConfig.pollInitialBackoffMs,
-        maxBackoffMs: telegramConfig.pollMaxBackoffMs,
-        ...(options.now ? { now: options.now } : {}),
-        signal: telegramAbort.signal,
-      });
-    }
-
-    if (telegramAdapter !== undefined) {
-      const adapters = new Map<ChannelIntegration, Messaging & ChannelCallbackAcknowledger>([
-        ["telegram", telegramAdapter],
-      ]);
-
-      messagingRuntime = createMessagingRuntime({
-        store,
-        workflow,
-        adapters,
-        telegramConsumer: telegramConfig?.consumer ?? "telegram-default",
-        ...(telegramConfig !== undefined
-          ? {
-              pollRetryInitialBackoffMs: telegramConfig.pollInitialBackoffMs,
-              pollRetryMaxBackoffMs: telegramConfig.pollMaxBackoffMs,
-              outboxPollIntervalMs: telegramConfig.outboxPollIntervalMs,
-              outboxInitialBackoffMs: telegramConfig.outboxInitialBackoffMs,
-              outboxMaxBackoffMs: telegramConfig.outboxMaxBackoffMs,
-            }
-          : {}),
-        ...(options.now ? { now: options.now } : {}),
-        onError: (error) => {
-          const rawMessage = error instanceof Error ? error.message : String(error);
-          console.error(
-            `telegram messaging error: ${redactTelegramSecret(rawMessage, telegramConfig?.botToken)}`,
-          );
+        now: clockNow,
+        admitRun: async (input) => {
+          const admitted = await coordinator.admit({
+            botId: input.botId,
+            sessionId: input.sessionId,
+            origin: "routine",
+            idempotencyKey: `routine:${input.routineId}:${input.routineSlot}`,
+            engine: input.engine,
+            input: { parts: [{ type: "text", text: input.prompt }] },
+            routineId: input.routineId,
+            routineSlot: input.routineSlot,
+          });
+          return { runId: admitted.run.id };
         },
       });
-      messagingRuntime.start();
-    }
-  }
+    } else {
+      const restateDriver = createRestateWorkflowDriver(config.restateIngressUrl);
+      coordinator = createRunCoordinator({
+        store,
+        engines,
+        tools,
+        driver: restateDriver,
+        approvalTimeoutMs: config.approvalTimeoutMs,
+        now: clockNow,
+        ...(options.reconcileEffect ? { reconcileEffect: options.reconcileEffect } : {}),
+      });
+      routineSchedule = createRoutineScheduleClient(config.restateIngressUrl);
 
-  const commands: ServerCommands = {
-    admitRun: (request) => workflow.admit(request),
-    decideApproval: (decision, channelIntake) => workflow.decide(decision, channelIntake),
-    configureRoutine: (routineId, input) => routineSchedule.configure(routineId, input),
-    listBots: () => store.listBots(),
-    listSessions: (botId) => store.listSessions(botId),
-    listMessages: (sessionId, opts) => store.listMessages(sessionId, opts),
-    getRun: (runId) => {
-      const run = store.getRun(runId);
-      if (!run) {
-        return undefined;
+      const extraServices = [...(options.extraRestateServices ?? [])];
+      if (!hasRestateServiceNamed(extraServices, "RoutineSchedule")) {
+        extraServices.push(
+          createRoutineScheduleObject({
+            store,
+            routines,
+            engines,
+            ...(options.now ? { now: options.now } : {}),
+          }),
+        );
       }
-      return {
-        run,
-        approval: store.getLatestApprovalForRun(runId) ?? null,
-      };
-    },
-    readMemory: (botId, version) => memory.read(botId, version),
-    writeMemory: (input) => memory.write(input),
-    listSkills: () => skills.listSkills(),
-    listRoutines: (botId) => routines.listRoutines(botId),
-    diagnoseEngines: async () => {
-      const results: EngineReadiness[] = [];
-      for (const [kind, engine] of engines.entries()) {
-        if (engine.diagnose) {
-          results.push(await engine.diagnose());
+
+      const restateFetchHandler = createRestateFetchHandler(coordinator, extraServices);
+      restateServer = Bun.serve({
+        hostname: config.restateHost,
+        port: config.restateListen,
+        fetch: (request) => restateFetchHandler(request),
+      });
+    }
+
+    const loadRunInput = createContextLoader({
+      store,
+      memory,
+      skills,
+      tools,
+      coordinator,
+      ...(options.reconcileEffect ? { reconcileEffect: options.reconcileEffect } : {}),
+      maxTokens: config.contextMaxTokens,
+    });
+
+    if (options.engines === undefined) {
+      const requested = new Set<EngineKind>(config.enabledEngines);
+      if (config.seedFixture) {
+        requested.add("fixture");
+      }
+      for (const kind of requested) {
+        if (kind === "fixture") {
+          engines.set("fixture", createFixtureEngine(store));
         } else {
-          results.push({
-            engine: kind,
-            interactive: "ready",
-            unattended: "unverified",
-            isolationVerified: false,
-            reasons: ["Engine diagnostics not configured."],
-          });
+          engines.set(
+            kind,
+            buildOfficialEngine({
+              kind,
+              config,
+              workspaceHostPath,
+              loadRunInput,
+              runner,
+              ...(options.probeEngineAuth !== undefined
+                ? { probeEngineAuth: options.probeEngineAuth }
+                : {}),
+            }),
+          );
         }
       }
-      return results;
-    },
-    listOutboxEvents: (filter) => store.listOutboxEvents(filter),
-    upsertChannelBinding: (input) => store.upsertChannelBinding(input),
-    listChannelBindings: (filter) => store.listChannelBindings(filter),
-  };
+    } else if (config.seedFixture && !engines.has("fixture")) {
+      engines.set("fixture", createFixtureEngine(store));
+    }
 
-  return {
-    config,
-    store,
-    memory,
-    routines,
-    skills,
-    tools,
-    engines,
-    workflow,
-    routineSchedule,
-    ...(messagingRuntime ? { messaging: messagingRuntime } : {}),
-    commands,
-    url: `http://${config.host}:${httpServer.port}`,
-    restateUrl: `http://${config.restateHost}:${restateServer.port}`,
-    ...(seededFixture ? { seededFixture } : {}),
-    async close() {
-      telegramAbort?.abort();
-      await messagingRuntime?.stop();
-      closeDirectWorkflow?.();
-      await mcpHandle?.close();
-      await httpServer.stop(true);
-      await restateServer.stop(true);
-      if (ownsStore) {
-        store.close();
-      }
-    },
-  };
+    const httpApp = createHttpApp({
+      bots: store,
+      sessions: store,
+      runs: store,
+      approvals: store,
+      memory,
+      routines,
+      skills,
+      tools,
+      workflow: coordinator,
+      routineSchedule,
+      engines,
+      config,
+      now: clockNow,
+      ...(options.extraHttpHandler ? { extraHttpHandler: options.extraHttpHandler } : {}),
+    });
+
+    const startedHttpServer = Bun.serve({
+      hostname: config.host,
+      port: config.port,
+      fetch: httpApp.fetch,
+    });
+    httpServer = startedHttpServer;
+
+    const outboxSinks = new Map<string, OutboxSink>();
+    for (const sink of integrationRegistry?.listOutboxSinks() ?? []) {
+      outboxSinks.set(sink.kind, sink);
+    }
+    for (const sink of options.outboxSinks ?? []) {
+      outboxSinks.set(sink.kind, sink);
+    }
+
+    const startedOutbox = createOutboxSender({
+      store,
+      listDestinations: () => store.listOutboxDestinations(),
+      sinks: outboxSinks,
+      pollIntervalMs: config.outboxPollIntervalMs,
+      initialBackoffMs: config.outboxInitialBackoffMs,
+      maxBackoffMs: config.outboxMaxBackoffMs,
+      now: clockNow,
+      onError: (error) => {
+        console.error(
+          `outbox delivery error: ${error instanceof Error ? error.message : String(error)}`,
+        );
+      },
+    });
+    outbox = startedOutbox;
+    if (outboxSinks.size > 0) {
+      startedOutbox.start();
+    }
+
+    const commands: ServerCommands = {
+      admitRun: (request) => coordinator.admit(request),
+      decideApproval: (decision, channelIntake) => coordinator.decide(decision, channelIntake),
+      configureRoutine: (routineId, input) => routineSchedule.configure(routineId, input),
+      listBots: () => store.listBots(),
+      listSessions: (botId) => store.listSessions(botId),
+      listMessages: (sessionId, opts) => store.listMessages(sessionId, opts),
+      getRun: (runId) => {
+        const run = store.getRun(runId);
+        if (!run) {
+          return undefined;
+        }
+        return {
+          run,
+          approval: store.getLatestApprovalForRun(runId) ?? null,
+        };
+      },
+      readMemory: (botId, version) => memory.read(botId, version),
+      writeMemory: (input) => memory.write(input),
+      listSkills: () => skills.listSkills(),
+      listRoutines: (botId) => routines.listRoutines(botId),
+      diagnoseEngines: async () => {
+        const results: EngineReadiness[] = [];
+        for (const [kind, engine] of engines.entries()) {
+          if (engine.diagnose) {
+            results.push(await engine.diagnose());
+          } else {
+            results.push({
+              engine: kind,
+              interactive: "ready",
+              unattended: "unverified",
+              isolationVerified: false,
+              reasons: ["Engine diagnostics not configured."],
+            });
+          }
+        }
+        return results;
+      },
+      listOutboxEvents: (filter) => store.listOutboxEvents(filter),
+      upsertChannelBinding: (input) => store.upsertChannelBinding(input),
+      listChannelBindings: (filter) => store.listChannelBindings(filter),
+    };
+
+    const restateUrl =
+      restateServer !== undefined
+        ? `http://${config.restateHost}:${restateServer.port}`
+        : undefined;
+
+    return {
+      config,
+      store,
+      memory,
+      routines,
+      skills,
+      tools,
+      engines,
+      coordinator,
+      workflow: coordinator,
+      routineSchedule,
+      outbox: startedOutbox,
+      commands,
+      url: `http://${config.host}:${startedHttpServer.port}`,
+      ...(restateUrl !== undefined ? { restateUrl } : {}),
+      ...(seededFixture ? { seededFixture } : {}),
+      async close() {
+        const errors: unknown[] = [];
+        const runStep = async (step: () => Promise<void> | void) => {
+          try {
+            await step();
+          } catch (error) {
+            errors.push(error);
+          }
+        };
+
+        await runStep(() => startedOutbox.stop());
+        await runStep(() => closeDirectDriver?.());
+        await runStep(() => integrationRegistry?.stop());
+        await runStep(() => startedHttpServer.stop(true));
+        await runStep(() => restateServer?.stop(true));
+        if (ownsStore) {
+          await runStep(() => {
+            store.close();
+          });
+        }
+
+        if (errors.length === 1) {
+          throw errors[0];
+        }
+        if (errors.length > 1) {
+          throw new AggregateError(errors, "Failed to close server cleanly");
+        }
+      },
+    };
+  } catch (error) {
+    await outbox?.stop().catch(() => undefined);
+    try {
+      closeDirectDriver?.();
+    } catch {
+      // best-effort startup rollback
+    }
+    await integrationRegistry?.stop().catch(() => undefined);
+    await httpServer?.stop(true).catch(() => undefined);
+    await restateServer?.stop(true).catch(() => undefined);
+    if (ownsStore) {
+      store.close();
+    }
+    throw error;
+  }
 }
 
 if (import.meta.main) {
-  const running = startServer();
+  const running = await startServer();
   await running.memory.reconcile();
-  console.log(`der server listening on ${running.url} (restate fetch on ${running.restateUrl})`);
+  console.log(
+    running.restateUrl !== undefined
+      ? `der server listening on ${running.url} (restate fetch on ${running.restateUrl})`
+      : `der server listening on ${running.url} (direct workflow mode)`,
+  );
 
   if (running.config.restateMode === "restate" && running.config.restateAutoRegister) {
     const deploymentUrl = running.config.restateDeploymentUrl ?? running.restateUrl;
-    registerDeploymentWithRestate({
-      adminUrl: running.config.restateAdminUrl,
-      deploymentUrl,
-    })
-      .then((registered) => {
-        console.log(`registered restate deployment ${registered.id} -> ${deploymentUrl}`);
+    if (deploymentUrl !== undefined) {
+      registerDeploymentWithRestate({
+        adminUrl: running.config.restateAdminUrl,
+        deploymentUrl,
       })
-      .catch((error) => {
-        console.error(
-          `restate deployment registration failed: ${error instanceof Error ? error.message : String(error)}`,
-        );
-      });
+        .then((registered) => {
+          console.log(`registered restate deployment ${registered.id} -> ${deploymentUrl}`);
+        })
+        .catch((error) => {
+          console.error(
+            `restate deployment registration failed: ${error instanceof Error ? error.message : String(error)}`,
+          );
+        });
+    }
   }
 
   const shutdown = () => {

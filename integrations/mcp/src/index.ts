@@ -4,10 +4,9 @@ export {
   effectIdentityMatches,
   type ApprovalVerifier,
 } from "./authorization";
-export { createHostTools } from "./composite-tools";
 export { redactSecrets, ToolConfigurationError, ToolEffectUncertainError } from "./errors";
-export { createHomeAssistantTools, type HomeAssistantConfig } from "./home-assistant";
 export {
+  createMcpIntegration,
   createMcpTools,
   type McpServerConfig,
   type McpToolsHandle,

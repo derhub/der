@@ -1,3 +1,11 @@
+import { Badge } from "@astryxdesign/core/Badge";
+import { Button } from "@astryxdesign/core/Button";
+import { EmptyState } from "@astryxdesign/core/EmptyState";
+import { Heading } from "@astryxdesign/core/Heading";
+import { Tab, TabList } from "@astryxdesign/core/TabList";
+import { TextInput } from "@astryxdesign/core/TextInput";
+import { Theme } from "@astryxdesign/core/theme";
+import { neutralTheme } from "@astryxdesign/theme-neutral/built";
 import {
   ActivityIcon,
   BookOpenIcon,
@@ -15,17 +23,6 @@ import { ProblemAlert } from "@/components/problem-alert";
 import { ReadinessPanel } from "@/components/readiness-panel";
 import { RoutinesPanel } from "@/components/routines-panel";
 import { SkillsPanel } from "@/components/skills-panel";
-import { Badge } from "@/components/ui/badge";
-import { Button } from "@/components/ui/button";
-import {
-  Empty,
-  EmptyDescription,
-  EmptyHeader,
-  EmptyMedia,
-  EmptyTitle,
-} from "@/components/ui/empty";
-import { Input } from "@/components/ui/input";
-import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { createOperatorApi, type OperatorApi } from "@/lib/operator-api";
 import { toOperatorProblem, type HealthResponse } from "@/lib/schemas";
 
@@ -157,155 +154,161 @@ export function App({ api: providedApi, fetcher }: AppProps) {
   ).length;
 
   return (
-    <div className="flex min-h-screen flex-col bg-background text-foreground md:flex-row">
-      <OperatorSidebar
-        api={api}
-        bots={bots}
-        sessions={sessions}
-        selectedBotId={selectedBotId}
-        selectedSessionId={selectedSessionId}
-        onSelectBot={setSelectedBotId}
-        onSelectSession={setSelectedSessionId}
-        onBotSaved={handleBotSaved}
-        onSessionCreated={handleSessionCreated}
-        onAnnounce={announce}
-      />
+    <Theme theme={neutralTheme}>
+      <div className="flex min-h-screen flex-col bg-body text-primary md:flex-row">
+        <OperatorSidebar
+          api={api}
+          bots={bots}
+          sessions={sessions}
+          selectedBotId={selectedBotId}
+          selectedSessionId={selectedSessionId}
+          onSelectBot={setSelectedBotId}
+          onSelectSession={setSelectedSessionId}
+          onBotSaved={handleBotSaved}
+          onSessionCreated={handleSessionCreated}
+          onAnnounce={announce}
+        />
 
-      <div className="flex min-w-0 flex-1 flex-col">
-        <header className="flex flex-wrap items-center justify-between gap-3 border-b border-border bg-card px-5 py-3">
-          <div className="flex flex-wrap items-center gap-2">
-            <h1 className="text-sm font-semibold tracking-tight">
-              {selectedBot ? selectedBot.name : "der control plane"}
-            </h1>
-            <Badge variant={health?.status === "ok" ? "ready" : "danger"}>
-              {health?.status === "ok" ? "API healthy" : "API unreachable"}
-            </Badge>
-            <Badge variant={readyEngineCount > 0 ? "ready" : "warn"}>
-              {readyEngineCount}/{engines.length} engines ready
-            </Badge>
+        <div className="flex min-w-0 flex-1 flex-col">
+          <header className="flex flex-wrap items-center justify-between gap-3 border-b border-border bg-card px-5 py-3">
+            <div className="flex flex-wrap items-center gap-2">
+              <Heading level={1}>{selectedBot ? selectedBot.name : "der control plane"}</Heading>
+              <Badge
+                variant={health?.status === "ok" ? "success" : "error"}
+                label={health?.status === "ok" ? "API healthy" : "API unreachable"}
+              />
+              <Badge
+                variant={readyEngineCount > 0 ? "success" : "warning"}
+                label={`${readyEngineCount}/${engines.length} engines ready`}
+              />
+            </div>
+
+            <div className="flex flex-wrap items-center gap-2">
+              <label htmlFor="operator-actor-input" className="text-xs text-secondary">
+                Actor
+              </label>
+              <TextInput
+                id="operator-actor-input"
+                label="Operator actor identifier"
+                isLabelHidden
+                size="sm"
+                width={128}
+                value={actor}
+                onChange={handleActorChange}
+                controlClassName="font-mono text-xs"
+              />
+              <Button
+                size="sm"
+                variant="secondary"
+                label="Refresh"
+                icon={<RefreshCwIcon className="size-3.5" aria-hidden="true" />}
+                isDisabled={loadingBootstrap}
+                onClick={() => void loadBootstrap()}
+              />
+            </div>
+          </header>
+
+          <div
+            role="status"
+            aria-label="Operator status"
+            aria-live="polite"
+            className="min-h-6 border-b border-border bg-muted px-5 py-1 text-xs text-secondary"
+          >
+            {statusMessage || "Connected to same-origin der operator API."}
           </div>
 
-          <div className="flex flex-wrap items-center gap-2">
-            <label htmlFor="operator-actor-input" className="text-xs text-muted-foreground">
-              Actor
-            </label>
-            <Input
-              id="operator-actor-input"
-              value={actor}
-              onChange={(event) => handleActorChange(event.target.value)}
-              className="h-8 w-32 font-mono text-xs"
-              aria-label="Operator actor identifier"
-            />
-            <Button
-              size="sm"
-              variant="outline"
-              disabled={loadingBootstrap}
-              onClick={() => void loadBootstrap()}
+          <main className="mx-auto flex w-full max-w-6xl flex-1 flex-col gap-4 px-5 py-5">
+            {bootstrapProblem ? (
+              <ProblemAlert
+                problem={bootstrapProblem}
+                onDismiss={() => setBootstrapProblem(null)}
+                onRetry={() => void loadBootstrap()}
+              />
+            ) : null}
+
+            <TabList
+              role="tablist"
+              aria-label="Operator workspace sections"
+              value={activeTab}
+              onChange={setActiveTab}
+              hasDivider
             >
-              <RefreshCwIcon data-icon="inline-start" />
-              Refresh
-            </Button>
-          </div>
-        </header>
+              <Tab
+                value="chat"
+                label="Chat & Runs"
+                panelId="panel-chat"
+                icon={<MessageSquareIcon className="size-4" aria-hidden="true" />}
+              />
+              <Tab
+                value="memory"
+                label="Memory"
+                panelId="panel-memory"
+                icon={<BrainIcon className="size-4" aria-hidden="true" />}
+              />
+              <Tab
+                value="routines"
+                label="Routines"
+                panelId="panel-routines"
+                icon={<CalendarClockIcon className="size-4" aria-hidden="true" />}
+              />
+              <Tab
+                value="readiness"
+                label="Readiness"
+                panelId="panel-readiness"
+                icon={<ActivityIcon className="size-4" aria-hidden="true" />}
+              />
+              <Tab
+                value="skills"
+                label="Skills"
+                panelId="panel-skills"
+                icon={<BookOpenIcon className="size-4" aria-hidden="true" />}
+              />
+            </TabList>
 
-        <div
-          role="status"
-          aria-live="polite"
-          className="min-h-6 border-b border-border/60 bg-muted/40 px-5 py-1 text-xs text-muted-foreground"
-        >
-          {statusMessage || "Connected to same-origin der operator API."}
-        </div>
-
-        <main className="mx-auto flex w-full max-w-6xl flex-1 flex-col gap-4 px-5 py-5">
-          {bootstrapProblem ? (
-            <ProblemAlert
-              problem={bootstrapProblem}
-              onDismiss={() => setBootstrapProblem(null)}
-              onRetry={() => void loadBootstrap()}
-            />
-          ) : null}
-
-          <Tabs value={activeTab} onValueChange={setActiveTab}>
-            <TabsList aria-label="Operator workspace sections" className="flex-wrap h-auto">
-              <TabsTrigger value="chat">
-                <MessageSquareIcon aria-hidden="true" />
-                Chat &amp; Runs
-              </TabsTrigger>
-              <TabsTrigger value="memory">
-                <BrainIcon aria-hidden="true" />
-                Memory
-              </TabsTrigger>
-              <TabsTrigger value="routines">
-                <CalendarClockIcon aria-hidden="true" />
-                Routines
-              </TabsTrigger>
-              <TabsTrigger value="readiness">
-                <ActivityIcon aria-hidden="true" />
-                Readiness
-              </TabsTrigger>
-              <TabsTrigger value="skills">
-                <BookOpenIcon aria-hidden="true" />
-                Skills
-              </TabsTrigger>
-            </TabsList>
-
-            <TabsContent value="chat">
-              {selectedBot && selectedSession ? (
-                <ChatWorkspace
-                  key={selectedSession.id}
+            <div role="tabpanel" id={`panel-${activeTab}`}>
+              {activeTab === "chat" ? (
+                selectedBot && selectedSession ? (
+                  <ChatWorkspace
+                    key={selectedSession.id}
+                    api={api}
+                    {...(fetcher !== undefined ? { fetcher } : {})}
+                    bot={selectedBot}
+                    session={selectedSession}
+                    actor={actor}
+                    onAnnounce={announce}
+                  />
+                ) : (
+                  <EmptyState
+                    icon={<MessageSquareIcon className="size-6" aria-hidden="true" />}
+                    title="Select a bot and session"
+                    description="Create or choose a bot and session in the sidebar to inspect scoped history and run live prompts."
+                  />
+                )
+              ) : activeTab === "memory" ? (
+                <MemoryPanel api={api} bot={selectedBot} onAnnounce={announce} />
+              ) : activeTab === "routines" ? (
+                <RoutinesPanel
                   api={api}
-                  {...(fetcher !== undefined ? { fetcher } : {})}
                   bot={selectedBot}
-                  session={selectedSession}
-                  actor={actor}
+                  sessions={sessions}
                   onAnnounce={announce}
                 />
+              ) : activeTab === "readiness" ? (
+                <ReadinessPanel
+                  health={health}
+                  engines={engines}
+                  tools={tools}
+                  loading={loadingBootstrap}
+                  problem={bootstrapProblem}
+                  onRefresh={() => void loadBootstrap()}
+                />
               ) : (
-                <Empty>
-                  <EmptyHeader>
-                    <EmptyMedia>
-                      <MessageSquareIcon />
-                    </EmptyMedia>
-                    <EmptyTitle>Select a bot and session</EmptyTitle>
-                    <EmptyDescription>
-                      Create or choose a bot and session in the sidebar to inspect scoped history
-                      and run live prompts.
-                    </EmptyDescription>
-                  </EmptyHeader>
-                </Empty>
+                <SkillsPanel api={api} />
               )}
-            </TabsContent>
-
-            <TabsContent value="memory">
-              <MemoryPanel api={api} bot={selectedBot} onAnnounce={announce} />
-            </TabsContent>
-
-            <TabsContent value="routines">
-              <RoutinesPanel
-                api={api}
-                bot={selectedBot}
-                sessions={sessions}
-                onAnnounce={announce}
-              />
-            </TabsContent>
-
-            <TabsContent value="readiness">
-              <ReadinessPanel
-                health={health}
-                engines={engines}
-                tools={tools}
-                loading={loadingBootstrap}
-                problem={bootstrapProblem}
-                onRefresh={() => void loadBootstrap()}
-              />
-            </TabsContent>
-
-            <TabsContent value="skills">
-              <SkillsPanel api={api} />
-            </TabsContent>
-          </Tabs>
-        </main>
+            </div>
+          </main>
+        </div>
       </div>
-    </div>
+    </Theme>
   );
 }

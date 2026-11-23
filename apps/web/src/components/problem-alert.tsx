@@ -1,8 +1,8 @@
-import { AlertTriangleIcon, XIcon } from "lucide-react";
+import { Badge } from "@astryxdesign/core/Badge";
+import { Banner } from "@astryxdesign/core/Banner";
+import { Button } from "@astryxdesign/core/Button";
+import { Text } from "@astryxdesign/core/Text";
 import type { ProblemDetails } from "@der/domain";
-import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
-import { Badge } from "@/components/ui/badge";
-import { Button } from "@/components/ui/button";
 
 export interface ProblemAlertProps {
   readonly problem: ProblemDetails;
@@ -18,46 +18,37 @@ export function ProblemAlert({
   retryLabel = "Retry",
 }: ProblemAlertProps) {
   return (
-    <Alert variant="destructive" data-problem-code={problem.code}>
-      <div className="flex items-start justify-between gap-3">
-        <div className="flex items-start gap-2.5 min-w-0">
-          <AlertTriangleIcon className="mt-0.5 size-4 shrink-0" aria-hidden="true" />
-          <div className="flex flex-col gap-1 min-w-0">
-            <div className="flex flex-wrap items-center gap-2">
-              <AlertTitle>{problem.title}</AlertTitle>
-              <Badge variant="danger" className="font-mono">
-                {problem.status}
-              </Badge>
-              <Badge variant="outline" className="font-mono">
-                {problem.code}
-              </Badge>
-            </div>
-            <AlertDescription className="break-words">{problem.detail}</AlertDescription>
-            <div className="flex flex-wrap items-center gap-3 font-mono text-[11px] opacity-80">
+    <div role="alert" aria-label={problem.title} data-problem-code={problem.code}>
+      <Banner
+        status="error"
+        collapsible={false}
+        isDismissable={Boolean(onDismiss)}
+        {...(onDismiss ? { onDismiss } : {})}
+        dismissLabel="Dismiss error"
+        title={
+          <span className="inline-flex flex-wrap items-center gap-2">
+            <span>{problem.title}</span>
+            <Badge variant="error" label={String(problem.status)} />
+            <Badge variant="neutral" label={problem.code} />
+          </span>
+        }
+        description={
+          <div className="flex flex-col gap-1">
+            <Text type="body" as="p" className="break-words">
+              {problem.detail}
+            </Text>
+            <div className="flex flex-wrap items-center gap-3 font-mono text-xs opacity-80">
               <span>instance: {problem.instance}</span>
               <span>type: {problem.type}</span>
             </div>
           </div>
-        </div>
-        <div className="flex shrink-0 items-center gap-1.5">
-          {onRetry ? (
-            <Button size="sm" variant="outline" onClick={onRetry}>
-              {retryLabel}
-            </Button>
-          ) : null}
-          {onDismiss ? (
-            <Button
-              size="icon"
-              variant="ghost"
-              aria-label="Dismiss error"
-              onClick={onDismiss}
-              className="size-7"
-            >
-              <XIcon />
-            </Button>
-          ) : null}
-        </div>
-      </div>
-    </Alert>
+        }
+        endContent={
+          onRetry ? (
+            <Button size="sm" variant="secondary" label={retryLabel} onClick={onRetry} />
+          ) : undefined
+        }
+      />
+    </div>
   );
 }

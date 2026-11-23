@@ -19,7 +19,7 @@ import {
 } from "@der/domain";
 import { compiledParsers } from "@der/domain/compiled";
 import { canonicalizeJson } from "./canonical";
-import { insertOutboxForBindings, recordIntakeInTx } from "./channel-outbox";
+import { insertOutboxForBindings } from "./channel-outbox";
 import type { SqliteDatabase } from "./database";
 import { conflictError, notFoundError, validationError } from "./errors";
 import {
@@ -215,7 +215,7 @@ export function getLatestApprovalForRun(
 export async function decideApproval(
   database: SqliteDatabase,
   decision: ApprovalResolutionInput,
-  channelIntake?: ChannelIntakeMetadata,
+  _channelIntake?: ChannelIntakeMetadata,
 ): Promise<Approval> {
   const parsed = compiledParsers.approvalResolutionInput.safeParse(decision);
   if (!parsed.success) {
@@ -298,10 +298,6 @@ export async function decideApproval(
         ).run(now, row.run_id);
       }
 
-      if (channelIntake) {
-        recordIntakeInTx(db, channelIntake, "decided", row.id, now);
-      }
-
       const updated = db
         .query<ApprovalRow, [string]>("SELECT * FROM approvals WHERE id = ?")
         .get(input.approvalId);
@@ -315,9 +311,6 @@ export async function decideApproval(
       row.status === input.status && (input.status === "expired" || row.actor === input.actor);
 
     if (isExactReplay) {
-      if (channelIntake) {
-        recordIntakeInTx(db, channelIntake, "duplicate", row.id, now);
-      }
       return { kind: "settled", approval: mapApprovalRow(row) };
     }
 

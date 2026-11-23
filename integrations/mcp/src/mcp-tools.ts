@@ -1,9 +1,19 @@
-import type { JsonValue, ToolDescriptor, ToolOperation, ToolResult, Tools } from "@der/domain";
+import {
+  defineIntegration,
+  defineTool,
+  type Integration,
+  type JsonValue,
+  type ToolDescriptor,
+  type ToolOperation,
+  type ToolResult,
+  type Tools,
+} from "@der/domain";
 import { compiledParsers } from "@der/domain/compiled";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import type { Transport } from "@modelcontextprotocol/sdk/shared/transport.js";
+import * as z from "zod";
 import { deniedToolResult, type ApprovalVerifier } from "./authorization";
 import { redactSecrets, ToolConfigurationError, ToolEffectUncertainError } from "./errors";
 
@@ -391,4 +401,37 @@ export function createMcpTools(options: McpToolsOptions): McpToolsHandle {
       );
     },
   };
+}
+
+const mcpArgumentsSchema = z.record(z.string(), z.unknown());
+
+export function createMcpIntegration(
+  options: McpToolsOptions & { readonly id?: string },
+): Integration {
+  return defineIntegration({
+    id: options.id ?? "mcp",
+    setup() {
+      const handle = createMcpTools(options);
+      return {
+        async listTools() {
+          const descriptors = await handle.list();
+          return descriptors.map((descriptor) =>
+            defineTool({
+              id: descriptor.id,
+              operationKind: "mcp",
+              name: descriptor.name,
+              description: descriptor.description,
+              inputSchema: mcpArgumentsSchema,
+              descriptorInputSchema: descriptor.inputSchema,
+              approval: descriptor.requiresApproval ? "always" : "none",
+              execute: async (_input, ctx) => handle.invoke({ effect: ctx.effect }),
+            }),
+          );
+        },
+        async stop() {
+          await handle.close();
+        },
+      };
+    },
+  });
 }

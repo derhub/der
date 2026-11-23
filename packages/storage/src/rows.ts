@@ -1,19 +1,27 @@
-import type {
-  Approval,
-  ApprovalDecision,
-  Bot,
-  ChannelBinding,
-  ChannelCursor,
-  ChannelReceipt,
-  EffectRecord,
-  Message,
-  OutboxEvent,
-  Routine,
-  Run,
-  RunEvent,
-  Session,
+import {
+  effectOperationKind,
+  type Approval,
+  type ApprovalDecision,
+  type Bot,
+  type ChannelBinding,
+  type ChannelCursor,
+  type ChannelReceipt,
+  type EffectRecord,
+  type Message,
+  type OutboxEvent,
+  type PersistedEffectOperationKind,
+  type Routine,
+  type Run,
+  type RunEvent,
+  type Session,
 } from "@der/domain";
 import { compiledParsers } from "@der/domain/compiled";
+
+const ACTIVE_OPERATION_KINDS = new Set<string>(effectOperationKind.options);
+
+function normalizePersistedOperationKind(raw: string): PersistedEffectOperationKind {
+  return ACTIVE_OPERATION_KINDS.has(raw) ? (raw as PersistedEffectOperationKind) : "legacy";
+}
 
 export interface BotRow {
   readonly id: string;
@@ -266,7 +274,7 @@ export function mapApprovalRow(row: ApprovalRow): Approval {
     runId: row.run_id,
     effect: {
       runId: row.run_id,
-      operationKind: row.operation_kind,
+      operationKind: normalizePersistedOperationKind(row.operation_kind),
       operationId: row.operation_id,
       canonicalArguments: JSON.parse(row.canonical_arguments_json) as unknown,
       attemptId: row.attempt_id,
@@ -285,7 +293,7 @@ export function mapEffectRow(row: EffectRow): EffectRecord {
     id: row.id,
     identity: {
       runId: row.run_id,
-      operationKind: row.operation_kind,
+      operationKind: normalizePersistedOperationKind(row.operation_kind),
       operationId: row.operation_id,
       canonicalArguments: JSON.parse(row.canonical_arguments_json) as unknown,
       attemptId: row.attempt_id,
