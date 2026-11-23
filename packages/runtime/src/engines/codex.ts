@@ -33,6 +33,7 @@ export interface CodexEngineConfig {
   readonly sandboxMode?: CodexSandboxMode;
   readonly approvalPolicy?: CodexApprovalMode;
   readonly env?: Record<string, string>;
+  readonly autoCompactTokens?: number;
 }
 
 export function createCodexEngine(config: CodexEngineConfig): Engine {
@@ -73,6 +74,13 @@ export function createCodexEngine(config: CodexEngineConfig): Engine {
           ? { codexExecutable: config.codexExecutable }
           : {}),
         env: containerEnv,
+        ...(config.autoCompactTokens !== undefined
+          ? {
+              config: {
+                model_auto_compact_token_limit: String(config.autoCompactTokens),
+              },
+            }
+          : {}),
       });
 
       const sandbox = defineSandbox({

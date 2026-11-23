@@ -155,6 +155,16 @@ describe("cap memory and the skill catalog in a Run's prompt", () => {
     expect(config.skillCatalogMaxBytes).toBe(700);
   });
 
+  it("defaults the compact window to 100,000 tokens", () => {
+    expect(parseServerConfig(undefined, {}).engineCompactTokens).toBe(100_000);
+  });
+
+  it("reads the compact window from the environment", () => {
+    const config = parseServerConfig(undefined, { DER_ENGINE_COMPACT_TOKENS: "120000" });
+
+    expect(config.engineCompactTokens).toBe(120_000);
+  });
+
   it("gives the engine a memory cut to the configured cap", async () => {
     const tempDb = createTempDatabase("der-context-caps-");
     const workspaceDir = join(tempDb.dir, "workspaces");

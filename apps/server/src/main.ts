@@ -579,6 +579,7 @@ function buildOfficialEngine(input: {
     return createCodexEngine({
       model: input.config.engineModels.codex as Parameters<typeof createCodexEngine>[0]["model"],
       sandboxProvider,
+      autoCompactTokens: input.config.engineCompactTokens,
       diagnose,
       loadRunInput: input.loadRunInput,
     });
@@ -591,6 +592,7 @@ function buildOfficialEngine(input: {
       >[0]["model"],
       sandboxProvider,
       callbackContinuity: "verified",
+      autoCompactTokens: input.config.engineCompactTokens,
       diagnose,
       loadRunInput: input.loadRunInput,
     });

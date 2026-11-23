@@ -131,6 +131,7 @@ const serverConfigSchema = z
     contextMaxTokens: z.number().int().positive().default(32_000),
     memoryPromptMaxBytes: z.number().int().positive().default(24_000),
     skillCatalogMaxBytes: z.number().int().positive().default(8_000),
+    engineCompactTokens: z.number().int().positive().default(100_000),
     allowedOrigins: z
       .array(originString)
       .default([
@@ -292,6 +293,10 @@ export function parseServerConfig(
     env["DER_SKILL_CATALOG_MAX_BYTES"],
     "DER_SKILL_CATALOG_MAX_BYTES",
   );
+  const engineCompactTokens = parseOptionalInt(
+    env["DER_ENGINE_COMPACT_TOKENS"],
+    "DER_ENGINE_COMPACT_TOKENS",
+  );
   const seedFixture = parseOptionalBoolean(env["DER_SEED_FIXTURE"], "DER_SEED_FIXTURE");
   const restateAutoRegister = parseOptionalBoolean(
     env["DER_RESTATE_AUTO_REGISTER"],
@@ -377,6 +382,7 @@ export function parseServerConfig(
     ...(contextMaxTokens !== undefined ? { contextMaxTokens } : {}),
     ...(memoryPromptMaxBytes !== undefined ? { memoryPromptMaxBytes } : {}),
     ...(skillCatalogMaxBytes !== undefined ? { skillCatalogMaxBytes } : {}),
+    ...(engineCompactTokens !== undefined ? { engineCompactTokens } : {}),
     ...(allowedOrigins !== undefined ? { allowedOrigins } : {}),
     ...(approvalTimeoutMs !== undefined ? { approvalTimeoutMs } : {}),
     ...(scriptMaxCalls !== undefined ? { scriptMaxCalls } : {}),
