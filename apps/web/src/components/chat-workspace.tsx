@@ -46,6 +46,7 @@ import {
   type ProblemDetails,
   type Run,
   type RunAdmission,
+  type RunUsage,
   type Session,
 } from "@der/domain";
 import { useChat, type UIMessage } from "@tanstack/ai-react";
@@ -98,6 +99,14 @@ const styles = stylex.create({
     fontFamily: typographyVars["--font-family-code"],
     fontSize: textSizeVars["--font-size-sm"],
     color: colorVars["--color-text-secondary"],
+  },
+  usageList: {
+    display: "flex",
+    flexDirection: "column",
+    gap: spacingVars["--spacing-0-5"],
+    margin: 0,
+    padding: 0,
+    listStyle: "none",
   },
   approvalBody: {
     display: "flex",
@@ -272,6 +281,43 @@ interface FailedDraftRetry {
   readonly text: string;
   readonly engine: EngineKind;
   readonly idempotencyKey: string;
+}
+
+function dashIfNull(value: number | null): string {
+  return value === null ? "-" : String(value);
+}
+
+function tokenSummary(usage: RunUsage): string {
+  return [
+    `input ${usage.inputTokens}`,
+    `cached ${dashIfNull(usage.cachedInputTokens)}`,
+    `cache write ${dashIfNull(usage.cacheWriteTokens)}`,
+    `output ${usage.outputTokens}`,
+  ].join(" · ");
+}
+
+function runUsageLine(run: Run & { readonly usage: RunUsage }): string {
+  const parts = [`${run.id} · ${tokenSummary(run.usage)}`];
+  if (run.contextMode !== null) parts.push(run.contextMode);
+  if (run.usage.reportedCostUsd !== null) {
+    parts.push(`vendor running cost $${run.usage.reportedCostUsd}`);
+  }
+  return parts.join(" · ");
+}
+
+function sumNullable(values: readonly (number | null)[]): number | null {
+  const present = values.filter((value): value is number => value !== null);
+  return present.length === 0 ? null : present.reduce((sum, value) => sum + value, 0);
+}
+
+function sessionUsageTotalsLine(usages: readonly RunUsage[]): string {
+  return `Session total · ${tokenSummary({
+    inputTokens: usages.reduce((sum, usage) => sum + usage.inputTokens, 0),
+    cachedInputTokens: sumNullable(usages.map((usage) => usage.cachedInputTokens)),
+    cacheWriteTokens: sumNullable(usages.map((usage) => usage.cacheWriteTokens)),
+    outputTokens: usages.reduce((sum, usage) => sum + usage.outputTokens, 0),
+    reportedCostUsd: null,
+  })}`;
 }
 
 export interface ChatWorkspaceProps {
@@ -544,6 +590,7 @@ export function ChatWorkspace({
   const [historyMessages, setHistoryMessages] = useState<Message[]>([]);
   const [historyLoading, setHistoryLoading] = useState(false);
   const [activeRun, setActiveRun] = useState<Run | null>(null);
+  const [sessionRuns, setSessionRuns] = useState<Run[]>([]);
   const [activeApproval, setActiveApproval] = useState<Approval | null>(null);
   const [streamStatus, setStreamStatus] = useState<RunStreamStatus>("idle");
   const [committedCursor, setCommittedCursor] = useState(0);
@@ -567,6 +614,14 @@ export function ChatWorkspace({
       setProblem(toOperatorProblem(error, `/api/sessions/${session.id}/messages`));
     } finally {
       setHistoryLoading(false);
+    }
+  }, [api, session.id]);
+
+  const refreshSessionRuns = useCallback(async () => {
+    try {
+      setSessionRuns(await api.listSessionRuns(session.id));
+    } catch (error) {
+      setProblem(toOperatorProblem(error, `/api/sessions/${session.id}/runs`));
     }
   }, [api, session.id]);
 
@@ -637,8 +692,9 @@ export function ChatWorkspace({
     (runId: string) => {
       void refreshRunState(runId);
       void refreshHistory();
+      void refreshSessionRuns();
     },
-    [refreshHistory, refreshRunState],
+    [refreshHistory, refreshRunState, refreshSessionRuns],
   );
 
   const connection = useMemo(
@@ -682,6 +738,7 @@ export function ChatWorkspace({
 
   useEffect(() => {
     void refreshHistory();
+    void refreshSessionRuns();
     const persisted = readPersistedCursor(session.id);
     if (persisted) {
       cursorMapRef.current.set(persisted.runId, persisted.cursor);
@@ -691,7 +748,7 @@ export function ChatWorkspace({
     return () => {
       resumeAbortRef.current?.abort();
     };
-  }, [refreshHistory, refreshRunState, session.id]);
+  }, [refreshHistory, refreshRunState, refreshSessionRuns, session.id]);
 
   async function submitRunPrompt(text: string, engine: EngineKind, explicitKey?: string) {
     const trimmed = text.trim();
@@ -810,6 +867,9 @@ export function ChatWorkspace({
   const displayedMessages = chat.messages;
   const activeIdempotencyKey =
     failedDraft?.idempotencyKey ?? idempotencyTrackerRef.current.peek(session.id)?.key ?? null;
+  const usageRuns = sessionRuns.flatMap((sessionRun) =>
+    sessionRun.usage === null ? [] : [{ ...sessionRun, usage: sessionRun.usage }],
+  );
   const engineOptions = bot.allowedEngines.map((kind) => ({ value: kind, label: kind }));
 
   return (
@@ -962,6 +1022,20 @@ export function ChatWorkspace({
         </Card>
       ) : null}
 
+      {usageRuns.length > 0 ? (
+        <div {...stylex.props(styles.columnGap05)}>
+          <p {...stylex.props(styles.monoMuted)}>
+            {sessionUsageTotalsLine(usageRuns.map((usageRun) => usageRun.usage))}
+          </p>
+          <ul {...stylex.props(styles.usageList)} aria-label="Run usage">
+            {usageRuns.map((usageRun) => (
+              <li key={usageRun.id} {...stylex.props(styles.monoMuted)}>
+                {runUsageLine(usageRun)}
+              </li>
+            ))}
+          </ul>
+        </div>
+      ) : null}
       <Card padding={0}>
         <div {...stylex.props(styles.transcriptHeader)}>
           <div {...stylex.props(styles.columnGap05)}>

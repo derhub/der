@@ -1,0 +1,142 @@
+import { render, screen } from "@testing-library/react";
+import { describe, expect, it } from "vite-plus/test";
+import type { Bot, Session } from "@der/domain";
+import { ChatWorkspace } from "@/components/chat-workspace";
+import { createOperatorApi } from "@/lib/operator-api";
+
+const bot: Bot = {
+  id: "bot-1",
+  name: "Usage Bot",
+  persona: "Counts tokens.",
+  defaultEngine: "fixture",
+  allowedEngines: ["fixture"],
+  createdAt: "2026-01-01T00:00:00.000Z",
+  updatedAt: "2026-01-01T00:00:00.000Z",
+};
+
+const session: Session = {
+  id: "sess-1",
+  botId: "bot-1",
+  title: "Usage Session",
+  engine: "fixture",
+  createdAt: "2026-01-01T00:00:00.000Z",
+  updatedAt: "2026-01-01T00:00:00.000Z",
+};
+
+function runRecord(id: string, extra: Record<string, unknown>) {
+  return {
+    id,
+    botId: "bot-1",
+    sessionId: "sess-1",
+    origin: "web",
+    engine: "fixture",
+    status: "completed",
+    routineId: null,
+    checkpoint: null,
+    createdAt: "2026-01-01T00:00:01.000Z",
+    updatedAt: "2026-01-01T00:00:02.000Z",
+    finishedAt: "2026-01-01T00:00:03.000Z",
+    ...extra,
+  };
+}
+
+function usage(inputTokens: number, extra: Record<string, unknown> = {}) {
+  return {
+    inputTokens,
+    cachedInputTokens: null,
+    cacheWriteTokens: null,
+    outputTokens: 7,
+    reportedCostUsd: null,
+    ...extra,
+  };
+}
+
+function renderWithRuns(runs: readonly Record<string, unknown>[]) {
+  const fetcher: typeof fetch = async (input) => {
+    const url = new URL(
+      typeof input === "string" ? input : input instanceof URL ? input.href : input.url,
+      "http://127.0.0.1:5173",
+    );
+    if (url.pathname === "/api/sessions/sess-1/messages") {
+      return Response.json({ messages: [] });
+    }
+    if (url.pathname === "/api/sessions/sess-1/runs") {
+      return Response.json({ runs });
+    }
+    return new Response("Not found", { status: 404 });
+  };
+  render(
+    <ChatWorkspace
+      api={createOperatorApi({ fetcher })}
+      fetcher={fetcher}
+      bot={bot}
+      session={session}
+      actor="operator"
+      onAnnounce={() => {}}
+    />,
+  );
+}
+
+describe("show usage for a session's Runs", () => {
+  it("per Run: renders four token counts and the context mode, dashes for null fields", async () => {
+    renderWithRuns([
+      runRecord("run-a", {
+        usage: usage(1200, { cachedInputTokens: 800, outputTokens: 45 }),
+        contextMode: "resumed",
+      }),
+    ]);
+
+    expect(
+      await screen.findByText(
+        "run-a · input 1200 · cached 800 · cache write - · output 45 · resumed",
+      ),
+    ).toBeTruthy();
+  });
+
+  it("per Run: renders the reported cost as the vendor's running figure", async () => {
+    renderWithRuns([
+      runRecord("run-a", {
+        usage: usage(10, { reportedCostUsd: 0.25 }),
+        contextMode: "rebuilt",
+      }),
+    ]);
+
+    expect(
+      await screen.findByText(
+        "run-a · input 10 · cached - · cache write - · output 7 · rebuilt · vendor running cost $0.25",
+      ),
+    ).toBeTruthy();
+  });
+
+  it("per Run: renders no usage line for a Run with usage null", async () => {
+    renderWithRuns([
+      runRecord("run-a", { usage: usage(5), contextMode: "rebuilt" }),
+      runRecord("run-script", { usage: null, contextMode: null }),
+    ]);
+
+    await screen.findByText(/^run-a · input 5/);
+    expect(screen.queryByText(/run-script/)).toBeNull();
+  });
+
+  it("totals: sums input tokens over the session's Runs and renders no cost total", async () => {
+    renderWithRuns([
+      runRecord("run-3", {
+        usage: usage(300, { reportedCostUsd: 3 }),
+        contextMode: "resumed",
+      }),
+      runRecord("run-2", {
+        usage: usage(200, { reportedCostUsd: 2 }),
+        contextMode: "resumed",
+      }),
+      runRecord("run-1", {
+        usage: usage(100, { reportedCostUsd: 1 }),
+        contextMode: "rebuilt",
+      }),
+    ]);
+
+    expect(
+      await screen.findByText("Session total · input 600 · cached - · cache write - · output 21"),
+    ).toBeTruthy();
+    expect(screen.queryByText(/total cost/i)).toBeNull();
+  });
+});
