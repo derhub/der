@@ -1,41 +1,7 @@
-import { createHash } from "node:crypto";
-import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
 import * as z from "zod";
 import { CapabilityCatalog, defineCapability, type Capability, type Run } from "@der/domain";
 import { createFixtureCapabilities, type FixtureCall } from "#capabilities/fixture";
 import type { RunningServer } from "#main";
-
-const GUEST_DIGEST = "sha256:0795ae56bbe46ac61429c42ade4f8ad69b393ff6b88f372f8298cff233d03d2c";
-
-function sha256Of(path: string): string | undefined {
-  try {
-    return `sha256:${createHash("sha256").update(readFileSync(path)).digest("hex")}`;
-  } catch {
-    return undefined;
-  }
-}
-
-export async function ensureScriptGuest(): Promise<string> {
-  const dir = join(tmpdir(), "der-script-guests");
-  const path = join(dir, "quickjs-0.15.1.webc");
-  if (sha256Of(path) === GUEST_DIGEST) {
-    return path;
-  }
-  const response = await fetch(
-    `https://cdn.wasmer.io/webcimages/${GUEST_DIGEST.slice("sha256:".length)}.webc`,
-  );
-  if (!response.ok) {
-    throw new Error(`guest download failed: HTTP ${response.status}`);
-  }
-  mkdirSync(dir, { recursive: true });
-  writeFileSync(path, new Uint8Array(await response.arrayBuffer()));
-  if (sha256Of(path) !== GUEST_DIGEST) {
-    throw new Error("downloaded guest does not match the pinned digest");
-  }
-  return path;
-}
 
 export interface NoteHost {
   readonly catalog: CapabilityCatalog;

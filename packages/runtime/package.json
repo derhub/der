@@ -7,8 +7,7 @@
     ".": "./src/index.ts",
     "./sandbox": "./src/sandbox/index.ts",
     "./engines": "./src/engines/index.ts",
-    "./context": "./src/context/index.ts",
-    "./guest-pin": "./src/script/guest-pin.ts"
+    "./context": "./src/context/index.ts"
   },
   "scripts": {
     "test": "bun test"
@@ -23,6 +22,7 @@
     "@tanstack/ai-sandbox": "1.5.0",
     "@tanstack/ai-skills": "1.0.3",
     "@wasmer/sdk": "0.19.1",
+    "quickjs-emscripten": "0.32.0",
     "yaml": "2.9.1",
     "zod": "4.6.7"
   }

@@ -1,4 +1,4 @@
-import { afterAll, afterEach, beforeAll, describe, expect, it } from "bun:test";
+import { afterEach, describe, expect, it } from "bun:test";
 import * as z from "zod";
 import {
   defineCapability,
@@ -17,29 +17,14 @@ import { createSearchTool } from "#code-mode/search";
 import { createFixtureCapabilities } from "#capabilities/fixture";
 import { startServer, type RunningServer } from "#main";
 import { createTempDatabase, waitUntil } from "./fixtures/restate-harness";
-import {
-  admitOwningRun,
-  createNoteHost,
-  ensureScriptGuest,
-  type NoteHost,
-} from "./fixtures/script-host";
+import { admitOwningRun, createNoteHost, type NoteHost } from "./fixtures/script-host";
 
 const cleanups: (() => Promise<void> | void)[] = [];
-let guestArtifactPath = "";
-
-beforeAll(async () => {
-  guestArtifactPath = await ensureScriptGuest();
-}, 120_000);
 
 afterEach(async () => {
   while (cleanups.length > 0) {
     await cleanups.pop()!();
   }
-});
-
-afterAll(() => {
-  const children = Bun.spawnSync(["pgrep", "-P", String(process.pid), "-f", "script-child"]);
-  expect(children.stdout.toString().trim()).toBe("");
 });
 
 const RESULT_BYTES = 65_536;
@@ -67,7 +52,6 @@ async function startDirectServer(
       enabledEngines: ["fixture"],
       approvalTimeoutMs: 30_000,
       seedFixture: true,
-      scriptGuestArtifactPath: guestArtifactPath,
     },
     catalog: host.catalog,
     ...(options.engines === undefined ? {} : { engines: options.engines }),

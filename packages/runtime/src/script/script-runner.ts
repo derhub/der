@@ -1,6 +1,5 @@
-import { readFileSync } from "node:fs";
-import { join } from "node:path";
 import type { JsonValue } from "@der/domain";
+import type { ScriptWorkerInit, ScriptWorkerMessage, ScriptWorkerReply } from "./script-worker";
 
 export interface ScriptLimits {
   readonly memoryBytes: number;
@@ -53,7 +52,6 @@ export interface RunScriptOptions {
   readonly seed: number;
   readonly now: number;
   readonly signal?: AbortSignal;
-  readonly guestArtifactPath?: string;
 }
 
 export class ScriptRunnerError extends Error {
@@ -66,39 +64,18 @@ export class ScriptRunnerError extends Error {
   }
 }
 
-const CHILD_PATH = join(import.meta.dir, "script-child.ts");
-const POLL_MS = 20;
-const STARTUP_MS = 60_000;
-const STDERR_TAIL_BYTES = 2048;
+const WORKER_URL = new URL("./script-worker.ts", import.meta.url);
+const STALL_GRACE_MS = 2_000;
+const STALL_POLL_MS = 50;
+const STOP_REQUESTED = 1;
 
 const transpiler = new Bun.Transpiler({ loader: "js" });
-const IMPORT_FORM = /(?<![\w$])import\s*[(.]/;
 const WRAPPER_LINES = 1;
 
-const importRejected = (): ScriptResult => ({
-  ok: false,
-  error: { kind: "script", message: "import is not available in a Script" },
-  logs: [],
-});
-
-function hasModuleSyntax(script: string): boolean {
+function findSyntaxError(script: string): ScriptResult | undefined {
   try {
-    const scan = transpiler.scan(script);
-    return scan.imports.length > 0 || scan.exports.length > 0;
-  } catch {
-    return false;
-  }
-}
-
-function rejectImports(script: string): ScriptResult | undefined {
-  if (hasModuleSyntax(script)) {
-    return importRejected();
-  }
-  let printed: string;
-  try {
-    printed = transpiler.transformSync(
-      `globalThis.__script = async function (der) {\n${script}\n};`,
-    );
+    transpiler.transformSync(`globalThis.__script = async function (der) {\n${script}\n};`);
+    return undefined;
   } catch (error) {
     const detail = (
       Array.isArray((error as AggregateError).errors) ? (error as AggregateError).errors[0] : error
@@ -113,22 +90,6 @@ function rejectImports(script: string): ScriptResult | undefined {
       },
       logs: [],
     };
-  }
-  return IMPORT_FORM.test(printed) ? importRejected() : undefined;
-}
-
-function readRssBytes(pid: number): number | undefined {
-  try {
-    if (process.platform === "linux") {
-      const status = readFileSync(`/proc/${pid}/status`, "utf8");
-      const match = /VmRSS:\s+(\d+) kB/.exec(status);
-      return match ? Number(match[1]) * 1024 : undefined;
-    }
-    const ps = Bun.spawnSync(["ps", "-o", "rss=", "-p", String(pid)]);
-    const kilobytes = Number(ps.stdout.toString().trim());
-    return Number.isFinite(kilobytes) && kilobytes > 0 ? kilobytes * 1024 : undefined;
-  } catch {
-    return undefined;
   }
 }
 
@@ -145,98 +106,60 @@ export async function runScript(options: RunScriptOptions): Promise<ScriptResult
     return { ok: false, error: { kind: "cancelled", message: "script cancelled" }, logs };
   }
 
-  const rejected = rejectImports(options.script);
-  if (rejected !== undefined) {
-    return rejected;
+  const syntaxError = findSyntaxError(options.script);
+  if (syntaxError !== undefined) {
+    return syntaxError;
   }
 
-  const child = Bun.spawn([process.execPath, CHILD_PATH], {
-    stdin: "pipe",
-    stdout: "pipe",
-    stderr: "pipe",
-    env: {},
-  });
+  const stop = new SharedArrayBuffer(4);
+  const worker = new Worker(WORKER_URL, { env: {} });
 
   const outcome: { verdict?: ScriptResult; fatal?: ScriptRunnerError } = {};
   let resolveVerdict: () => void = () => {};
   const verdictSettled = new Promise<void>((resolve) => {
     resolveVerdict = resolve;
   });
-  let ready = false;
-  let activeSince: number | undefined;
-  let activeUsed = 0;
   let outputBytes = 0;
   let calls = 0;
-  let stderrTail = "";
-  const startedAt = performance.now();
+  let callsInFlight = 0;
+  let lastHeardAt = performance.now();
+  let callQueue: Promise<void> = Promise.resolve();
 
   const finish = (result: ScriptResult): void => {
     if (outcome.verdict !== undefined) {
       return;
     }
     outcome.verdict = result;
-    child.kill("SIGKILL");
+    Atomics.store(new Int32Array(stop), 0, STOP_REQUESTED);
+    worker.terminate();
     resolveVerdict();
   };
   const fail = (kind: ScriptErrorKind, message: string): void => {
     finish({ ok: false, error: { kind, message }, logs });
   };
-  const send = async (message: unknown): Promise<void> => {
-    await child.stdin.write(`${JSON.stringify(message)}\n`);
-    await child.stdin.flush();
-  };
-  const pauseActiveClock = (): void => {
-    if (activeSince !== undefined) {
-      activeUsed += performance.now() - activeSince;
-      activeSince = undefined;
-    }
-  };
 
   const onAbort = (): void => fail("cancelled", "script cancelled");
   signal?.addEventListener("abort", onAbort, { once: true });
 
-  const watchdog = setInterval(() => {
-    if (outcome.verdict !== undefined) {
-      return;
-    }
-    const rss = readRssBytes(child.pid);
-    if (rss !== undefined && rss > limits.memoryBytes) {
-      fail("limit", `memory limit of ${limits.memoryBytes} bytes exceeded`);
-      return;
-    }
-    if (!ready) {
-      if (performance.now() - startedAt > STARTUP_MS) {
-        outcome.fatal = new ScriptRunnerError(
-          "script.guest_start_timeout",
-          "script guest did not start",
-        );
-        fail("script", "script guest did not start");
-      }
-      return;
-    }
-    const used =
-      activeSince === undefined ? activeUsed : activeUsed + (performance.now() - activeSince);
-    if (used > limits.activeMs) {
+  const stallWatch = setInterval(() => {
+    if (
+      outcome.verdict === undefined &&
+      callsInFlight === 0 &&
+      performance.now() - lastHeardAt > limits.activeMs + STALL_GRACE_MS
+    ) {
       fail("limit", `active time limit of ${limits.activeMs} ms exceeded`);
     }
-  }, POLL_MS);
+  }, STALL_POLL_MS);
 
-  const handleCall = async (message: Record<string, unknown>): Promise<void> => {
-    pauseActiveClock();
+  const handleCall = async (message: { call: number; id: string; input: unknown }) => {
     calls += 1;
     if (calls > limits.maxCalls) {
       fail("limit", `call limit of ${limits.maxCalls} exceeded`);
       return;
     }
-    const id = message["id"];
-    const ordinal = message["call"];
-    if (typeof id !== "string" || typeof ordinal !== "number") {
-      fail("script", "guest sent a malformed call");
-      return;
-    }
     let reply: ScriptCallReply;
     try {
-      reply = await options.call(id, message["input"] as JsonValue);
+      reply = await options.call(message.id, message.input as JsonValue);
     } catch (error) {
       reply = {
         ok: false,
@@ -249,110 +172,90 @@ export async function runScript(options: RunScriptOptions): Promise<ScriptResult
     if (outcome.verdict !== undefined) {
       return;
     }
-    const wire = reply.ok
-      ? { call: ordinal, ok: true, value: reply.value, now: reply.now }
+    const wire: ScriptWorkerReply = reply.ok
+      ? { call: message.call, ok: true, value: reply.value, now: reply.now }
       : {
-          call: ordinal,
+          call: message.call,
           ok: false,
           error: isHostErrorKind(reply.error.kind)
             ? reply.error
             : { kind: "capability", message: reply.error.message },
           now: reply.now,
         };
-    await send(wire);
-    activeSince = performance.now();
+    lastHeardAt = performance.now();
+    worker.postMessage(wire);
   };
 
-  const handleLine = async (line: string): Promise<void> => {
-    let message: Record<string, unknown>;
-    try {
-      message = JSON.parse(line) as Record<string, unknown>;
-    } catch {
-      fail("script", "guest wrote a malformed line");
+  const handleMessage = (message: ScriptWorkerMessage): void => {
+    if ("log" in message) {
+      logs.push(message.log);
+    } else if ("call" in message) {
+      callsInFlight += 1;
+      callQueue = callQueue.then(() =>
+        handleCall(message).finally(() => {
+          callsInFlight -= 1;
+        }),
+      );
+    } else if ("fatal" in message) {
+      outcome.fatal = new ScriptRunnerError(message.fatal.code, message.fatal.message);
+      fail("script", message.fatal.message);
+    } else if (message.limit === "memory") {
+      fail("limit", `memory limit of ${limits.memoryBytes} bytes exceeded`);
+    } else if (message.limit === "time") {
+      fail("limit", `active time limit of ${limits.activeMs} ms exceeded`);
+    } else if (message.error !== undefined) {
+      const error = message.error;
+      finish({
+        ok: false,
+        error: {
+          kind: isHostErrorKind(error.kind) ? error.kind : "script",
+          message: error.message,
+          ...(error.call === undefined ? {} : { call: error.call }),
+          ...(error.line === undefined ? {} : { line: error.line }),
+        },
+        logs,
+      });
+    } else {
+      finish({ ok: true, result: (message.result ?? null) as JsonValue, logs, truncated: false });
+    }
+  };
+
+  worker.onmessage = (event: MessageEvent<string>) => {
+    if (outcome.verdict !== undefined) {
       return;
     }
-    if (message["ready"] === true) {
-      ready = true;
-      activeSince = performance.now();
-    } else if (message["fatal"] !== undefined) {
-      const detail = message["fatal"] as { code: string; message: string };
-      outcome.fatal = new ScriptRunnerError(detail.code, detail.message);
-      fail("script", detail.message);
-    } else if (typeof message["log"] === "string") {
-      logs.push(message["log"]);
-    } else if (message["call"] !== undefined) {
-      await handleCall(message);
-    } else if (message["done"] === true) {
-      const error = message["error"] as Extract<ScriptResult, { ok: false }>["error"] | undefined;
-      finish(
-        error === undefined
-          ? { ok: true, result: (message["result"] ?? null) as JsonValue, logs, truncated: false }
-          : {
-              ok: false,
-              error: { ...error, kind: isHostErrorKind(error.kind) ? error.kind : "script" },
-              logs,
-            },
-      );
+    lastHeardAt = performance.now();
+    outputBytes += Buffer.byteLength(event.data);
+    if (outputBytes > limits.outputBytes) {
+      fail("limit", `output limit of ${limits.outputBytes} bytes exceeded`);
+      return;
     }
+    handleMessage(JSON.parse(event.data) as ScriptWorkerMessage);
   };
-
-  const pump = async (): Promise<void> => {
-    const decoder = new TextDecoder();
-    let buffer = "";
-    for await (const chunk of child.stdout) {
-      outputBytes += chunk.byteLength;
-      if (outputBytes > limits.outputBytes) {
-        fail("limit", `output limit of ${limits.outputBytes} bytes exceeded`);
-        return;
-      }
-      buffer += decoder.decode(chunk, { stream: true });
-      let newline = buffer.indexOf("\n");
-      while (newline >= 0 && outcome.verdict === undefined) {
-        const line = buffer.slice(0, newline);
-        buffer = buffer.slice(newline + 1);
-        await handleLine(line);
-        newline = buffer.indexOf("\n");
-      }
-      if (outcome.verdict !== undefined) {
-        return;
-      }
-    }
+  worker.onerror = (event: ErrorEvent) => {
+    outcome.fatal = new ScriptRunnerError("script.worker_failed", event.message);
+    fail("script", event.message);
   };
-
-  const collectStderr = async (): Promise<void> => {
-    const decoder = new TextDecoder();
-    for await (const chunk of child.stderr) {
-      stderrTail = (stderrTail + decoder.decode(chunk, { stream: true })).slice(-STDERR_TAIL_BYTES);
-    }
-  };
-
-  await send({
-    init: {
-      script: options.script,
-      seed: options.seed,
-      now: options.now,
-      ...(options.guestArtifactPath === undefined
-        ? {}
-        : { guestArtifactPath: options.guestArtifactPath }),
-    },
+  worker.addEventListener("close", () => {
+    fail("script", "script ended without a result");
   });
 
-  const stderrDone = collectStderr();
-  const pumped = pump().catch((error: unknown) =>
-    fail("script", error instanceof Error ? error.message : String(error)),
-  );
+  const init: ScriptWorkerInit = {
+    script: options.script,
+    seed: options.seed,
+    now: options.now,
+    memoryBytes: limits.memoryBytes,
+    activeMs: limits.activeMs,
+    stop,
+  };
+  worker.postMessage(init);
+
   try {
-    await Promise.race([pumped, verdictSettled]);
-    if (outcome.verdict === undefined) {
-      const exitCode = await child.exited;
-      await stderrDone;
-      fail("script", `script ended without a result (exit ${exitCode}): ${stderrTail.trim()}`);
-    }
+    await verdictSettled;
   } finally {
-    clearInterval(watchdog);
+    clearInterval(stallWatch);
     signal?.removeEventListener("abort", onAbort);
-    child.kill("SIGKILL");
-    await child.exited;
+    worker.terminate();
   }
   if (outcome.fatal !== undefined) {
     throw outcome.fatal;

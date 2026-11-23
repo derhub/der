@@ -143,7 +143,6 @@ const serverConfigSchema = z
     scriptMemoryBytes: z.number().int().positive().default(268_435_456),
     scriptOutputBytes: z.number().int().positive().default(1_048_576),
     scriptResultBytes: z.number().int().positive().default(65_536),
-    scriptGuestArtifactPath: z.string().min(1).optional(),
     ssePollIntervalMs: z.number().int().positive().default(25),
     sseKeepAliveMs: z.number().int().positive().default(15_000),
     seedFixture: z.boolean().default(false),
@@ -373,9 +372,6 @@ export function parseServerConfig(
     ...(scriptMemoryBytes !== undefined ? { scriptMemoryBytes } : {}),
     ...(scriptOutputBytes !== undefined ? { scriptOutputBytes } : {}),
     ...(scriptResultBytes !== undefined ? { scriptResultBytes } : {}),
-    ...(env["DER_SCRIPT_GUEST_ARTIFACT_PATH"]
-      ? { scriptGuestArtifactPath: env["DER_SCRIPT_GUEST_ARTIFACT_PATH"] }
-      : {}),
     ...(ssePollIntervalMs !== undefined ? { ssePollIntervalMs } : {}),
     ...(sseKeepAliveMs !== undefined ? { sseKeepAliveMs } : {}),
     ...(seedFixture !== undefined ? { seedFixture } : {}),

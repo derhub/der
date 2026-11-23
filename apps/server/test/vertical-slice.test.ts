@@ -1,4 +1,4 @@
-import { afterEach, beforeAll, describe, expect, it } from "bun:test";
+import { afterEach, describe, expect, it } from "bun:test";
 import { Hono } from "hono";
 import {
   PROBLEM_DETAILS_MEDIA_TYPE,
@@ -20,14 +20,9 @@ import {
   waitUntil,
   type TempDatabaseHandle,
 } from "./fixtures/restate-harness";
-import { createFixtureHost, ensureScriptGuest } from "./fixtures/script-host";
+import { createFixtureHost } from "./fixtures/script-host";
 
 const cleanups: (() => Promise<void> | void)[] = [];
-let guestArtifactPath = "";
-
-beforeAll(async () => {
-  guestArtifactPath = await ensureScriptGuest();
-}, 120_000);
 
 async function startVerticalSliceServer(options?: {
   readonly approvalTimeoutMs?: number;
@@ -52,7 +47,6 @@ async function startVerticalSliceServer(options?: {
       ssePollIntervalMs: 15,
       sseKeepAliveMs: 2_000,
       seedFixture: options?.seedFixture ?? true,
-      scriptGuestArtifactPath: guestArtifactPath,
     },
     ...(options?.now ? { now: options.now } : {}),
     catalog: fixture.catalog,

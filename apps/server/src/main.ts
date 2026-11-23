@@ -686,9 +686,6 @@ export async function startServer(options: CreateServerOptions = {}): Promise<Ru
         outputBytes: config.scriptOutputBytes,
       },
       now: clockNow,
-      ...(config.scriptGuestArtifactPath !== undefined
-        ? { guestArtifactPath: config.scriptGuestArtifactPath }
-        : {}),
     });
 
     if (config.restateMode === "direct") {

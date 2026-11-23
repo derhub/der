@@ -17,15 +17,13 @@ import {
   type LocalRestateHandle,
   type TempDatabaseHandle,
 } from "./fixtures/restate-harness";
-import { createFixtureHost, ensureScriptGuest } from "./fixtures/script-host";
+import { createFixtureHost } from "./fixtures/script-host";
 
 let restateHandle: LocalRestateHandle | undefined;
-let guestArtifactPath = "";
 const cleanups: (() => Promise<void> | void)[] = [];
 
 beforeAll(async () => {
   restateHandle = await ensureLocalRestate();
-  guestArtifactPath = await ensureScriptGuest();
 }, 120_000);
 
 afterEach(async () => {
@@ -67,7 +65,6 @@ describe("recover a pending approval across Bun deployment replacement with Rest
         ssePollIntervalMs: 20,
         sseKeepAliveMs: 5_000,
         seedFixture: true,
-        scriptGuestArtifactPath: guestArtifactPath,
       },
       catalog: fixtureFirst.catalog,
     });
@@ -169,7 +166,6 @@ describe("recover a pending approval across Bun deployment replacement with Rest
         ssePollIntervalMs: 20,
         sseKeepAliveMs: 5_000,
         seedFixture: false,
-        scriptGuestArtifactPath: guestArtifactPath,
       },
       catalog: fixtureReplacement.catalog,
     });
@@ -313,7 +309,6 @@ describe("recover a pending approval across Bun deployment replacement with Rest
         ssePollIntervalMs: 20,
         sseKeepAliveMs: 5_000,
         seedFixture: true,
-        scriptGuestArtifactPath: guestArtifactPath,
       },
     });
     cleanups.push(() => server.close());

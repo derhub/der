@@ -1,4 +1,4 @@
-import { afterEach, beforeAll, describe, expect, it } from "bun:test";
+import { afterEach, describe, expect, it } from "bun:test";
 import { join } from "node:path";
 import type {
   Approval,
@@ -14,14 +14,8 @@ import { parseServerConfig } from "#config";
 import { startServer } from "#main";
 import { createOutboxSender } from "#messaging/index";
 import { createTempDatabase } from "../fixtures/restate-harness";
-import { ensureScriptGuest } from "../fixtures/script-host";
 
 const cleanups: (() => Promise<void> | void)[] = [];
-let guestArtifactPath = "";
-
-beforeAll(async () => {
-  guestArtifactPath = await ensureScriptGuest();
-}, 120_000);
 
 afterEach(async () => {
   while (cleanups.length > 0) {
@@ -354,7 +348,6 @@ describe("wire generic outbox config and OutboxSink delivery into server startup
         workspaceRootDir: join(temp.dir, "workspaces"),
         seedFixture: true,
         enabledEngines: ["fixture"],
-        scriptGuestArtifactPath: guestArtifactPath,
         outboxPollIntervalMs: 20,
         outboxInitialBackoffMs: 20,
         outboxMaxBackoffMs: 100,

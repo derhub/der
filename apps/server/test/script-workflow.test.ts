@@ -1,31 +1,20 @@
-import { afterAll, afterEach, beforeAll, describe, expect, it } from "bun:test";
+import { afterEach, describe, expect, it } from "bun:test";
 import { formatUtcTimestamp } from "@der/domain";
 import { startServer, type RunningServer } from "#main";
 import { createTempDatabase, waitUntil } from "./fixtures/restate-harness";
 import {
   admitOwningRun,
   createNoteHost,
-  ensureScriptGuest,
   submitScript,
   type NoteHost,
 } from "./fixtures/script-host";
 
 const cleanups: (() => Promise<void> | void)[] = [];
-let guestArtifactPath = "";
-
-beforeAll(async () => {
-  guestArtifactPath = await ensureScriptGuest();
-}, 120_000);
 
 afterEach(async () => {
   while (cleanups.length > 0) {
     await cleanups.pop()!();
   }
-});
-
-afterAll(() => {
-  const children = Bun.spawnSync(["pgrep", "-P", String(process.pid), "-f", "script-child"]);
-  expect(children.stdout.toString().trim()).toBe("");
 });
 
 async function startDirectServer(options: { readonly scriptMaxCalls?: number } = {}) {
@@ -43,7 +32,6 @@ async function startDirectServer(options: { readonly scriptMaxCalls?: number } =
       enabledEngines: ["fixture"],
       approvalTimeoutMs: 30_000,
       seedFixture: true,
-      scriptGuestArtifactPath: guestArtifactPath,
       ...(options.scriptMaxCalls === undefined ? {} : { scriptMaxCalls: options.scriptMaxCalls }),
     },
     catalog: host.catalog,
@@ -315,7 +303,5 @@ describe("stop a script", () => {
     expect(server.store.getApproval(approval.id)?.decision.status).toBe("expired");
     expect(host.published).toEqual([]);
     expect(server.scriptRunStore.get(scriptRun.id)?.status).toBe("cancelled");
-    const children = Bun.spawnSync(["pgrep", "-P", String(process.pid), "-f", "script-child"]);
-    expect(children.stdout.toString().trim()).toBe("");
   }, 60_000);
 });

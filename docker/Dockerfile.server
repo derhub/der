@@ -4,9 +4,6 @@ FROM docker:27-dind@sha256:aa3df78ecf320f5fafdce71c659f1629e96e9de0968305fe1de67
 
 FROM oven/bun:1@sha256:3aa040e5445efa09d75bb428a64ba50db13e2b3ac9b6b0c7f145615f62b2ee18 AS der-server
 
-ARG QUICKJS_GUEST_SHA256=0795ae56bbe46ac61429c42ade4f8ad69b393ff6b88f372f8298cff233d03d2c
-ARG QUICKJS_GUEST_URL=https://cdn.wasmer.io/webcimages/0795ae56bbe46ac61429c42ade4f8ad69b393ff6b88f372f8298cff233d03d2c.webc
-
 WORKDIR /app
 
 COPY --from=docker-cli /usr/local/bin/docker /usr/local/bin/docker
@@ -24,13 +21,6 @@ RUN bun install --frozen-lockfile
 COPY packages/ packages/
 COPY integrations/ integrations/
 COPY apps/server/ apps/server/
-
-RUN mkdir -p /guests/cache \
-  && bun -e 'const res = await fetch(process.env["QUICKJS_GUEST_URL"]!); if (!res.ok) throw new Error(`${res.url}: HTTP ${res.status}`); await Bun.write("/guests/quickjs-0.15.1.webc", new Uint8Array(await res.arrayBuffer()));' \
-  && printf '%s  /guests/quickjs-0.15.1.webc\n' "${QUICKJS_GUEST_SHA256}" | sha256sum -c - \
-  && (cd /app/packages/runtime && bun -e 'import { Wasmer } from "@wasmer/sdk/node"; const client = await Wasmer.create({ cache: { directory: "/guests/cache" } }); try { await client.packages.load(new Uint8Array(await Bun.file("/guests/quickjs-0.15.1.webc").arrayBuffer())); } finally { await client.close(); }') \
-  && chmod -R a+rX /guests \
-  && chown -R 1000:1000 /guests
 
 RUN mkdir -p /data/memory /data/skills /data/workspaces /run/der-rootless \
   && chown -R 1000:1000 /app /data /run/der-rootless

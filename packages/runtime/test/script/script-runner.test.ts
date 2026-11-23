@@ -1,16 +1,6 @@
-import { afterAll, beforeAll, describe, expect, it } from "bun:test";
-import { createHash } from "node:crypto";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { describe, expect, it } from "bun:test";
 import type { JsonValue } from "@der/domain";
-import { QUICKJS_GUEST_PIN } from "@der/runtime/guest-pin";
-import {
-  runScript,
-  ScriptRunnerError,
-  type ScriptCallReply,
-  type ScriptLimits,
-} from "@der/runtime";
+import { runScript, type ScriptCallReply, type ScriptLimits } from "@der/runtime";
 
 const START = 1_795_000_000_000;
 const MB = 1024 * 1024;
@@ -20,44 +10,6 @@ const roomyLimits: ScriptLimits = {
   maxCalls: 100,
   outputBytes: 1 * MB,
 };
-
-let guestArtifactPath = "";
-const scratch = mkdtempSync(join(tmpdir(), "der-script-test-"));
-
-function sha256Of(path: string): string | undefined {
-  try {
-    return `sha256:${createHash("sha256").update(readFileSync(path)).digest("hex")}`;
-  } catch {
-    return undefined;
-  }
-}
-
-async function ensureGuest(): Promise<string> {
-  const dir = join(tmpdir(), "der-script-guests");
-  const path = join(dir, "quickjs-0.15.1.webc");
-  if (sha256Of(path) === QUICKJS_GUEST_PIN.digest) {
-    return path;
-  }
-  const hex = QUICKJS_GUEST_PIN.digest.slice("sha256:".length);
-  const response = await fetch(`https://cdn.wasmer.io/webcimages/${hex}.webc`);
-  if (!response.ok) {
-    throw new Error(`guest download failed: HTTP ${response.status}`);
-  }
-  mkdirSync(dir, { recursive: true });
-  writeFileSync(path, new Uint8Array(await response.arrayBuffer()));
-  expect(sha256Of(path)).toBe(QUICKJS_GUEST_PIN.digest);
-  return path;
-}
-
-beforeAll(async () => {
-  guestArtifactPath = await ensureGuest();
-}, 120_000);
-
-afterAll(() => {
-  rmSync(scratch, { recursive: true, force: true });
-  const leftover = Bun.spawnSync(["pgrep", "-f", "script/script-child.ts"]);
-  expect(leftover.stdout.toString().trim()).toBe("");
-});
 
 interface RecordedCall {
   readonly id: string;
@@ -103,7 +55,6 @@ describe("run a script", () => {
         limits: roomyLimits,
         seed: 1,
         now: START,
-        guestArtifactPath,
       });
 
       expect(result).toEqual({ ok: true, result: 321, logs: [], truncated: false });
@@ -121,7 +72,6 @@ describe("run a script", () => {
         limits: roomyLimits,
         seed: 1,
         now: START,
-        guestArtifactPath,
       });
 
       expect(result).toEqual({
@@ -142,7 +92,6 @@ describe("run a script", () => {
         limits: roomyLimits,
         seed: 1,
         now: START,
-        guestArtifactPath,
       });
 
       expect(result).toEqual({
@@ -161,27 +110,9 @@ describe("run a script", () => {
         limits: roomyLimits,
         seed: 1,
         now: START,
-        guestArtifactPath,
       });
 
       expect(result).toEqual({ ok: true, result: "nope", logs: [], truncated: false });
-    }, 60_000);
-
-    it("throws a runner error when the guest artifact digest does not match the pin", async () => {
-      const wrong = join(scratch, "wrong.webc");
-      writeFileSync(wrong, "not the guest");
-
-      const error = await runScript({
-        script: "return 1;",
-        call: noCalls,
-        limits: roomyLimits,
-        seed: 1,
-        now: START,
-        guestArtifactPath: wrong,
-      }).catch((caught: unknown) => caught);
-
-      expect(error).toBeInstanceOf(ScriptRunnerError);
-      expect(error).toMatchObject({ code: "script.guest_digest_mismatch" });
     }, 60_000);
   });
 
@@ -195,7 +126,6 @@ describe("run a script", () => {
         limits: { ...roomyLimits, memoryBytes: bound },
         seed: 1,
         now: START,
-        guestArtifactPath,
       });
 
       expect(result).toEqual({
@@ -217,7 +147,6 @@ describe("run a script", () => {
         limits: { ...roomyLimits, activeMs: 500 },
         seed: 1,
         now: START,
-        guestArtifactPath,
       });
 
       expect(result).toEqual({
@@ -226,6 +155,24 @@ describe("run a script", () => {
         logs: [],
       });
       expect(performance.now() - started).toBeLessThan(15_000);
+    }, 60_000);
+
+    it("keeps the host event loop live while a script spins to its time bound", async () => {
+      const ticks: number[] = [];
+      const timer = setInterval(() => ticks.push(performance.now()), 50);
+
+      const result = await runScript({
+        script: `for (;;) {}`,
+        call: noCalls,
+        limits: { ...roomyLimits, activeMs: 1000 },
+        seed: 1,
+        now: START,
+      }).finally(() => clearInterval(timer));
+
+      const gaps = ticks.slice(1).map((tick, index) => tick - ticks[index]!);
+      expect(result).toMatchObject({ ok: false, error: { kind: "limit" } });
+      expect(ticks.length).toBeGreaterThanOrEqual(15);
+      expect(Math.max(...gaps)).toBeLessThan(200);
     }, 60_000);
 
     it("completes a script whose call is answered after the bound", async () => {
@@ -238,7 +185,6 @@ describe("run a script", () => {
         limits: { ...roomyLimits, activeMs: 1000 },
         seed: 1,
         now: START,
-        guestArtifactPath,
       });
 
       expect(result).toEqual({ ok: true, result: "late", logs: [], truncated: false });
@@ -259,7 +205,6 @@ describe("run a script", () => {
           limits: roomyLimits,
           seed: 1,
           now: START,
-          guestArtifactPath,
         });
 
         expect(result).toEqual({
@@ -273,11 +218,10 @@ describe("run a script", () => {
       }
     }, 60_000);
 
-    const importMessage = "import is not available in a Script";
     const importRoutes: ReadonlyArray<readonly [string, string]> = [
       ["a literal dynamic import", `return await import("qjs:os");`],
       ["a dynamic import of a variable", `const n = "qjs:os"; return await import(n);`],
-      ["a dynamic import of a guest file", `return await import("/workspace/guest.mjs");`],
+      ["a dynamic import of a path", `return await import("/workspace/guest.mjs");`],
       ["import.meta", `return import.meta;`],
       ["a static import", `import * as os from "qjs:os"; return os.now();`],
       ["a static export", `export const x = 1;`],
@@ -289,7 +233,7 @@ describe("run a script", () => {
     ];
 
     it.each(importRoutes)(
-      "rejects %s before any guest starts",
+      "fails %s as a script error",
       async (_route, script) => {
         const result = await runScript({
           script,
@@ -297,14 +241,9 @@ describe("run a script", () => {
           limits: roomyLimits,
           seed: 1,
           now: START,
-          guestArtifactPath: join(scratch, "never-loaded.webc"),
         });
 
-        expect(result).toEqual({
-          ok: false,
-          error: { kind: "script", message: importMessage },
-          logs: [],
-        });
+        expect(result).toMatchObject({ ok: false, error: { kind: "script" }, logs: [] });
       },
       60_000,
     );
@@ -339,7 +278,6 @@ describe("run a script", () => {
           limits: roomyLimits,
           seed: 1,
           now: START,
-          guestArtifactPath,
         });
 
         expect(result).toMatchObject({
@@ -364,7 +302,6 @@ describe("run a script", () => {
         limits: roomyLimits,
         seed: 1,
         now: START,
-        guestArtifactPath,
       });
 
       expect(result).toEqual({
@@ -399,7 +336,6 @@ describe("run a script", () => {
         limits: roomyLimits,
         seed,
         now: START,
-        guestArtifactPath,
       });
       return { result, calls: host.calls };
     }
@@ -461,7 +397,6 @@ describe("run a script", () => {
         limits: roomyLimits,
         seed: 1,
         now: START,
-        guestArtifactPath,
       });
 
       expect(result).toEqual({
@@ -499,7 +434,6 @@ describe("run a script", () => {
         limits: { ...roomyLimits, maxCalls: 3 },
         seed: 1,
         now: START,
-        guestArtifactPath,
       });
 
       expect(result).toEqual({
@@ -517,7 +451,6 @@ describe("run a script", () => {
         limits: { ...roomyLimits, outputBytes: 50_000 },
         seed: 1,
         now: START,
-        guestArtifactPath,
       });
 
       expect(result).toMatchObject({
@@ -544,7 +477,6 @@ describe("run a script", () => {
         seed: 1,
         now: START,
         signal: controller.signal,
-        guestArtifactPath,
       });
       await reachedCall;
       const abortedAt = performance.now();

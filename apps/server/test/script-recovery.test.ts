@@ -13,18 +13,15 @@ import {
 import {
   admitOwningRun,
   createNoteHost,
-  ensureScriptGuest,
   submitScript,
   type NoteHost,
 } from "./fixtures/script-host";
 
 let restateHandle: LocalRestateHandle | undefined;
-let guestArtifactPath = "";
 const cleanups: (() => Promise<void> | void)[] = [];
 
 beforeAll(async () => {
   restateHandle = await ensureLocalRestate();
-  guestArtifactPath = await ensureScriptGuest();
 }, 150_000);
 
 afterEach(async () => {
@@ -35,8 +32,6 @@ afterEach(async () => {
 
 afterAll(async () => {
   await restateHandle?.stop();
-  const children = Bun.spawnSync(["pgrep", "-P", String(process.pid), "-f", "script-child"]);
-  expect(children.stdout.toString().trim()).toBe("");
 }, 30_000);
 
 async function startRestateServer(
@@ -62,7 +57,6 @@ async function startRestateServer(
       enabledEngines: ["fixture"],
       approvalTimeoutMs: 120_000,
       seedFixture,
-      scriptGuestArtifactPath: guestArtifactPath,
     },
     catalog: host.catalog,
   });

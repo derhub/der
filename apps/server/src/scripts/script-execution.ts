@@ -25,7 +25,6 @@ export interface ScriptExecutionDeps {
   readonly catalog: Catalog;
   readonly approvals: Pick<RunCoordinator, "awaitApprovalWithDriver">;
   readonly limits: ScriptLimits;
-  readonly guestArtifactPath?: string;
   readonly now?: () => Date;
 }
 
@@ -306,7 +305,6 @@ export async function executeScriptRun(
     seed: start.seed,
     now: start.now,
     ...(callSignal === undefined ? {} : { signal: callSignal }),
-    ...(deps.guestArtifactPath === undefined ? {} : { guestArtifactPath: deps.guestArtifactPath }),
   });
   if (signals.attemptEnded?.aborted) {
     return undefined;
