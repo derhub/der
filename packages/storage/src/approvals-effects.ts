@@ -501,3 +501,27 @@ export function getEffect(
     .get(identity.runId, identity.operationKind, identity.operationId, identity.attemptId);
   return row ? mapEffectRow(row) : undefined;
 }
+
+export function findWriteInDoubt(database: SqliteDatabase, runId: RunId): EffectRecord | undefined {
+  const row = database.db
+    .query<EffectRow, [string, string]>(
+      `SELECT e.* FROM effects e
+       WHERE e.run_id = ? AND e.operation_kind = ?
+         AND (
+           e.status = 'unknown'
+           OR (
+             e.status = 'started'
+             AND EXISTS (
+               SELECT 1 FROM script_runs s
+               WHERE s.run_id = e.run_id
+                 AND substr(e.attempt_id, 1, length(s.id) + 1) = s.id || ':'
+                 AND s.status NOT IN ('running', 'waiting_approval')
+             )
+           )
+         )
+       ORDER BY e.started_at, e.id
+       LIMIT 1`,
+    )
+    .get(runId, "capability");
+  return row ? mapEffectRow(row) : undefined;
+}

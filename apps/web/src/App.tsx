@@ -22,7 +22,13 @@ import {
   RefreshCwIcon,
 } from "lucide-react";
 import { useCallback, useEffect, useMemo, useState } from "react";
-import type { Bot, EngineReadiness, ProblemDetails, Session, ToolDescriptor } from "@der/domain";
+import type {
+  Bot,
+  CapabilityDescriptor,
+  EngineReadiness,
+  ProblemDetails,
+  Session,
+} from "@der/domain";
 import { ChatWorkspace } from "@/components/chat-workspace";
 import { MemoryPanel } from "@/components/memory-panel";
 import { OperatorSidebar } from "@/components/operator-sidebar";
@@ -141,7 +147,7 @@ export function App({ api: providedApi, fetcher }: AppProps) {
 
   const [health, setHealth] = useState<HealthResponse | null>(null);
   const [engines, setEngines] = useState<EngineReadiness[]>([]);
-  const [tools, setTools] = useState<ToolDescriptor[]>([]);
+  const [capabilities, setCapabilities] = useState<CapabilityDescriptor[]>([]);
   const [bots, setBots] = useState<Bot[]>([]);
   const [sessions, setSessions] = useState<Session[]>([]);
   const [selectedBotId, setSelectedBotId] = useState<string | null>(null);
@@ -160,15 +166,15 @@ export function App({ api: providedApi, fetcher }: AppProps) {
     setLoadingBootstrap(true);
     setBootstrapProblem(null);
     try {
-      const [nextHealth, nextEngines, nextTools, nextBots] = await Promise.all([
+      const [nextHealth, nextEngines, nextCapabilities, nextBots] = await Promise.all([
         api.getHealth(),
         api.listEngines(),
-        api.listTools(),
+        api.listCapabilities(),
         api.listBots(),
       ]);
       setHealth(nextHealth);
       setEngines(nextEngines);
-      setTools(nextTools);
+      setCapabilities(nextCapabilities);
       setBots(nextBots);
       setSelectedBotId((current) => {
         if (current && nextBots.some((entry) => entry.id === current)) {
@@ -388,7 +394,7 @@ export function App({ api: providedApi, fetcher }: AppProps) {
                 <ReadinessPanel
                   health={health}
                   engines={engines}
-                  tools={tools}
+                  capabilities={capabilities}
                   loading={loadingBootstrap}
                   problem={bootstrapProblem}
                   onRefresh={() => void loadBootstrap()}

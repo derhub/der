@@ -5,6 +5,7 @@ import {
   DomainError,
   formatUtcTimestamp,
   type BotId,
+  type CreateRoutineInput,
   type Engine,
   type EngineKind,
   type MaybePromise,
@@ -13,6 +14,8 @@ import {
   type RoutineSlot,
   type RoutineSlotDisposition,
   type RoutineStore,
+  type RoutineTarget,
+  type RunEngineKind,
   type RunId,
   type RunStore,
   type SessionId,
@@ -161,8 +164,11 @@ export interface UnattendedEligibilityResult {
 
 export async function checkUnattendedEligibility(
   engines: ReadonlyMap<EngineKind, Engine>,
-  engineKind: EngineKind,
+  engineKind: RunEngineKind,
 ): Promise<UnattendedEligibilityResult> {
+  if (engineKind === "script") {
+    return { eligible: true };
+  }
   const engine = engines.get(engineKind);
   if (!engine) {
     return {
@@ -199,16 +205,14 @@ export async function checkUnattendedEligibility(
 }
 
 export type ConfigureRoutineInput =
-  | {
+  | ({
       readonly kind: "create";
       readonly botId: BotId;
       readonly sessionId: SessionId;
       readonly name: string;
       readonly cron: string;
       readonly enabled: boolean;
-      readonly engine: EngineKind;
-      readonly prompt: string;
-    }
+    } & RoutineTarget)
   | {
       readonly kind: "update";
       readonly name?: string;
@@ -216,8 +220,21 @@ export type ConfigureRoutineInput =
       readonly enabled?: boolean;
       readonly engine?: EngineKind;
       readonly prompt?: string;
+      readonly script?: string;
       readonly expectedRevision?: number;
     };
+
+function createRoutineInput(
+  routineId: RoutineId,
+  input: Extract<ConfigureRoutineInput, { readonly kind: "create" }>,
+): CreateRoutineInput {
+  const { kind: _kind, ...fields } = input;
+  return { id: routineId, ...fields };
+}
+
+export function routineRunText(routine: Routine): string {
+  return routine.engine === "script" ? `Run script routine "${routine.name}"` : routine.prompt;
+}
 
 export interface ConfigureRoutineResult {
   readonly routine: Routine;
@@ -254,6 +271,7 @@ export interface RoutineScheduleStore extends RoutineStore {
       readonly enabled?: boolean;
       readonly engine?: EngineKind;
       readonly prompt?: string;
+      readonly script?: string;
       readonly expectedRevision?: number;
     },
   ): Promise<Routine>;
@@ -331,16 +349,7 @@ export function createRoutineScheduleObject(deps: RoutineScheduleDeps) {
                   });
                 }
               }
-              return await routines.createRoutine({
-                id: routineId,
-                botId: input.botId,
-                sessionId: input.sessionId,
-                name: input.name,
-                cron: input.cron,
-                enabled: input.enabled,
-                engine: input.engine,
-                prompt: input.prompt,
-              });
+              return await routines.createRoutine(createRoutineInput(routineId, input));
             }
 
             const existing = await routines.getRoutine(routineId);
@@ -382,6 +391,7 @@ export function createRoutineScheduleObject(deps: RoutineScheduleDeps) {
               ...(input.enabled !== undefined ? { enabled: input.enabled } : {}),
               ...(input.engine !== undefined ? { engine: input.engine } : {}),
               ...(input.prompt !== undefined ? { prompt: input.prompt } : {}),
+              ...(input.script !== undefined ? { script: input.script } : {}),
               ...(input.expectedRevision !== undefined
                 ? { expectedRevision: input.expectedRevision }
                 : {}),
@@ -618,7 +628,7 @@ export function createRoutineScheduleObject(deps: RoutineScheduleDeps) {
               idempotencyKey: `routine:${routine.id}:${dueSlot}`,
               engine: routine.engine,
               input: {
-                parts: [{ type: "text", text: routine.prompt }],
+                parts: [{ type: "text", text: routineRunText(routine) }],
               },
               routineId: routine.id,
               routineSlot: dueSlot,
@@ -738,10 +748,10 @@ export interface DirectRoutineScheduleDeps {
   readonly admitRun: (input: {
     readonly botId: BotId;
     readonly sessionId: SessionId;
-    readonly engine: EngineKind;
+    readonly engine: RunEngineKind;
     readonly routineId: RoutineId;
     readonly routineSlot: UtcTimestamp;
-    readonly prompt: string;
+    readonly text: string;
   }) => Promise<{ readonly runId: RunId }>;
   readonly now?: () => Date;
 }
@@ -775,16 +785,7 @@ export function createDirectRoutineScheduleClient(
             });
           }
         }
-        routine = await deps.routines.createRoutine({
-          id: routineId,
-          botId: input.botId,
-          sessionId: input.sessionId,
-          name: input.name,
-          cron: input.cron,
-          enabled: input.enabled,
-          engine: input.engine,
-          prompt: input.prompt,
-        });
+        routine = await deps.routines.createRoutine(createRoutineInput(routineId, input));
       } else {
         const existing = await deps.routines.getRoutine(routineId);
         if (!existing) {
@@ -822,6 +823,7 @@ export function createDirectRoutineScheduleClient(
           ...(input.enabled !== undefined ? { enabled: input.enabled } : {}),
           ...(input.engine !== undefined ? { engine: input.engine } : {}),
           ...(input.prompt !== undefined ? { prompt: input.prompt } : {}),
+          ...(input.script !== undefined ? { script: input.script } : {}),
           ...(input.expectedRevision !== undefined
             ? { expectedRevision: input.expectedRevision }
             : {}),
@@ -949,7 +951,7 @@ export function createDirectRoutineScheduleClient(
         engine: routine.engine,
         routineId: routine.id,
         routineSlot: dueSlot,
-        prompt: routine.prompt,
+        text: routineRunText(routine),
       });
       const recorded = await deps.routines.recordSlot({
         routineId: routine.id,

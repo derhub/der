@@ -12,6 +12,20 @@ export default defineConfig({
       typeAware: true,
       typeCheck: true,
     },
+    rules: {
+      "no-restricted-imports": [
+        "error",
+        {
+          patterns: [
+            {
+              regex: "(^|/)src(/|$)",
+              message:
+                "Do not import through a src path. Import a package by name (@der/<pkg>[/<entry>]), apps/server by its #-prefixed imports map, and apps/web by the @/ alias.",
+            },
+          ],
+        },
+      ],
+    },
   },
   pack: {
     entry: {

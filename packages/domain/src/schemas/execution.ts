@@ -1,5 +1,4 @@
 import * as z from "zod";
-import { effectIdentity, effectOperationKind } from "./approval";
 import { engineKind, jsonValue } from "./common";
 import { messagePart } from "./message";
 
@@ -9,11 +8,6 @@ export const engineEvent = z.discriminatedUnion("type", [
     chunkKey: z.string().min(1),
     chunk: jsonValue,
     isTerminal: z.boolean().optional(),
-  }),
-  z.object({
-    type: z.literal("approval_required"),
-    effect: effectIdentity,
-    prompt: z.string().min(1),
   }),
   z.object({
     type: z.literal("completed"),
@@ -62,25 +56,21 @@ export const sandboxResult = z.object({
 });
 export type SandboxResult = z.infer<typeof sandboxResult>;
 
-export const toolDescriptor = z.object({
-  kind: effectOperationKind,
+export const capabilityDescriptor = z.object({
   id: z.string().min(1),
-  name: z.string().min(1),
   description: z.string(),
+  effect: z.enum(["read", "write"]),
   requiresApproval: z.boolean(),
   inputSchema: jsonValue,
+  outputSchema: jsonValue,
+  example: z.string().optional(),
 });
-export type ToolDescriptor = z.infer<typeof toolDescriptor>;
+export type CapabilityDescriptor = z.infer<typeof capabilityDescriptor>;
 
-export const toolOperation = z.object({
-  effect: effectIdentity,
+export const capabilitySearchHit = z.object({
+  id: z.string().min(1),
+  summary: z.string(),
+  declaration: z.string().min(1),
+  example: z.string().optional(),
 });
-export type ToolOperation = z.infer<typeof toolOperation>;
-
-export const toolResult = z.object({
-  ok: z.boolean(),
-  outcome: jsonValue,
-  isError: z.boolean(),
-  detail: z.string().optional(),
-});
-export type ToolResult = z.infer<typeof toolResult>;
+export type CapabilitySearchHit = z.infer<typeof capabilitySearchHit>;

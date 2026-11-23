@@ -9,13 +9,13 @@ import {
 } from "@der/domain";
 import { MEMORY_ROUTINE_SLOTS_MIGRATION } from "@der/storage/memory";
 import { openSqliteRoutines } from "@der/storage/routines";
-import { startServer } from "../src/main";
+import { startServer } from "#main";
 import {
   createRoutineScheduleClient,
   createRoutineScheduleObject,
   nextUtcSlotAfter,
   resolveLatestDueUtcSlot,
-} from "../src/workflows/routine-schedule";
+} from "#workflows/routine-schedule";
 import {
   allocateLocalTcpNumber,
   createTempDatabase,

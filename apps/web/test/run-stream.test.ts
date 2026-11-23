@@ -1,9 +1,9 @@
 import { describe, expect, it } from "vite-plus/test";
 import { formatSseComment, formatSseEvent, PROBLEM_DETAILS_MEDIA_TYPE } from "@der/domain";
-import { createIdempotencyTracker } from "../src/lib/idempotency";
-import { OperatorApiError } from "../src/lib/schemas";
-import { createDerChatConnection, streamRunEvents } from "../src/lib/run-stream";
-import { createOperatorApi } from "../src/lib/operator-api";
+import { createIdempotencyTracker } from "@/lib/idempotency";
+import { OperatorApiError } from "@/lib/schemas";
+import { createDerChatConnection, streamRunEvents } from "@/lib/run-stream";
+import { createOperatorApi } from "@/lib/operator-api";
 
 function sseResponse(frames: readonly string[]): Response {
   const encoder = new TextEncoder();

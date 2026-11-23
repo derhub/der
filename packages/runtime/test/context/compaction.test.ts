@@ -1,7 +1,7 @@
 import { describe, expect, it } from "bun:test";
 import type { MemoryRecord, Message, Skill } from "@der/domain";
 import { COMPACTION_RECORD_TYPE } from "@tanstack/ai-compaction";
-import { buildRunContext, messagesToModelMessages } from "../../src/context/index";
+import { buildRunContext, messagesToModelMessages } from "@der/runtime/context";
 
 function makeMessage(ordinal: number, role: Message["role"], text: string): Message {
   return {

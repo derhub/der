@@ -5,6 +5,8 @@ import {
   approvalDecision,
   approvalResolutionInput,
   bot,
+  capabilityDescriptor,
+  capabilitySearchHit,
   channelBinding,
   channelCursor,
   channelReceipt,
@@ -32,9 +34,6 @@ import {
   session,
   skill,
   skillFrontmatter,
-  toolDescriptor,
-  toolOperation,
-  toolResult,
   updateBotInput,
 } from "../schemas/index";
 
@@ -78,7 +77,6 @@ export const compiledParsers = {
   engineReadiness: compileSchema(engineReadiness),
   sandboxRequest: compileSchema(sandboxRequest),
   sandboxResult: compileSchema(sandboxResult),
-  toolDescriptor: compileSchema(toolDescriptor),
-  toolOperation: compileSchema(toolOperation),
-  toolResult: compileSchema(toolResult),
+  capabilityDescriptor: compileSchema(capabilityDescriptor),
+  capabilitySearchHit: compileSchema(capabilitySearchHit),
 } as const;

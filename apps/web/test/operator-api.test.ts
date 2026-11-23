@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vite-plus/test";
 import { PROBLEM_DETAILS_MEDIA_TYPE } from "@der/domain";
-import { createOperatorApi } from "../src/lib/operator-api";
-import { OperatorApiError } from "../src/lib/schemas";
+import { createOperatorApi } from "@/lib/operator-api";
+import { OperatorApiError } from "@/lib/schemas";
 
 describe("validate operator HTTP responses with CSP-compatible schemas", () => {
   it("parses bots, readiness, memory, skills, routines, and sends JSON and idempotency headers", async () => {

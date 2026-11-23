@@ -1,5 +1,6 @@
-import type { Sandbox, SandboxRequest, SandboxResult, ToolDescriptor } from "@der/domain";
+import type { Sandbox, SandboxRequest, SandboxResult } from "@der/domain";
 import { compiledParsers } from "@der/domain/compiled";
+import { constants as osConstants } from "node:os";
 import {
   createExecBackedGit,
   UnsupportedCapabilityError,
@@ -30,24 +31,6 @@ import {
 } from "./docker-policy";
 import { SandboxControlError } from "./errors";
 import { bunCommandRunner, type CommandRunner } from "./process-runner";
-
-export const DOCKER_TOOL_DESCRIPTOR: ToolDescriptor = {
-  kind: "docker",
-  id: "docker.execute",
-  name: "Hardened Docker Sandbox Execute",
-  description: "Run a bounded command inside a hardened rootless Docker container.",
-  requiresApproval: true,
-  inputSchema: {
-    type: "object",
-    properties: {
-      command: { type: "string" },
-      args: { type: "array", items: { type: "string" } },
-      timeoutMs: { type: "integer", minimum: 1 },
-      network: { type: "string", enum: ["none", "scoped_egress"] },
-    },
-    required: ["command", "args", "timeoutMs", "network"],
-  },
-};
 
 export interface HardenedDockerProviderConfig {
   readonly dockerHost: string;
@@ -90,6 +73,84 @@ function shellQuote(value: string): string {
 function sanitizeContainerSegment(raw: string): string {
   const cleaned = raw.replace(/[^a-zA-Z0-9_.-]/g, "-").replace(/^-+/, "");
   return cleaned.length > 0 ? cleaned.slice(0, 48) : crypto.randomUUID().slice(0, 12);
+}
+
+const SPAWN_MARKER_ENV = "DER_SPAWN_ID";
+
+const SIGNAL_GRACE_POLLS = 20;
+const SIGNAL_EXEC_TIMEOUT_MS = 10_000;
+
+// Marked processes are found through the spawn marker in /proc/<pid>/environ; their descendants
+// are found by walking PPid so a child started with a cleared environment is still reached.
+// Pids already seen stay in the set, so a child reparented to init by its parent's death is
+// still waited for. Not reachable: a process that lost the marker and was already reparented
+// before the first scan, and a process that forks again between two scans. Exit 0 means every
+// known process is gone; exit 1 prints the survivors' pids. Written for dash and busybox sh.
+const SIGNAL_SPAWNED_SCRIPT = [
+  `marker="${SPAWN_MARKER_ENV}=$1"`,
+  'sig="$2"',
+  "shift 2",
+  'known="$*"',
+  "alive() {",
+  "  while read -r k v; do",
+  '    if [ "$k" = "State:" ]; then',
+  '      case "$v" in Z*) return 1 ;; *) return 0 ;; esac',
+  "    fi",
+  '  done 2>/dev/null < "/proc/$1/status"',
+  "  return 1",
+  "}",
+  "collect() {",
+  '  pairs=""; roots=""',
+  "  for d in /proc/[0-9]*; do",
+  '    p="${d#/proc/}"; ppid=""',
+  "    while read -r k v; do",
+  '      if [ "$k" = "PPid:" ]; then ppid="$v"; break; fi',
+  '    done 2>/dev/null < "$d/status"',
+  '    [ -n "$ppid" ] || continue',
+  '    pairs="$pairs $p:$ppid"',
+  `    if tr '\\0' '\\n' 2>/dev/null < "$d/environ" | grep -qxF "$marker"; then roots="$roots $p"; fi`,
+  "  done",
+  '  group="$roots"; changed=1',
+  '  while [ "$changed" = 1 ]; do',
+  "    changed=0",
+  "    for pair in $pairs; do",
+  '      p="${pair%%:*}"; pp="${pair##*:}"',
+  '      case " $group " in',
+  '        *" $pp "*) case " $group " in *" $p "*) ;; *) group="$group $p"; changed=1 ;; esac ;;',
+  "      esac",
+  "    done",
+  "  done",
+  "  for p in $group; do",
+  '    case " $known " in *" $p "*) ;; *) known="$known $p" ;; esac',
+  "  done",
+  "}",
+  "survivors() {",
+  '  left=""',
+  '  for p in $known; do alive "$p" && left="$left $p"; done',
+  "}",
+  "collect",
+  '[ -n "$known" ] || exit 0',
+  'kill -s "$sig" $known 2>/dev/null',
+  "i=0",
+  `while [ $i -lt ${SIGNAL_GRACE_POLLS} ]; do`,
+  "  collect; survivors",
+  '  [ -z "$left" ] && exit 0',
+  "  sleep 0.1",
+  "  i=$((i + 1))",
+  "done",
+  "echo $left",
+  "exit 1",
+].join("\n");
+
+function containerSignalName(signal: NodeJS.Signals | number | undefined): string | undefined {
+  if (signal === 0) {
+    return undefined;
+  }
+  const name =
+    typeof signal === "number"
+      ? Object.entries(osConstants.signals).find(([, value]) => value === signal)?.[0]
+      : signal;
+  return name !== undefined && /^SIG[A-Z0-9]+$/.test(name) ? name.slice(3) : "TERM";
 }
 
 function checkAborted(signal?: AbortSignal): void {
@@ -144,18 +205,79 @@ function createDockerHandle(input: {
 
     async spawn(command: string, options?: ProcessOptions): Promise<SpawnHandle> {
       checkAborted(options?.signal);
-      const args = [...buildExecPrefix(options, true), "sh", "-lc", command];
+      const spawnId = crypto.randomUUID();
+      const args = [
+        ...buildExecPrefix(
+          { ...options, env: { ...options?.env, [SPAWN_MARKER_ENV]: spawnId } },
+          true,
+        ),
+        "sh",
+        "-lc",
+        command,
+      ];
       const handle = await input.runner.spawn(input.dockerBinary, args, {
         env: hostEnv,
         ...(options?.signal !== undefined ? { signal: options.signal } : {}),
       });
+
+      const runSignal = async (name: string, seen: readonly string[]): Promise<string[]> => {
+        try {
+          const result = await input.runner.exec(
+            input.dockerBinary,
+            [
+              "exec",
+              input.containerId,
+              "sh",
+              "-c",
+              SIGNAL_SPAWNED_SCRIPT,
+              "der-signal",
+              spawnId,
+              name,
+              ...seen,
+            ],
+            { env: hostEnv, timeoutMs: SIGNAL_EXEC_TIMEOUT_MS },
+          );
+          return result.exitCode === 1 ? (result.stdout.match(/\d+/g) ?? []) : [];
+        } catch {
+          return [];
+        }
+      };
+
+      const terminate = async (signal?: NodeJS.Signals | number): Promise<void> => {
+        const name = containerSignalName(signal);
+        if (name !== undefined) {
+          const survivors = await runSignal(name, []);
+          if (survivors.length > 0 && name !== "KILL") {
+            await runSignal("KILL", survivors);
+          }
+        }
+        try {
+          await handle.kill(signal);
+        } catch {
+          // the local CLI is already gone
+        }
+      };
+
+      let abortKill: Promise<void> | undefined;
+      const onAbort = (): void => {
+        abortKill = terminate("SIGKILL");
+      };
+      options?.signal?.addEventListener("abort", onAbort, { once: true });
+      const exited = handle.wait();
+      const release = (): void => options?.signal?.removeEventListener("abort", onAbort);
+      exited.then(release, release);
+
       return {
         pid: handle.pid,
         stdout: handle.stdout,
         stderr: handle.stderr,
         stdin: handle.stdin,
-        wait: handle.wait,
-        kill: handle.kill,
+        async wait() {
+          const exitCode = await exited;
+          await abortKill;
+          return exitCode;
+        },
+        kill: terminate,
       };
     },
   };

@@ -1,22 +1,14 @@
 import { afterEach, describe, expect, it } from "bun:test";
-import {
-  defineIntegration,
-  defineTool,
-  DomainError,
-  IntegrationRegistry,
-  type EffectIdentity,
-  type ToolOperation,
-} from "@der/domain";
-import { compiledParsers } from "@der/domain/compiled";
+import { DomainError, IntegrationRegistry, type Catalog } from "@der/domain";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import * as z from "zod";
 import {
-  createExactApprovalVerifier,
   createMcpIntegration,
-  createMcpTools,
+  ToolConfigurationError,
   ToolEffectUncertainError,
-} from "../src/index";
+  type McpServerConfig,
+} from "@der/mcp";
 
 const closers: (() => Promise<void> | void)[] = [];
 
@@ -29,7 +21,7 @@ afterEach(async () => {
   }
 });
 
-async function startFixtureMcpServer() {
+async function startFixtureMcpServer(extraToolNames: readonly string[] = []) {
   const server = new McpServer({ name: "notes-server", version: "1.0.0" });
   const writes: Array<{ title: string; body: string }> = [];
   let dropOnWrite = false;
@@ -70,16 +62,30 @@ async function startFixtureMcpServer() {
   );
 
   server.registerTool(
-    "hidden_admin",
+    "archive-note",
     {
-      title: "Hidden Admin",
-      description: "Unlisted tool.",
-      inputSchema: { cmd: z.string() },
+      description: "Archive a note by title.",
+      inputSchema: { title: z.string() },
     },
-    async ({ cmd }) => ({
-      content: [{ type: "text", text: cmd }],
+    async ({ title }) => ({
+      content: [{ type: "text", text: JSON.stringify({ archived: title }) }],
     }),
   );
+
+  server.registerTool(
+    "broken_note",
+    { description: "Always reports a tool error.", inputSchema: {} },
+    async () => ({
+      isError: true,
+      content: [{ type: "text", text: "note store is read-only" }],
+    }),
+  );
+
+  for (const name of extraToolNames) {
+    server.registerTool(name, { description: `Extra ${name}.`, inputSchema: {} }, async () => ({
+      content: [{ type: "text", text: "ok" }],
+    }));
+  }
 
   const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
   await server.connect(serverTransport);
@@ -94,31 +100,13 @@ async function startFixtureMcpServer() {
   };
 }
 
-function makeOperation(overrides: Partial<EffectIdentity>): ToolOperation {
-  return {
-    effect: {
-      runId: "run-1",
-      operationKind: "mcp",
-      operationId: "notes.search_notes",
-      canonicalArguments: { query: "uptime" },
-      attemptId: "attempt-1",
-      ...overrides,
-    },
-  };
-}
-
-describe("MCP tools adapter with typed descriptors, exact-operation approval, and effect certainty", () => {
-  it("lists verified descriptors, keeps credentials internal, runs read-only tools, and enforces exact approval on writes", async () => {
-    const fixture = await startFixtureMcpServer();
-    const approvedEffect: EffectIdentity = {
-      runId: "run-1",
-      operationKind: "mcp",
-      operationId: "notes.append_note",
-      canonicalArguments: { title: "Shift", body: "All green" },
-      attemptId: "attempt-write-1",
-    };
-
-    const mcp = createMcpTools({
+async function startCatalog(
+  fixture: { readonly clientTransport: InMemoryTransport },
+  server: Partial<McpServerConfig> = {},
+): Promise<Catalog> {
+  const registry = new IntegrationRegistry();
+  await registry.register(
+    createMcpIntegration({
       servers: [
         {
           id: "notes",
@@ -126,201 +114,171 @@ describe("MCP tools adapter with typed descriptors, exact-operation approval, an
           allowedTools: ["search_notes", "append_note"],
           readOnlyTools: ["search_notes"],
           redactedSecrets: ["secret-mcp-token-999"],
+          ...server,
         },
       ],
-      verifyApproval: createExactApprovalVerifier([approvedEffect]),
-    });
-    closers.push(() => mcp.close());
+    }),
+  );
+  closers.push(() => registry.stop());
+  await registry.start();
+  return registry.catalog;
+}
 
-    const descriptors = await mcp.list();
-    expect(descriptors.map((d) => ({ id: d.id, requiresApproval: d.requiresApproval }))).toEqual([
-      { id: "notes.append_note", requiresApproval: true },
-      { id: "notes.search_notes", requiresApproval: false },
+describe("expose remote MCP tools as capabilities", () => {
+  it("lists each tool as a write capability that asks approval unless the operator marked it read-only", async () => {
+    const catalog = await startCatalog(await startFixtureMcpServer());
+
+    expect(
+      catalog.list().map((entry) => ({
+        id: entry.id,
+        effect: entry.effect,
+        requiresApproval: entry.requiresApproval,
+      })),
+    ).toEqual([
+      { id: "mcp.notes.append_note", effect: "write", requiresApproval: true },
+      { id: "mcp.notes.search_notes", effect: "write", requiresApproval: false },
     ]);
-    for (const descriptor of descriptors) {
-      expect(compiledParsers.toolDescriptor.safeParse(descriptor).success).toBe(true);
-      expect(JSON.stringify(descriptor)).not.toContain("secret-mcp-token-999");
-    }
-
-    const readResult = await mcp.invoke(makeOperation({}));
-    expect(compiledParsers.toolResult.parse(readResult)).toEqual({
-      ok: true,
-      isError: false,
-      outcome: { matches: ["note:uptime"] },
-    });
-
-    const unapprovedWrite = await mcp.invoke(
-      makeOperation({
-        operationId: "notes.append_note",
-        canonicalArguments: { title: "Shift", body: "Mutated payload" },
-        attemptId: "attempt-write-1",
-      }),
-    );
-    expect(unapprovedWrite.ok).toBe(false);
-    expect(unapprovedWrite.isError).toBe(true);
-    expect(unapprovedWrite.outcome).toEqual({
-      denied: true,
-      code: "tool.approval_required",
-    });
-    expect(fixture.writes).toHaveLength(0);
-
-    const approvedWrite = await mcp.invoke({ effect: approvedEffect });
-    expect(compiledParsers.toolResult.parse(approvedWrite)).toEqual({
-      ok: true,
-      isError: false,
-      outcome: { saved: true, title: "Shift" },
-    });
-    expect(fixture.writes).toEqual([{ title: "Shift", body: "All green" }]);
-
-    const unrecognized = await mcp.invoke(
-      makeOperation({ operationId: "notes.hidden_admin", canonicalArguments: { cmd: "rm" } }),
-    );
-    expect(unrecognized.ok).toBe(false);
-    expect(unrecognized.outcome).toEqual({
-      denied: true,
-      code: "tool.unrecognized_operation",
-    });
-
-    const registryFixture = await startFixtureMcpServer();
-    const registry = new IntegrationRegistry();
-    registry.registerSync(
-      createMcpIntegration({
-        servers: [
-          {
-            id: "notes",
-            transport: { kind: "custom", createTransport: () => registryFixture.clientTransport },
-            allowedTools: ["search_notes", "append_note"],
-            readOnlyTools: ["search_notes"],
-          },
-        ],
-        verifyApproval: createExactApprovalVerifier([approvedEffect]),
-      }),
-    );
-    closers.push(() => registry.stop());
-    const wrongKind = await registry.invoke(
-      makeOperation({ operationKind: "docker", operationId: "docker.exec" }),
-    );
-    expect(wrongKind.ok).toBe(false);
-    expect(wrongKind.outcome).toEqual({
-      denied: true,
-      code: "tool.unrecognized_operation",
-    });
+    expect(catalog.requiresApproval("mcp.notes.append_note", { title: "t", body: "b" })).toBe(true);
+    expect(catalog.requiresApproval("mcp.notes.search_notes", { query: "q" })).toBe(false);
   });
 
-  it("raises ToolEffectUncertainError with redacted details when a dispatched MCP write loses transport", async () => {
-    const fixture = await startFixtureMcpServer();
-    const writeEffect: EffectIdentity = {
-      runId: "run-2",
-      operationKind: "mcp",
-      operationId: "notes.append_note",
-      canonicalArguments: { title: "Incident", body: "Lost ack" },
-      attemptId: "attempt-write-2",
-    };
+  it("declares an unknown output and carries the remote description and input schema, without credentials", async () => {
+    const catalog = await startCatalog(await startFixtureMcpServer());
 
-    const mcp = createMcpTools({
-      servers: [
-        {
-          id: "notes",
-          transport: { kind: "custom", createTransport: () => fixture.clientTransport },
-          allowedTools: ["append_note"],
-          redactedSecrets: ["secret-mcp-token-999"],
-        },
-      ],
-      verifyApproval: createExactApprovalVerifier([writeEffect]),
+    const [hit] = catalog.search("append_note");
+    const described = catalog.list().find((entry) => entry.id === "mcp.notes.append_note");
+
+    expect(hit?.id).toBe("mcp.notes.append_note");
+    expect(hit?.summary).toBe("Write a new note entry.");
+    expect(hit?.declaration).toContain("type McpNotesAppendNoteOutput = unknown;");
+    expect(described?.description).toContain('"required":["title","body"]');
+    expect(JSON.stringify(catalog.list())).not.toContain("secret-mcp-token-999");
+  });
+
+  it("requires approval for every tool when the server is not told which tools are read-only", async () => {
+    const catalog = await startCatalog(await startFixtureMcpServer(), {
+      allowedTools: ["search_notes"],
+      readOnlyTools: [],
     });
-    closers.push(() => mcp.close());
 
-    await mcp.list();
+    expect(catalog.list().map((entry) => [entry.id, entry.requiresApproval])).toEqual([
+      ["mcp.notes.search_notes", true],
+    ]);
+  });
+
+  it("asks no approval for any tool when the server defaults to no approval", async () => {
+    const catalog = await startCatalog(await startFixtureMcpServer(), {
+      readOnlyTools: [],
+      defaultRequiresApproval: false,
+    });
+
+    expect(catalog.list().map((entry) => [entry.id, entry.requiresApproval])).toEqual([
+      ["mcp.notes.append_note", false],
+      ["mcp.notes.search_notes", false],
+    ]);
+  });
+
+  it("leaves out a tool the operator did not allow", async () => {
+    const catalog = await startCatalog(await startFixtureMcpServer());
+
+    expect(catalog.list().map((entry) => entry.id)).not.toContain("mcp.notes.hidden_admin");
+  });
+});
+
+describe("call a remote MCP tool through the catalog", () => {
+  it("returns the structured content of a read-only tool and of a write", async () => {
+    const fixture = await startFixtureMcpServer();
+    const catalog = await startCatalog(fixture);
+
+    expect(await catalog.invoke("mcp.notes.search_notes", { query: "uptime" }, {})).toEqual({
+      matches: ["note:uptime"],
+    });
+    expect(
+      await catalog.invoke("mcp.notes.append_note", { title: "Shift", body: "All green" }, {}),
+    ).toEqual({ saved: true, title: "Shift" });
+    expect(fixture.writes).toEqual([{ title: "Shift", body: "All green" }]);
+  });
+
+  it("fails with a typed error and the redacted tool text when the remote tool reports an error", async () => {
+    const catalog = await startCatalog(await startFixtureMcpServer(), {
+      allowedTools: ["broken_note"],
+    });
+
+    const caught = await catalog.invoke("mcp.notes.broken_note", {}, {}).catch((error) => error);
+
+    expect(caught).toBeInstanceOf(DomainError);
+    expect((caught as DomainError).code).toBe("mcp.tool_error");
+    expect((caught as DomainError).message).toBe("note store is read-only");
+  });
+
+  it("raises ToolEffectUncertainError with redacted details when a dispatched write loses transport", async () => {
+    const fixture = await startFixtureMcpServer();
+    const catalog = await startCatalog(fixture);
     fixture.setDropOnWrite(true);
 
-    let caught: unknown;
-    try {
-      await mcp.invoke({ effect: writeEffect });
-    } catch (error) {
-      caught = error;
-    }
+    const caught = await catalog
+      .invoke("mcp.notes.append_note", { title: "Incident", body: "Lost ack" }, {})
+      .catch((error) => error);
 
     expect(caught).toBeInstanceOf(ToolEffectUncertainError);
     expect((caught as ToolEffectUncertainError).code).toBe("effect.outcome_uncertain");
     expect((caught as ToolEffectUncertainError).message).not.toContain("secret-mcp-token-999");
   });
 
-  it("requires exact-operation approval for remote readOnlyHint tools unless operator-allowlisted in readOnlyTools", async () => {
+  it("fails with a typed error, not an uncertain outcome, when a tool that asks no approval loses transport", async () => {
     const fixture = await startFixtureMcpServer();
-    const approvedReadEffect: EffectIdentity = {
-      runId: "run-3",
-      operationKind: "mcp",
-      operationId: "notes.search_notes",
-      canonicalArguments: { query: "approved" },
-      attemptId: "attempt-read-1",
-    };
+    const catalog = await startCatalog(fixture, { readOnlyTools: ["append_note"] });
+    fixture.setDropOnWrite(true);
 
-    const mcp = createMcpTools({
-      servers: [
-        {
-          id: "notes",
-          transport: { kind: "custom", createTransport: () => fixture.clientTransport },
-          allowedTools: ["search_notes"],
-        },
-      ],
-      verifyApproval: createExactApprovalVerifier([approvedReadEffect]),
-    });
-    closers.push(() => mcp.close());
+    const caught = await catalog
+      .invoke("mcp.notes.append_note", { title: "Incident", body: "Lost ack" }, {})
+      .catch((error) => error);
 
-    const descriptors = await mcp.list();
-    expect(descriptors).toHaveLength(1);
-    expect(descriptors[0]?.id).toBe("notes.search_notes");
-    expect(descriptors[0]?.requiresApproval).toBe(true);
+    expect(caught).toBeInstanceOf(DomainError);
+    expect((caught as DomainError).code).toBe("mcp.call_failed");
+    expect((caught as DomainError).message).not.toContain("secret-mcp-token-999");
+  });
+});
 
-    const denied = await mcp.invoke(
-      makeOperation({
-        runId: "run-3",
-        operationId: "notes.search_notes",
-        canonicalArguments: { query: "unapproved" },
-        attemptId: "attempt-read-unapproved",
-      }),
-    );
-    expect(denied.ok).toBe(false);
-    expect(denied.outcome).toEqual({
-      denied: true,
-      code: "tool.approval_required",
+describe("name a remote tool as a capability id", () => {
+  it("replaces characters that are not identifier characters and still calls the remote name", async () => {
+    const catalog = await startCatalog(await startFixtureMcpServer(), {
+      id: "team-notes",
+      allowedTools: ["archive-note"],
     });
 
-    const allowed = await mcp.invoke({ effect: approvedReadEffect });
-    expect(allowed.ok).toBe(true);
-    expect(allowed.outcome).toEqual({ matches: ["note:approved"] });
-
-    const fixtureNoVerifier = await startFixtureMcpServer();
-    const mcpWithoutVerifier = createMcpTools({
-      servers: [
-        {
-          id: "notes",
-          transport: { kind: "custom", createTransport: () => fixtureNoVerifier.clientTransport },
-          allowedTools: ["search_notes"],
-        },
-      ],
-    });
-    closers.push(() => mcpWithoutVerifier.close());
-
-    const closedResult = await mcpWithoutVerifier.invoke(
-      makeOperation({
-        runId: "run-4",
-        operationId: "notes.search_notes",
-        canonicalArguments: { query: "no-verifier" },
-        attemptId: "attempt-read-2",
-      }),
-    );
-    expect(closedResult.ok).toBe(false);
-    expect(closedResult.outcome).toEqual({
-      denied: true,
-      code: "tool.approval_required",
+    expect(catalog.list().map((entry) => entry.id)).toEqual(["mcp.team_notes.archive_note"]);
+    expect(await catalog.invoke("mcp.team_notes.archive_note", { title: "old" }, {})).toEqual({
+      archived: "old",
     });
   });
 
-  it("registers MCP tools through defineIntegration and rejects duplicate tool IDs", async () => {
+  it("prefixes a segment that starts with a digit", async () => {
+    const catalog = await startCatalog(await startFixtureMcpServer(["9lives"]), {
+      id: "2fa",
+      allowedTools: ["9lives"],
+    });
+
+    expect(catalog.list().map((entry) => entry.id)).toEqual(["mcp._2fa._9lives"]);
+  });
+
+  it("fails start naming both remote tools when two names map to one capability id", async () => {
+    const fixture = await startFixtureMcpServer(["sync-all", "sync_all"]);
+
+    const caught = await startCatalog(fixture, { allowedTools: ["sync-all", "sync_all"] }).catch(
+      (error) => error,
+    );
+
+    expect(caught).toBeInstanceOf(ToolConfigurationError);
+    expect((caught as ToolConfigurationError).code).toBe("mcp.duplicate_capability_id");
+    expect((caught as ToolConfigurationError).message).toBe(
+      'MCP tools "notes/sync-all" and "notes/sync_all" both map to capability "mcp.notes.sync_all".',
+    );
+  });
+
+  it("fails start when a second integration contributes an id the MCP integration already registered", async () => {
     const fixture = await startFixtureMcpServer();
     const registry = new IntegrationRegistry();
-
     await registry.register(
       createMcpIntegration({
         servers: [
@@ -328,76 +286,28 @@ describe("MCP tools adapter with typed descriptors, exact-operation approval, an
             id: "notes",
             transport: { kind: "custom", createTransport: () => fixture.clientTransport },
             allowedTools: ["search_notes"],
-            readOnlyTools: ["search_notes"],
+          },
+        ],
+      }),
+    );
+    const sameTools = await startFixtureMcpServer();
+    await registry.register(
+      createMcpIntegration({
+        id: "mcp-second",
+        servers: [
+          {
+            id: "notes",
+            transport: { kind: "custom", createTransport: () => sameTools.clientTransport },
+            allowedTools: ["search_notes"],
           },
         ],
       }),
     );
     closers.push(() => registry.stop());
 
-    const descriptors = await registry.list();
-    expect(descriptors.map((d) => d.id)).toEqual(["notes.search_notes"]);
+    const caught = await registry.start().catch((error) => error);
 
-    const searchResult = await registry.invoke(makeOperation({}));
-    expect(searchResult).toEqual({
-      ok: true,
-      isError: false,
-      outcome: { matches: ["note:uptime"] },
-    });
-
-    const invalidArgs = await registry.invoke(
-      makeOperation({ canonicalArguments: "not-an-object" }),
-    );
-    expect(invalidArgs.ok).toBe(false);
-    expect(invalidArgs.outcome).toEqual({
-      denied: true,
-      code: "tool.invalid_arguments",
-    });
-
-    const conflictingRegistry = new IntegrationRegistry();
-    conflictingRegistry.registerSync(
-      defineIntegration({
-        id: "static-conflict",
-        setup() {
-          return {
-            tools: [
-              defineTool({
-                id: "notes.search_notes",
-                operationKind: "mcp",
-                description: "Duplicate static tool.",
-                inputSchema: z.object({}),
-                approval: "none",
-                async execute() {
-                  return { ok: true, isError: false, outcome: null };
-                },
-              }),
-            ],
-          };
-        },
-      }),
-    );
-    const secondFixture = await startFixtureMcpServer();
-    conflictingRegistry.registerSync(
-      createMcpIntegration({
-        servers: [
-          {
-            id: "notes",
-            transport: { kind: "custom", createTransport: () => secondFixture.clientTransport },
-            allowedTools: ["search_notes"],
-            readOnlyTools: ["search_notes"],
-          },
-        ],
-      }),
-    );
-    closers.push(() => conflictingRegistry.stop());
-
-    let caught: unknown;
-    try {
-      await conflictingRegistry.list();
-    } catch (error) {
-      caught = error;
-    }
     expect(caught).toBeInstanceOf(DomainError);
-    expect((caught as DomainError).code).toBe("integration.duplicate_tool_id");
+    expect((caught as DomainError).code).toBe("integration.duplicate_capability_id");
   });
 });

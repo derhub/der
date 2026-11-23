@@ -15,7 +15,7 @@ import {
   type CommandRunner,
   type CommandSpawnHandle,
   type DockerContainerSpec,
-} from "../../src/sandbox/index";
+} from "@der/runtime/sandbox";
 
 const tempDirs: string[] = [];
 
@@ -1494,5 +1494,176 @@ describe("provide a hardened @tanstack/ai-sandbox handle and @der/domain Sandbox
 
     expect(report.verified).toBe(false);
     expect(report.reasons.join("\n")).toContain("malformed Containers metadata");
+  });
+});
+
+describe("kill a spawned process through the hardened Docker provider", () => {
+  const isSignalExec = (args: readonly string[]): boolean => args.includes("der-signal");
+
+  async function spawnWith(options: {
+    readonly onSignalExec: (
+      args: readonly string[],
+    ) => CommandExecResult | Promise<CommandExecResult>;
+    readonly signal?: AbortSignal;
+    readonly exitCode?: number;
+    readonly releaseExit?: Promise<void>;
+  }) {
+    const localKills: Array<NodeJS.Signals | number | undefined> = [];
+    const fakeSpawn = {
+      ...createFakeSpawnHandle({ stdout: [], stderr: [], exitCode: options.exitCode ?? 0 }),
+      async wait() {
+        await options.releaseExit;
+        return options.exitCode ?? 0;
+      },
+      async kill(signal?: NodeJS.Signals | number) {
+        localKills.push(signal);
+      },
+    };
+    const { runner, calls } = createFakeCommandRunner({
+      onExec: (_cmd, args) => {
+        if (args[0] === "info") {
+          return {
+            exitCode: 0,
+            stdout: JSON.stringify({
+              ServerVersion: "29.10.0",
+              SecurityOptions: ["name=rootless", "name=seccomp,profile=builtin"],
+              MemoryLimit: true,
+              CpuCfsQuota: true,
+              PidsLimit: true,
+            }),
+            stderr: "",
+          };
+        }
+        if (args[0] === "run") {
+          return { exitCode: 0, stdout: "container-id-123\n", stderr: "" };
+        }
+        if (isSignalExec(args)) {
+          return options.onSignalExec(args);
+        }
+        return { exitCode: 0, stdout: "", stderr: "" };
+      },
+      onSpawn: () => fakeSpawn,
+    });
+    const provider = createHardenedDockerProvider({
+      dockerHost: "unix:///run/user/1000/docker.sock",
+      image: "der-engine-codex:pinned",
+      engine: "codex",
+      user: "1000:1000",
+      workspaceHostPath: "/srv/der/workspaces/sess-1",
+      shadowHome: DEFAULT_ENGINE_SHADOW_HOMES.codex,
+      network: { mode: "none" },
+      limits: { cpus: 2, memoryMb: 1024, pidsLimit: 256 },
+      runner,
+      resolveRealPath: identityRealPath,
+    });
+    const handle = await provider.create({ id: "sess-kill" });
+    const spawned = await handle.process.spawn(
+      "agy acp --stdio",
+      options.signal === undefined ? undefined : { signal: options.signal },
+    );
+    const signalArgs = () =>
+      calls.filter((call) => isSignalExec(call.args)).map((c) => c.args.slice(7));
+    return { spawned, localKills, signalArgs };
+  }
+
+  it("resolves and still stops the local CLI when the signal command cannot run", async () => {
+    const { spawned, localKills } = await spawnWith({
+      onSignalExec: () => {
+        throw new Error("Error response from daemon: No such container: container-id-123");
+      },
+    });
+
+    await spawned.kill("SIGTERM");
+
+    expect(localKills).toEqual(["SIGTERM"]);
+  });
+
+  it.each([
+    ["the container is missing", { exitCode: 125, stdout: "", stderr: "No such container" }],
+    ["the signal command fails", { exitCode: 2, stdout: "", stderr: "sh: boom" }],
+  ] as const)("resolves when %s", async (_name, result) => {
+    const { spawned, localKills } = await spawnWith({ onSignalExec: () => result });
+
+    await spawned.kill("SIGTERM");
+
+    expect(localKills).toEqual(["SIGTERM"]);
+  });
+
+  it("sends SIGKILL for the survivors when the first signal leaves processes alive", async () => {
+    const { spawned, signalArgs } = await spawnWith({
+      onSignalExec: (args) =>
+        args[7] === "TERM"
+          ? { exitCode: 1, stdout: "41 42\n", stderr: "" }
+          : { exitCode: 0, stdout: "", stderr: "" },
+    });
+
+    await spawned.kill("SIGTERM");
+
+    expect(signalArgs()).toEqual([["TERM"], ["KILL", "41", "42"]]);
+  });
+
+  it("resolves when survivors outlive SIGKILL too", async () => {
+    const { spawned, signalArgs } = await spawnWith({
+      onSignalExec: () => ({ exitCode: 1, stdout: "41\n", stderr: "" }),
+    });
+
+    await spawned.kill("SIGTERM");
+
+    expect(signalArgs()).toHaveLength(2);
+  });
+
+  it.each([
+    [undefined, "TERM"],
+    ["SIGINT", "INT"],
+    [9, "KILL"],
+    [15, "TERM"],
+  ] as const)("passes signal %p to the container by name %s", async (signal, name) => {
+    const { spawned, signalArgs } = await spawnWith({
+      onSignalExec: () => ({ exitCode: 0, stdout: "", stderr: "" }),
+    });
+
+    await spawned.kill(signal);
+
+    expect(signalArgs().map((args) => args[0])).toEqual([name]);
+  });
+
+  it("reports the process's own exit code after an abort even when the container kill fails", async () => {
+    const controller = new AbortController();
+    let release: () => void = () => {};
+    const { spawned, localKills } = await spawnWith({
+      signal: controller.signal,
+      exitCode: 137,
+      releaseExit: new Promise<void>((resolve) => {
+        release = resolve;
+      }),
+      onSignalExec: () => {
+        throw new Error("daemon unreachable");
+      },
+    });
+
+    controller.abort();
+    release();
+
+    expect(await spawned.wait()).toBe(137);
+    expect(localKills).toEqual(["SIGKILL"]);
+  });
+
+  it("removes the abort listener once the process has exited", async () => {
+    const controller = new AbortController();
+    const removed: string[] = [];
+    const remove = controller.signal.removeEventListener.bind(controller.signal);
+    controller.signal.removeEventListener = ((type: string, ...rest: unknown[]) => {
+      removed.push(type);
+      return (remove as (...args: unknown[]) => void)(type, ...rest);
+    }) as AbortSignal["removeEventListener"];
+    const { spawned } = await spawnWith({
+      signal: controller.signal,
+      onSignalExec: () => ({ exitCode: 0, stdout: "", stderr: "" }),
+    });
+
+    await spawned.wait();
+    await Bun.sleep(0);
+
+    expect(removed).toEqual(["abort"]);
   });
 });

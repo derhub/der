@@ -149,6 +149,7 @@ const styles = stylex.create({
     paddingBlock: spacingVars["--spacing-2"],
     fontSize: textSizeVars["--font-size-base"],
     lineHeight: 1.625,
+    whiteSpace: "pre-wrap",
   },
   slotList: {
     display: "flex",
@@ -481,7 +482,7 @@ export function RoutinesPanel({ api, bot, sessions, onAnnounce }: RoutinesPanelP
                 <Text type="code" color="secondary" as="p">
                   {detail
                     ? `${detail.routine.cron} UTC · session ${detail.routine.sessionId} · rev ${detail.routine.revision}`
-                    : "Select a routine to inspect its prompt and recorded UTC slots."}
+                    : "Select a routine to inspect its prompt or script and recorded UTC slots."}
                 </Text>
               </div>
 
@@ -489,9 +490,11 @@ export function RoutinesPanel({ api, bot, sessions, onAnnounce }: RoutinesPanelP
                 <>
                   <div {...stylex.props(styles.detailSection)}>
                     <Text type="label" color="secondary">
-                      Prompt
+                      {detail.routine.script === null ? "Prompt" : "Script"}
                     </Text>
-                    <p {...stylex.props(styles.promptBox)}>{detail.routine.prompt}</p>
+                    <p {...stylex.props(styles.promptBox)}>
+                      {detail.routine.script ?? detail.routine.prompt}
+                    </p>
                   </div>
 
                   <div {...stylex.props(styles.slotsSection)}>

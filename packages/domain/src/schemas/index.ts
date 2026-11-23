@@ -54,6 +54,7 @@ export {
   engineKind,
   id,
   jsonValue,
+  runEngineKind,
   type ApprovalId,
   type BotId,
   type ChannelBindingId,
@@ -64,25 +65,24 @@ export {
   type MessageId,
   type OutboxEventId,
   type RoutineId,
+  type RunEngineKind,
   type RunId,
   type SessionId,
   type SkillId,
 } from "./common";
 export {
+  capabilityDescriptor,
+  capabilitySearchHit,
   engineEvent,
   engineReadiness,
   sandboxRequest,
   sandboxResult,
-  toolDescriptor,
-  toolOperation,
-  toolResult,
+  type CapabilityDescriptor,
+  type CapabilitySearchHit,
   type EngineEvent,
   type EngineReadiness,
   type SandboxRequest,
   type SandboxResult,
-  type ToolDescriptor,
-  type ToolOperation,
-  type ToolResult,
 } from "./execution";
 export { memoryRecord, memoryWriteInput, type MemoryRecord, type MemoryWriteInput } from "./memory";
 export {
@@ -100,6 +100,7 @@ export {
   type Routine,
   type RoutineSlot,
   type RoutineSlotDisposition,
+  type RoutineTarget,
 } from "./routine";
 export {
   channelIntakeMetadata,
@@ -121,5 +122,17 @@ export {
   type RunStatus,
   type TerminalRunStatus,
 } from "./run";
+export {
+  executeErrorKind,
+  executeResult,
+  scriptRun,
+  scriptRunStatus,
+  terminalScriptRunStatus,
+  type ExecuteErrorKind,
+  type ExecuteResult,
+  type ScriptRun,
+  type ScriptRunStatus,
+  type TerminalScriptRunStatus,
+} from "./script-run";
 export { createSessionInput, session, type CreateSessionInput, type Session } from "./session";
 export { skill, skillFrontmatter, type Skill, type SkillFrontmatter } from "./skill";

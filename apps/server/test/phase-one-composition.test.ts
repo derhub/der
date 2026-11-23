@@ -3,30 +3,25 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync
 import { join } from "node:path";
 import * as z from "zod";
 import {
+  defineCapability,
   defineIntegration,
-  defineTool,
   DomainError,
-  IntegrationRegistry,
   PROBLEM_DETAILS_MEDIA_TYPE,
   type Approval,
   type Bot,
-  type EffectIdentity,
-  type Engine,
+  type Capability,
+  type CapabilityDescriptor,
   type EngineReadiness,
   type MemoryRecord,
   type Routine,
   type Run,
   type RunAdmission,
   type Skill,
-  type ToolDescriptor,
-  type ToolResult,
-  type Tools,
 } from "@der/domain";
 import { compiledParsers } from "@der/domain/compiled";
 import type { CommandExecOptions, CommandRunner, CommandSpawnHandle } from "@der/runtime/sandbox";
-import { parseServerConfig } from "../src/config";
-import { buildEngineHostTools, startServer } from "../src/main";
-import { createDirectWorkflow, UncertainEffectError } from "../src/workflows/index";
+import { parseServerConfig } from "#config";
+import { startServer } from "#main";
 import { allocateLocalTcpNumber, createTempDatabase, waitUntil } from "./fixtures/restate-harness";
 
 const cleanups: (() => Promise<void> | void)[] = [];
@@ -193,55 +188,48 @@ describe("serve Phase 1 memory, skills, routines, engines, tools, and shared com
       }
     }
 
-    expect(server.tools).toBeInstanceOf(IntegrationRegistry);
-    const toolsRes = await fetch(`${server.url}/api/tools`);
-    expect(toolsRes.status).toBe(200);
-    const toolsPayload = (await toolsRes.json()) as { tools: ToolDescriptor[] };
-    expect(toolsPayload.tools.map((entry) => entry.id)).toEqual([
-      "docker.execute",
+    const capabilitiesRes = await fetch(`${server.url}/api/capabilities`);
+    expect(capabilitiesRes.status).toBe(200);
+    const capabilitiesPayload = (await capabilitiesRes.json()) as {
+      capabilities: CapabilityDescriptor[];
+    };
+    expect(capabilitiesPayload.capabilities.map((entry) => entry.id)).toEqual([
+      "catalog.search",
       "fixture.apply",
       "fixture.uncertain",
-      "wasmer.execute",
+      "memory.read",
+      "memory.write",
+      "routines.create",
+      "routines.list",
+      "routines.update",
+      "sandbox.docker",
+      "sandbox.wasmer",
+      "sessions.list",
+      "sessions.messages",
+      "skills.list",
+      "skills.read",
     ]);
 
-    const invalidArgsTool = await server.tools.invoke({
-      effect: {
-        runId: "run_unapproved",
-        operationKind: "docker",
-        operationId: "docker.execute",
-        canonicalArguments: { command: "" },
-        attemptId: "att-invalid",
-      },
-    });
-    expect(invalidArgsTool.ok).toBe(false);
-    expect(invalidArgsTool.outcome).toEqual({ denied: true, code: "tool.invalid_arguments" });
+    const invalidInput = await server.catalog
+      .invoke("sandbox.docker", { command: "" }, {})
+      .catch((error: unknown) => error);
+    expect(invalidInput).toBeInstanceOf(DomainError);
+    expect((invalidInput as DomainError).code).toBe("capability.invalid_input");
 
-    const deniedTool = await server.tools.invoke({
-      effect: {
-        runId: "run_unapproved",
-        operationKind: "docker",
-        operationId: "docker.execute",
-        canonicalArguments: { command: "echo", args: ["hi"], timeoutMs: 1000, network: "none" },
-        attemptId: "att-1",
-      },
-    });
-    expect(deniedTool.ok).toBe(false);
-    expect(deniedTool.outcome).toEqual({ denied: true, code: "tool.approval_required" });
+    expect(
+      server.catalog.requiresApproval("sandbox.docker", {
+        command: "echo",
+        args: ["hi"],
+        timeoutMs: 1000,
+        network: "none",
+      }),
+    ).toBe(true);
 
-    const unrecognizedTool = await server.tools.invoke({
-      effect: {
-        runId: "run_unapproved",
-        operationKind: "mcp",
-        operationId: "unknown.rm_rf",
-        canonicalArguments: {},
-        attemptId: "att-1",
-      },
-    });
-    expect(unrecognizedTool.ok).toBe(false);
-    expect(unrecognizedTool.outcome).toEqual({
-      denied: true,
-      code: "tool.unrecognized_operation",
-    });
+    const unrecognized = await server.catalog
+      .invoke("unknown.rm_rf", {}, {})
+      .catch((error: unknown) => error);
+    expect(unrecognized).toBeInstanceOf(DomainError);
+    expect((unrecognized as DomainError).code).toBe("capability.unknown");
 
     const skillsRes = await fetch(`${server.url}/api/skills`);
     expect(skillsRes.status).toBe(200);
@@ -771,41 +759,18 @@ describe("serve Phase 1 memory, skills, routines, engines, tools, and shared com
       optionId: "allow-once-1",
     });
 
-    const wasmerEffect = {
-      runId: admission.run.id,
-      operationKind: "wasmer" as const,
-      operationId: "wasmer.execute",
-      canonicalArguments: {
+    const wasmerResult = await server.catalog.invoke(
+      "sandbox.wasmer",
+      {
         command: "bash",
         args: ["-c", "echo hi"],
         readonlyPaths: [allowedRoDir],
         timeoutMs: 2000,
         network: "none",
       },
-      attemptId: "wasmer-att-1",
-    };
-    const wasmerApproval = await server.store.requestApproval({
-      botId: bot.id,
-      sessionId: session.id,
-      runId: admission.run.id,
-      effect: wasmerEffect,
-      prompt: "Run bash in wasmer?",
-      awakeable: "awk-wasmer-1",
-      deadline: "2099-01-01T00:00:00.000Z",
-    });
-    await server.store.decide({
-      approvalId: wasmerApproval.approval.id,
-      botId: bot.id,
-      sessionId: session.id,
-      runId: admission.run.id,
-      status: "approved",
-      actor: "operator",
-      decidedAt: "2026-11-22T00:00:00.000Z",
-    });
-
-    const wasmerToolResult = await server.tools.invoke({ effect: wasmerEffect });
-    expect(wasmerToolResult.ok).toBe(true);
-    expect(wasmerToolResult.outcome).toMatchObject({
+      {},
+    );
+    expect(wasmerResult).toMatchObject({
       exitCode: 0,
       stdout: "wasmer-container-ok\n",
     });
@@ -819,514 +784,8 @@ describe("serve Phase 1 memory, skills, routines, engines, tools, and shared com
     expect(wasmerContainerCall?.args).toContain("--security-opt=no-new-privileges:true");
   });
 
-  it("reuses recorded outcome on replay of a completed approved engine host-tool call and interrupts without re-execution on a crashed started effect", async () => {
-    const tempDb = createTempDatabase("der-host-tool-replay-");
-    const server = await startServer({
-      config: {
-        host: "127.0.0.1",
-        port: 0,
-        restateHost: "127.0.0.1",
-        restateListen: 0,
-        restateMode: "direct",
-        databasePath: tempDb.dbPath,
-        memoryProjectionDir: join(tempDb.dir, "memory"),
-        skillsRootDir: join(tempDb.dir, "skills"),
-        workspaceRootDir: join(tempDb.dir, "workspaces"),
-        enabledEngines: ["fixture"],
-        seedFixture: true,
-      },
-    });
-    cleanups.push(async () => {
-      await server.close();
-      tempDb.cleanup();
-    });
-
-    const bot = server.seededFixture!.bot;
-    const session = server.seededFixture!.session;
-
-    let completedInvokeCount = 0;
-    const recordingTools: Tools = {
-      async list(): Promise<readonly ToolDescriptor[]> {
-        return [
-          {
-            kind: "mcp",
-            id: "mcp.side_effect",
-            name: "Side Effect Tool",
-            description: "Applies an external side effect.",
-            requiresApproval: true,
-            inputSchema: { type: "object" },
-          },
-        ];
-      },
-      async invoke(operation): Promise<ToolResult> {
-        completedInvokeCount += 1;
-        return {
-          ok: true,
-          isError: false,
-          outcome: {
-            applied: true,
-            invocation: completedInvokeCount,
-            args: operation.effect.canonicalArguments,
-          },
-        };
-      },
-    };
-
-    const replayAdmission = await server.store.admit({
-      botId: bot.id,
-      sessionId: session.id,
-      origin: "web",
-      idempotencyKey: "host-tool-replay-completed",
-      engine: "fixture",
-      input: { parts: [{ type: "text", text: "apply lamp" }] },
-    });
-    const replayRun = await server.store.markRunRunning(replayAdmission.run.id);
-
-    const directWf = createDirectWorkflow({
-      store: server.store,
-      engines: new Map(),
-      tools: recordingTools,
-      approvalTimeoutMs: 10_000,
-    });
-    cleanups.push(() => directWf.close());
-
-    const makeBroker = (run: Run) => ({
-      async requestApproval(req: {
-        readonly effect: EffectIdentity;
-        readonly prompt: string;
-        readonly signal: AbortSignal;
-      }) {
-        return directWf.awaitApproval!({ run, effect: req.effect, prompt: req.prompt }, req.signal);
-      },
-    });
-
-    const attempt1Tools = await buildEngineHostTools({
-      run: replayRun,
-      store: server.store,
-      tools: recordingTools,
-      approvalBroker: makeBroker(replayRun),
-    });
-    const firstCallPromise = attempt1Tools[0]!.execute!({ target: "lamp-1" });
-
-    const pendingApproval = await waitUntil(async () => {
-      const latest = server.store.getLatestApprovalForRun(replayRun.id);
-      return latest && latest.decision.status === "pending" ? latest : false;
-    });
-    await directWf.decide({
-      approvalId: pendingApproval.id,
-      botId: bot.id,
-      sessionId: session.id,
-      runId: replayRun.id,
-      status: "approved",
-      actor: "operator",
-      decidedAt: "2026-11-22T00:00:00.000Z",
-    });
-
-    const firstResult = (await firstCallPromise) as ToolResult;
-    expect(firstResult).toEqual({
-      ok: true,
-      isError: false,
-      outcome: { applied: true, invocation: 1, args: { target: "lamp-1" } },
-    });
-    expect(completedInvokeCount).toBe(1);
-    expect(server.store.getEffect(pendingApproval.effect)?.status).toBe("completed");
-
-    const attempt2Tools = await buildEngineHostTools({
-      run: replayRun,
-      store: server.store,
-      tools: recordingTools,
-      approvalBroker: makeBroker(replayRun),
-    });
-    const replayedResult = (await attempt2Tools[0]!.execute!({ target: "lamp-1" })) as ToolResult;
-    expect(replayedResult).toEqual(firstResult);
-    expect(completedInvokeCount).toBe(1);
-
-    await server.store.finishRun({
-      runId: replayRun.id,
-      status: "completed",
-      terminalEvent: {
-        chunkKey: `${replayRun.id}:terminal`,
-        chunk: { type: "RUN_FINISHED", threadId: session.id, runId: replayRun.id },
-      },
-    });
-
-    let crashedInvokeCount = 0;
-    const crashedTools: Tools = {
-      async list(): Promise<readonly ToolDescriptor[]> {
-        return recordingTools.list!();
-      },
-      async invoke(): Promise<ToolResult> {
-        crashedInvokeCount += 1;
-        return { ok: true, isError: false, outcome: { shouldNeverRun: true } };
-      },
-    };
-
-    let caughtEngineToolError: unknown;
-    const replayEngine: Engine = {
-      kind: "fixture",
-      async *run(run) {
-        const hostTools = await buildEngineHostTools({
-          run,
-          store: server.store,
-          tools: crashedTools,
-          approvalBroker: makeBroker(run),
-        });
-        try {
-          await hostTools[0]!.execute!({ target: "lamp-crashed" });
-        } catch (error) {
-          caughtEngineToolError = error;
-        }
-        yield {
-          type: "completed",
-          finalMessage: { parts: [{ type: "text", text: "should not overwrite interrupted" }] },
-        };
-      },
-    };
-
-    const crashWf = createDirectWorkflow({
-      store: server.store,
-      engines: new Map<Engine["kind"], Engine>([["fixture", replayEngine]]),
-      tools: crashedTools,
-      approvalTimeoutMs: 10_000,
-    });
-    cleanups.push(() => crashWf.close());
-
-    const crashedAdmission = await server.store.admit({
-      botId: bot.id,
-      sessionId: session.id,
-      origin: "web",
-      idempotencyKey: "host-tool-replay-crashed-started",
-      engine: "fixture",
-      input: { parts: [{ type: "text", text: "apply crashed lamp" }] },
-    });
-    const crashedRun = crashedAdmission.run;
-
-    const probeTools = await buildEngineHostTools({
-      run: crashedRun,
-      store: server.store,
-      tools: crashedTools,
-      approvalBroker: {
-        async requestApproval(req) {
-          const requested = await server.store.requestApproval({
-            botId: bot.id,
-            sessionId: session.id,
-            runId: crashedRun.id,
-            effect: req.effect,
-            prompt: req.prompt,
-            awakeable: "awk-crashed-started",
-            deadline: "2099-01-01T00:00:00.000Z",
-          });
-          await server.store.decide({
-            approvalId: requested.approval.id,
-            botId: bot.id,
-            sessionId: session.id,
-            runId: crashedRun.id,
-            status: "approved",
-            actor: "operator",
-            decidedAt: "2026-11-22T00:00:00.000Z",
-          });
-          const begun = await server.store.beginEffect(req.effect, {
-            approvalId: requested.approval.id,
-          });
-          expect(begun.kind).toBe("started");
-          return {
-            status: "denied",
-            approvalId: requested.approval.id,
-            effect: req.effect,
-          };
-        },
-      },
-    });
-    await probeTools[0]!.execute!({ target: "lamp-crashed" });
-    const seededApproval = server.store.getLatestApprovalForRun(crashedRun.id)!;
-    expect(server.store.getEffect(seededApproval.effect)?.status).toBe("started");
-
-    await crashWf.admit({
-      botId: bot.id,
-      sessionId: session.id,
-      origin: "web",
-      idempotencyKey: "host-tool-replay-crashed-started",
-      engine: "fixture",
-      input: { parts: [{ type: "text", text: "apply crashed lamp" }] },
-    });
-
-    const interruptedRun = await waitUntil(async () => {
-      const current = server.store.getRun(crashedRun.id);
-      return current && current.status === "interrupted" ? current : false;
-    });
-    expect(interruptedRun.status).toBe("interrupted");
-    expect(caughtEngineToolError).toBeInstanceOf(UncertainEffectError);
-    expect(crashedInvokeCount).toBe(0);
-    expect(server.store.getEffect(seededApproval.effect)?.status).toBe("unknown");
-  });
-
-  it("derives order-independent race-free effect identity so concurrent or reordered replays reuse completed outcomes and interrupt on ambiguous effects", async () => {
-    const tempDb = createTempDatabase("der-host-tool-order-");
-    const server = await startServer({
-      config: {
-        host: "127.0.0.1",
-        port: 0,
-        restateHost: "127.0.0.1",
-        restateListen: 0,
-        restateMode: "direct",
-        databasePath: tempDb.dbPath,
-        memoryProjectionDir: join(tempDb.dir, "memory"),
-        skillsRootDir: join(tempDb.dir, "skills"),
-        workspaceRootDir: join(tempDb.dir, "workspaces"),
-        enabledEngines: ["fixture"],
-        seedFixture: true,
-      },
-    });
-    cleanups.push(async () => {
-      await server.close();
-      tempDb.cleanup();
-    });
-
-    const bot = server.seededFixture!.bot;
-    const session = server.seededFixture!.session;
-
-    let invokeCount = 0;
-    const observedEffectIds: EffectIdentity[] = [];
-    const multiTools: Tools = {
-      async list(): Promise<readonly ToolDescriptor[]> {
-        return [
-          {
-            kind: "mcp",
-            id: "mcp.alpha",
-            name: "Alpha Tool",
-            description: "Applies alpha side effect.",
-            requiresApproval: true,
-            inputSchema: { type: "object" },
-          },
-          {
-            kind: "mcp",
-            id: "mcp.beta",
-            name: "Beta Tool",
-            description: "Applies beta side effect.",
-            requiresApproval: true,
-            inputSchema: { type: "object" },
-          },
-        ];
-      },
-      async invoke(operation): Promise<ToolResult> {
-        invokeCount += 1;
-        observedEffectIds.push(operation.effect);
-        return {
-          ok: true,
-          isError: false,
-          outcome: {
-            op: operation.effect.operationId,
-            invocation: invokeCount,
-            args: operation.effect.canonicalArguments,
-          },
-        };
-      },
-    };
-
-    const admission = await server.store.admit({
-      botId: bot.id,
-      sessionId: session.id,
-      origin: "web",
-      idempotencyKey: "host-tool-order-independent",
-      engine: "fixture",
-      input: { parts: [{ type: "text", text: "apply alpha and beta" }] },
-    });
-    const run = await server.store.markRunRunning(admission.run.id);
-
-    const autoApproveBroker = {
-      async requestApproval(req: {
-        readonly effect: EffectIdentity;
-        readonly prompt: string;
-        readonly signal: AbortSignal;
-      }) {
-        const requested = await server.store.requestApproval({
-          botId: bot.id,
-          sessionId: session.id,
-          runId: run.id,
-          effect: req.effect,
-          prompt: req.prompt,
-          awakeable: `awk-${req.effect.attemptId}`,
-          deadline: "2099-01-01T00:00:00.000Z",
-        });
-        if (requested.approval.decision.status === "pending") {
-          await server.store.decide({
-            approvalId: requested.approval.id,
-            botId: bot.id,
-            sessionId: session.id,
-            runId: run.id,
-            status: "approved",
-            actor: "operator",
-            decidedAt: "2026-11-22T00:00:00.000Z",
-          });
-        }
-        return {
-          status: "approved" as const,
-          approvalId: requested.approval.id,
-          effect: req.effect,
-        };
-      },
-    };
-
-    const attempt1 = await buildEngineHostTools({
-      run,
-      store: server.store,
-      tools: multiTools,
-      approvalBroker: autoApproveBroker,
-    });
-    const [alphaFirst, betaFirst] = (await Promise.all([
-      attempt1[0]!.execute!({ target: "lamp-a", level: 1 }),
-      attempt1[1]!.execute!({ target: "lamp-b", level: 2 }),
-    ])) as [ToolResult, ToolResult];
-
-    expect(invokeCount).toBe(2);
-    expect(observedEffectIds).toHaveLength(2);
-    expect(observedEffectIds[0]!.attemptId).not.toBe(observedEffectIds[1]!.attemptId);
-
-    const attempt2 = await buildEngineHostTools({
-      run,
-      store: server.store,
-      tools: multiTools,
-      approvalBroker: autoApproveBroker,
-    });
-    const betaReplayed = (await attempt2[1]!.execute!({
-      level: 2,
-      target: "lamp-b",
-    })) as ToolResult;
-    const alphaReplayed = (await attempt2[0]!.execute!({
-      level: 1,
-      target: "lamp-a",
-    })) as ToolResult;
-    expect(betaReplayed).toEqual(betaFirst);
-    expect(alphaReplayed).toEqual(alphaFirst);
-    expect(invokeCount).toBe(2);
-
-    await server.store.finishRun({
-      runId: run.id,
-      status: "completed",
-      terminalEvent: {
-        chunkKey: `${run.id}:terminal`,
-        chunk: { type: "RUN_FINISHED", threadId: session.id, runId: run.id },
-      },
-    });
-
-    const crashAdmission = await server.store.admit({
-      botId: bot.id,
-      sessionId: session.id,
-      origin: "web",
-      idempotencyKey: "host-tool-order-ambiguous",
-      engine: "fixture",
-      input: { parts: [{ type: "text", text: "ambiguous out-of-order replay" }] },
-    });
-    const crashRun = await server.store.markRunRunning(crashAdmission.run.id);
-
-    let seededAmbiguousEffect: EffectIdentity | undefined;
-    const seederTools = await buildEngineHostTools({
-      run: crashRun,
-      store: server.store,
-      tools: multiTools,
-      approvalBroker: {
-        async requestApproval(req) {
-          seededAmbiguousEffect = req.effect;
-          const requested = await server.store.requestApproval({
-            botId: bot.id,
-            sessionId: session.id,
-            runId: crashRun.id,
-            effect: req.effect,
-            prompt: req.prompt,
-            awakeable: `awk-seed-${req.effect.attemptId}`,
-            deadline: "2099-01-01T00:00:00.000Z",
-          });
-          await server.store.decide({
-            approvalId: requested.approval.id,
-            botId: bot.id,
-            sessionId: session.id,
-            runId: crashRun.id,
-            status: "approved",
-            actor: "operator",
-            decidedAt: "2026-11-22T00:00:00.000Z",
-          });
-          const begun = await server.store.beginEffect(req.effect, {
-            approvalId: requested.approval.id,
-          });
-          expect(begun.kind).toBe("started");
-          return {
-            status: "denied",
-            approvalId: requested.approval.id,
-            effect: req.effect,
-          };
-        },
-      },
-    });
-    await seederTools[0]!.execute!({ target: "ambiguous-lamp" });
-    expect(seededAmbiguousEffect).toBeDefined();
-
-    let ambiguousInvokeCount = 0;
-    const replayAmbiguousTools: Tools = {
-      async list() {
-        return multiTools.list!();
-      },
-      async invoke(operation): Promise<ToolResult> {
-        ambiguousInvokeCount += 1;
-        return {
-          ok: true,
-          isError: false,
-          outcome: { op: operation.effect.operationId },
-        };
-      },
-    };
-
-    const reorderedAttempt = await buildEngineHostTools({
-      run: crashRun,
-      store: server.store,
-      tools: replayAmbiguousTools,
-      approvalBroker: {
-        async requestApproval(req) {
-          const requested = await server.store.requestApproval({
-            botId: bot.id,
-            sessionId: session.id,
-            runId: crashRun.id,
-            effect: req.effect,
-            prompt: req.prompt,
-            awakeable: `awk-replay-${req.effect.attemptId}`,
-            deadline: "2099-01-01T00:00:00.000Z",
-          });
-          if (requested.approval.decision.status === "pending") {
-            await server.store.decide({
-              approvalId: requested.approval.id,
-              botId: bot.id,
-              sessionId: session.id,
-              runId: crashRun.id,
-              status: "approved",
-              actor: "operator",
-              decidedAt: "2026-11-22T00:00:00.000Z",
-            });
-          }
-          return {
-            status: "approved",
-            approvalId: requested.approval.id,
-            effect: req.effect,
-          };
-        },
-      },
-    });
-
-    await reorderedAttempt[1]!.execute!({ target: "other-lamp" });
-    expect(ambiguousInvokeCount).toBe(1);
-
-    let caughtAmbiguous: unknown;
-    try {
-      await reorderedAttempt[0]!.execute!({ target: "ambiguous-lamp" });
-    } catch (error) {
-      caughtAmbiguous = error;
-    }
-    expect(caughtAmbiguous).toBeInstanceOf(UncertainEffectError);
-    expect(ambiguousInvokeCount).toBe(1);
-    expect(server.store.getRun(crashRun.id)?.status).toBe("interrupted");
-    expect(server.store.getEffect(seededAmbiguousEffect!)?.status).toBe("unknown");
-  });
-
-  it("fails startServer() before opening listeners when an integration exposes a duplicate dynamic tool ID", async () => {
-    const tempDb = createTempDatabase("der-dup-dynamic-tool-");
+  it("fails startServer() before opening listeners when an integration exposes a duplicate dynamic capability ID", async () => {
+    const tempDb = createTempDatabase("der-dup-dynamic-capability-");
     cleanups.push(() => tempDb.cleanup());
     const reservedPort = await allocateLocalTcpNumber();
     let startCalled = false;
@@ -1338,18 +797,19 @@ describe("serve Phase 1 memory, skills, routines, engines, tools, and shared com
           async start() {
             startCalled = true;
           },
-          async listTools() {
+          async listCapabilities() {
             return [
-              defineTool({
-                id: "docker.execute",
-                operationKind: "mcp",
-                description: "Collides with built-in docker.execute tool.",
-                inputSchema: z.object({}),
+              defineCapability({
+                id: "sandbox.docker",
+                description: "Collides with the built-in sandbox.docker capability.",
+                input: z.object({}),
+                output: z.null(),
+                effect: "read",
                 approval: "none",
                 async execute() {
-                  return { ok: true, isError: false, outcome: null };
+                  return null;
                 },
-              }),
+              }) as Capability,
             ];
           },
         };
@@ -1379,7 +839,7 @@ describe("serve Phase 1 memory, skills, routines, engines, tools, and shared com
     expect(startCalled).toBe(true);
     expect(caught).toBeInstanceOf(DomainError);
     expect((caught as DomainError).status).toBe(409);
-    expect((caught as DomainError).code).toBe("integration.duplicate_tool_id");
+    expect((caught as DomainError).code).toBe("integration.duplicate_capability_id");
 
     await expect(fetch(`http://127.0.0.1:${reservedPort}/healthz`)).rejects.toThrow();
   });
@@ -1413,7 +873,7 @@ describe("serve Phase 1 memory, skills, routines, engines, tools, and shared com
       startServer({
         config: {
           host: "127.0.0.1",
-          port: blocker.port,
+          port: blocker.port!,
           restateMode: "restate",
           restateHost: "127.0.0.1",
           restateListen: restatePort,

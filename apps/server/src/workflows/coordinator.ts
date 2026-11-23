@@ -12,12 +12,8 @@ import {
 } from "@der/domain";
 import type { ApprovalBroker } from "@der/runtime/engines";
 import {
-  executeApprovedEffectStep,
-  executeEnginePreApprovalStage,
-  finalizeCompletedWithEffectStep,
+  executeEngineStage,
   finalizeDirectRunStep,
-  finalizeInterruptedUncertainStep,
-  finalizeRejectedApprovalStep,
   loadAndStartRunStep,
   persistPendingApprovalStep,
   reconcileApprovalExpiryStep,
@@ -27,6 +23,7 @@ import {
   type DurableWorkflow,
   type WorkflowDeps,
 } from "./run-steps";
+import { executeScriptRoutineStage } from "./script-routine-stage";
 
 export interface AwakeableHandle {
   readonly id: string;
@@ -92,7 +89,6 @@ export function createRunCoordinator(options: RunCoordinatorOptions): RunCoordin
     driver: CoordinatorDriver,
     input: AwaitApprovalInput,
     signal?: AbortSignal,
-    stepPrefix = "engine-approval",
   ): Promise<AwaitApprovalOutcome> {
     if (signal?.aborted) {
       throw new Error("Approval request aborted.");
@@ -103,7 +99,7 @@ export function createRunCoordinator(options: RunCoordinatorOptions): RunCoordin
     const nowMs = await currentNowMs(driver);
     const deadline = formatUtcTimestamp(new Date(nowMs + options.approvalTimeoutMs));
 
-    const persisted = await driver.runStep(`persist-${stepPrefix}`, async () => {
+    const persisted = await driver.runStep("persist-approval", async () => {
       const result = await persistPendingApprovalStep(options, {
         run: input.run,
         effect: input.effect,
@@ -135,7 +131,7 @@ export function createRunCoordinator(options: RunCoordinatorOptions): RunCoordin
     if (awakeable) {
       const outcome = await awakeable.wait(remainingMs, signal, persisted.awakeableId);
       if (outcome === "timeout") {
-        decisionStatus = await driver.runStep(`reconcile-${stepPrefix}-expiry`, () =>
+        decisionStatus = await driver.runStep("reconcile-approval-expiry", () =>
           reconcileApprovalExpiryStep(options, {
             run: input.run,
             approvalId: persisted.approvalId,
@@ -166,65 +162,13 @@ export function createRunCoordinator(options: RunCoordinatorOptions): RunCoordin
     }
 
     const run = started.run;
-    const stage = await driver.runStep("engine-pre-approval", () =>
-      executeEnginePreApprovalStage(options, run),
-    );
+    const stage =
+      run.engine === "script"
+        ? await driver.runStep("run-routine-script", () => executeScriptRoutineStage(options, run))
+        : await driver.runStep("run-engine", () => executeEngineStage(options, run));
 
-    if (stage.kind !== "approval_required") {
-      await driver.runStep("finish-direct-run", () =>
-        finalizeDirectRunStep(options, { run, outcome: stage }),
-      );
-      return;
-    }
-
-    const approvalOutcome = await awaitApprovalWithDriver(
-      driver,
-      {
-        run,
-        effect: stage.effect,
-        prompt: stage.prompt,
-      },
-      undefined,
-      "approval",
-    );
-
-    if (approvalOutcome.status !== "approved") {
-      const rejectedStatus = approvalOutcome.status;
-      await driver.runStep("finish-rejected-approval", () =>
-        finalizeRejectedApprovalStep(options, {
-          run,
-          approvalId: approvalOutcome.approvalId,
-          status: rejectedStatus,
-        }),
-      );
-      return;
-    }
-
-    const effectOutcome = await driver.runStep("execute-approved-effect", () =>
-      executeApprovedEffectStep(options, {
-        run,
-        approvalId: approvalOutcome.approvalId,
-        effect: stage.effect,
-      }),
-    );
-
-    if (effectOutcome.kind === "uncertain") {
-      await driver.runStep("interrupt-uncertain-run", () =>
-        finalizeInterruptedUncertainStep(options, {
-          run,
-          effectId: effectOutcome.effectId,
-          detail: effectOutcome.detail,
-        }),
-      );
-      return;
-    }
-
-    await driver.runStep("finish-completed-run", () =>
-      finalizeCompletedWithEffectStep(options, {
-        run,
-        effect: stage.effect,
-        toolResult: effectOutcome.toolResult,
-      }),
+    await driver.runStep("finish-direct-run", () =>
+      finalizeDirectRunStep(options, { run, outcome: stage }),
     );
   }
 

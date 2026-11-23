@@ -17,7 +17,7 @@ import {
   problemDetails,
   sseHeaders,
   utcTimestamp,
-} from "../src/protocol/index";
+} from "@der/domain/protocol";
 
 describe("validate RFC 3339 UTC timestamps", () => {
   it.each([

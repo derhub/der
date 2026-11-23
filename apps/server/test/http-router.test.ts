@@ -1,5 +1,8 @@
 import { describe, expect, it } from "bun:test";
+import * as z from "zod";
 import {
+  CapabilityCatalog,
+  defineCapability,
   PROBLEM_DETAILS_MEDIA_TYPE,
   SSE_CACHE_CONTROL,
   SSE_CONTENT_TYPE,
@@ -14,24 +17,24 @@ import {
   type Routine,
   type RoutineSlot,
   type Run,
+  type RunAdmission,
   type RunEvent,
   type RunStore,
   type RunStreamState,
   type Session,
   type SessionStore,
-  type Tools,
 } from "@der/domain";
 import { compiledParsers } from "@der/domain/compiled";
-import type { SkillCatalog } from "@der/runtime/context";
 import { openSqliteStore } from "@der/storage";
-import { parseServerConfig } from "../src/config";
+import { parseServerConfig } from "#config";
 import {
   createHttpApp,
   type HttpMemoryPort,
   type HttpRoutinePort,
   type HttpRouterDeps,
-} from "../src/http/index";
-import type { DurableWorkflow, RoutineScheduleClient } from "../src/workflows/index";
+  type HttpSkillPort,
+} from "#http/index";
+import type { DurableWorkflow, RoutineScheduleClient } from "#workflows/index";
 import { collectSseFrames } from "./fixtures/restate-harness";
 
 const FIXED_NOW = new Date("2026-11-23T00:00:00.000Z");
@@ -62,11 +65,29 @@ function createMinimalDeps(overrides: Partial<HttpRouterDeps> = {}): HttpRouterD
     botId: bot.id,
     sessionId: session.id,
     origin: "http",
-    idempotencyKey: "idem-1",
     engine: "fixture",
     status: "completed",
+    routineId: null,
+    checkpoint: null,
     createdAt: FIXED_TS,
     updatedAt: FIXED_TS,
+    finishedAt: FIXED_TS,
+  };
+
+  const admission: RunAdmission = {
+    run,
+    initialMessage: {
+      id: "msg-1",
+      botId: bot.id,
+      sessionId: session.id,
+      ordinal: 1,
+      role: "user",
+      parts: [{ type: "text", text: "hello" }],
+      runId: run.id,
+      createdAt: FIXED_TS,
+    },
+    isDuplicate: false,
+    payloadFingerprint: "fp-1",
   };
 
   const events: RunEvent[] = [
@@ -134,7 +155,7 @@ function createMinimalDeps(overrides: Partial<HttpRouterDeps> = {}): HttpRouterD
   };
 
   const runs: RunStore = {
-    admit: async () => ({ run, isDuplicate: false }),
+    admit: async () => admission,
     getRun: (id) => (id === run.id ? run : undefined),
     markRunRunning: async () => run,
     appendRunEvents: async () => [],
@@ -172,6 +193,7 @@ function createMinimalDeps(overrides: Partial<HttpRouterDeps> = {}): HttpRouterD
       throw new Error("not used");
     },
     getEffect: () => undefined,
+    findWriteInDoubt: () => undefined,
   };
 
   const memoryRecord: MemoryRecord = {
@@ -203,6 +225,7 @@ function createMinimalDeps(overrides: Partial<HttpRouterDeps> = {}): HttpRouterD
     revision: 1,
     engine: "fixture",
     prompt: "Check status",
+    script: null,
     createdAt: FIXED_TS,
     updatedAt: FIXED_TS,
   };
@@ -213,7 +236,7 @@ function createMinimalDeps(overrides: Partial<HttpRouterDeps> = {}): HttpRouterD
     listSlots: (): RoutineSlot[] => [],
   };
 
-  const skills: SkillCatalog = {
+  const skills: HttpSkillPort = {
     loadCatalog: async () => ({
       skills: [
         {
@@ -236,13 +259,10 @@ function createMinimalDeps(overrides: Partial<HttpRouterDeps> = {}): HttpRouterD
     readSkillBody: async () => "Read open alerts.",
   };
 
-  const tools: Tools = {
-    list: async () => [],
-    invoke: async () => ({ ok: true, isError: false, outcome: null }),
-  };
+  const catalog = new CapabilityCatalog();
 
   const workflow: DurableWorkflow = {
-    admit: async () => ({ run, isDuplicate: false }),
+    admit: async () => admission,
     decide: async (decision): Promise<Approval> => ({
       id: decision.approvalId,
       botId: decision.botId,
@@ -258,11 +278,10 @@ function createMinimalDeps(overrides: Partial<HttpRouterDeps> = {}): HttpRouterD
       prompt: "Approve?",
       awakeable: "awk-1",
       deadline: FIXED_TS,
-      decision: {
-        status: decision.status,
-        actor: decision.actor,
-        decidedAt: decision.decidedAt,
-      },
+      decision:
+        decision.status === "expired"
+          ? { status: "expired", decidedAt: decision.decidedAt }
+          : { status: decision.status, actor: decision.actor, decidedAt: decision.decidedAt },
       createdAt: FIXED_TS,
       updatedAt: FIXED_TS,
     }),
@@ -273,6 +292,12 @@ function createMinimalDeps(overrides: Partial<HttpRouterDeps> = {}): HttpRouterD
       routine: { ...routine, id: routineId },
       nextSlot: FIXED_TS,
     }),
+    tick: async () => {
+      throw new Error("tick is not used by the router");
+    },
+    inspect: async () => {
+      throw new Error("inspect is not used by the router");
+    },
   };
 
   const engines = new Map<EngineKind, Engine>([
@@ -293,7 +318,7 @@ function createMinimalDeps(overrides: Partial<HttpRouterDeps> = {}): HttpRouterD
     memory,
     routines,
     skills,
-    tools,
+    catalog,
     workflow,
     routineSchedule,
     engines,
@@ -374,6 +399,49 @@ describe("serve Hono HTTP router on narrow domain ports", () => {
     expect(compiledParsers.problemDetails.parse(await notFoundRes.json()).code).toBe(
       "http.not_found",
     );
+  });
+
+  it("lists the catalog on GET /api/capabilities", async () => {
+    const catalog = new CapabilityCatalog();
+    catalog.add(
+      defineCapability({
+        id: "notes.append",
+        description: "Append a note.",
+        input: z.object({ text: z.string() }),
+        output: z.object({ count: z.number() }),
+        effect: "write",
+        approval: "always",
+        execute: async () => ({ count: 1 }),
+      }) as never,
+    );
+    const app = createHttpApp(createMinimalDeps({ catalog }));
+
+    const listed = await app.fetch(new Request("http://localhost/api/capabilities"));
+
+    expect(listed.status).toBe(200);
+    expect(await listed.json()).toEqual({
+      capabilities: [
+        {
+          id: "notes.append",
+          description: "Append a note.",
+          effect: "write",
+          requiresApproval: true,
+          inputSchema: {
+            $schema: "https://json-schema.org/draft/2020-12/schema",
+            type: "object",
+            properties: { text: { type: "string" } },
+            required: ["text"],
+          },
+          outputSchema: {
+            $schema: "https://json-schema.org/draft/2020-12/schema",
+            type: "object",
+            properties: { count: { type: "number" } },
+            required: ["count"],
+            additionalProperties: false,
+          },
+        },
+      ],
+    });
   });
 
   it("accepts explicit origin http and omitted origin with matching idempotency fingerprint on POST /api/sessions/:sessionId/runs", async () => {

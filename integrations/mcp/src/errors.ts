@@ -1,13 +1,9 @@
-import type { EffectIdentity } from "@der/domain";
-
 export class ToolEffectUncertainError extends Error {
   readonly code = "effect.outcome_uncertain";
-  readonly effect: EffectIdentity;
 
-  constructor(effect: EffectIdentity, message: string) {
+  constructor(message: string) {
     super(message);
     this.name = "ToolEffectUncertainError";
-    this.effect = effect;
   }
 }
 

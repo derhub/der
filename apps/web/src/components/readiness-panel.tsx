@@ -14,7 +14,7 @@ import {
 } from "@astryxdesign/core/theme/tokens.stylex";
 import * as stylex from "@stylexjs/stylex";
 import { CheckCircle2Icon, RefreshCwIcon, ShieldAlertIcon, WrenchIcon } from "lucide-react";
-import type { EngineReadiness, ProblemDetails, ToolDescriptor } from "@der/domain";
+import type { CapabilityDescriptor, EngineReadiness, ProblemDetails } from "@der/domain";
 import { ProblemAlert } from "@/components/problem-alert";
 import type { HealthResponse } from "@/lib/schemas";
 
@@ -131,7 +131,7 @@ const styles = stylex.create({
 export interface ReadinessPanelProps {
   readonly health: HealthResponse | null;
   readonly engines: readonly EngineReadiness[];
-  readonly tools: readonly ToolDescriptor[];
+  readonly capabilities: readonly CapabilityDescriptor[];
   readonly loading: boolean;
   readonly problem: ProblemDetails | null;
   readonly onRefresh: () => void;
@@ -149,10 +149,21 @@ function unattendedBadgeVariant(state: EngineReadiness["unattended"]): BadgeVari
   return "error";
 }
 
+function groupByNamespace(
+  capabilities: readonly CapabilityDescriptor[],
+): Array<[string, CapabilityDescriptor[]]> {
+  const groups = new Map<string, CapabilityDescriptor[]>();
+  for (const capability of capabilities) {
+    const namespace = capability.id.split(".")[0] ?? capability.id;
+    groups.set(namespace, [...(groups.get(namespace) ?? []), capability]);
+  }
+  return [...groups];
+}
+
 export function ReadinessPanel({
   health,
   engines,
-  tools,
+  capabilities,
   loading,
   problem,
   onRefresh,
@@ -161,7 +172,7 @@ export function ReadinessPanel({
     <div {...stylex.props(styles.root)}>
       <div {...stylex.props(styles.header)}>
         <div {...stylex.props(styles.titleGroup)}>
-          <Heading level={2}>Readiness and host tools</Heading>
+          <Heading level={2}>Readiness and capabilities</Heading>
           <Text type="supporting" as="p">
             Server process health, rootless sandbox isolation verification, and BYO engine
             eligibility.
@@ -269,41 +280,53 @@ export function ReadinessPanel({
         )}
       </section>
 
-      <section aria-labelledby="tools-heading" {...stylex.props(styles.section)}>
-        <Heading level={3} id="tools-heading">
-          Registered host tools ({tools.length})
+      <section aria-labelledby="capabilities-heading" {...stylex.props(styles.section)}>
+        <Heading level={3} id="capabilities-heading">
+          Capabilities ({capabilities.length})
         </Heading>
-        {tools.length === 0 ? (
+        {capabilities.length === 0 ? (
           <EmptyState
             icon={<WrenchIcon {...stylex.props(styles.iconLg)} aria-hidden="true" />}
-            title="No host tools registered"
-            description="Configure MCP servers, Docker, or Wasmer tools on the server."
+            title="No capabilities registered"
+            description="Configure capability sources on the server."
           />
         ) : (
-          <div {...stylex.props(styles.cardGrid)}>
-            {tools.map((tool) => (
-              <Card key={`${tool.kind}:${tool.id}`}>
-                <div {...stylex.props(styles.toolCard)}>
-                  <div {...stylex.props(styles.rowBetweenWrap)}>
-                    <Heading level={4}>{tool.name}</Heading>
-                    <div {...stylex.props(styles.toolBadges)}>
-                      <Badge variant="neutral" label={tool.kind} />
-                      <Badge
-                        variant={tool.requiresApproval ? "warning" : "success"}
-                        label={tool.requiresApproval ? "Approval required" : "Read-only"}
-                      />
+          groupByNamespace(capabilities).map(([namespace, group]) => (
+            <section
+              key={namespace}
+              aria-labelledby={`capabilities-${namespace}`}
+              {...stylex.props(styles.section)}
+            >
+              <Heading level={4} id={`capabilities-${namespace}`}>
+                {namespace}
+              </Heading>
+              <div {...stylex.props(styles.cardGrid)}>
+                {group.map((capability) => (
+                  <Card key={capability.id}>
+                    <div {...stylex.props(styles.toolCard)}>
+                      <div {...stylex.props(styles.rowBetweenWrap)}>
+                        <Text type="code" weight="semibold">
+                          {capability.id}
+                        </Text>
+                        <div {...stylex.props(styles.toolBadges)}>
+                          <Badge variant="neutral" label={capability.effect} />
+                          <Badge
+                            variant={capability.requiresApproval ? "warning" : "success"}
+                            label={
+                              capability.requiresApproval ? "Approval required" : "No approval"
+                            }
+                          />
+                        </div>
+                      </div>
+                      <Text type="supporting" as="p">
+                        {capability.description}
+                      </Text>
                     </div>
-                  </div>
-                  <Text type="code" color="secondary" as="p">
-                    {tool.id}
-                  </Text>
-                  <Text type="supporting" as="p">
-                    {tool.description}
-                  </Text>
-                </div>
-              </Card>
-            ))}
-          </div>
+                  </Card>
+                ))}
+              </div>
+            </section>
+          ))
         )}
       </section>
     </div>
