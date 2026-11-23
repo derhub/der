@@ -7,7 +7,8 @@
     ".": "./src/index.ts",
     "./sandbox": "./src/sandbox/index.ts",
     "./engines": "./src/engines/index.ts",
-    "./context": "./src/context/index.ts"
+    "./context": "./src/context/index.ts",
+    "./guest-pin": "./src/script/guest-pin.ts"
   },
   "scripts": {
     "test": "bun test"

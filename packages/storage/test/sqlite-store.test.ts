@@ -13,7 +13,7 @@ import {
   OUTBOX_DESTINATIONS_MIGRATION,
   type SqliteStore,
   type StorageMigration,
-} from "../src/index";
+} from "@der/storage";
 
 const tempDirs: string[] = [];
 

@@ -10,10 +10,10 @@ import type { SkillCatalog } from "@der/runtime/context";
 import { openSqliteStore, type SqliteStore } from "@der/storage";
 import { openSqliteMemory } from "@der/storage/memory";
 import { openSqliteRoutines } from "@der/storage/routines";
-import { parseServerConfig } from "../src/config";
-import { createHostCapabilities } from "../src/capabilities/index";
-import { createHttpApp } from "../src/http/index";
-import { createDirectRoutineScheduleClient } from "../src/workflows/index";
+import { parseServerConfig } from "#config";
+import { createHostCapabilities } from "#capabilities/index";
+import { createHttpApp } from "#http/index";
+import { createDirectRoutineScheduleClient } from "#workflows/index";
 
 const NOW = new Date("2026-11-23T00:00:00.000Z");
 

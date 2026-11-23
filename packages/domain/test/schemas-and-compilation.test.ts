@@ -2,7 +2,7 @@ import { readdirSync, readFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { describe, expect, it } from "vite-plus/test";
 import * as z from "zod";
-import { compiledParsers } from "../src/compiled/index";
+import { compiledParsers } from "@der/domain/compiled";
 import {
   defineCapability,
   defineIntegration,
@@ -21,9 +21,9 @@ import {
   type Store,
   type Workflow,
   type WorkflowDriver,
-} from "../src/interfaces/index";
-import type { Memory as MemoryCapability } from "../src/interfaces/memory";
-import { cloudEvent, DomainError, problemDetails, utcTimestamp } from "../src/protocol/index";
+} from "@der/domain/interfaces";
+import type { Memory as MemoryCapability } from "@der/domain/memory";
+import { cloudEvent, DomainError, problemDetails, utcTimestamp } from "@der/domain/protocol";
 import {
   approval,
   approvalDecision,
@@ -47,8 +47,8 @@ import {
   runRequest,
   session,
   skill,
-} from "../src/schemas/index";
-import { memoryRecord as standaloneMemoryRecord } from "../src/schemas/memory";
+} from "@der/domain/schemas";
+import { memoryRecord as standaloneMemoryRecord } from "@der/domain/memory/schema";
 
 const fixtures = {
   utc: "2026-11-22T15:00:00Z",

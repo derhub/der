@@ -10,8 +10,8 @@ import {
   verifyInstalledSdkApis,
   type EngineAuthProbeResult,
   type EngineDoctorConfig,
-} from "../../src/engines/index";
-import type { CommandExecResult, CommandRunner } from "../../src/sandbox/index";
+} from "@der/runtime/engines";
+import type { CommandExecResult, CommandRunner } from "@der/runtime/sandbox";
 
 function createDoctorRunner(responses: {
   readonly dockerInfo?: CommandExecResult;

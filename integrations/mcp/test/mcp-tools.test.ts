@@ -8,7 +8,7 @@ import {
   ToolConfigurationError,
   ToolEffectUncertainError,
   type McpServerConfig,
-} from "../src/index";
+} from "@der/mcp";
 
 const closers: (() => Promise<void> | void)[] = [];
 

@@ -12,8 +12,8 @@ import {
   type Session,
 } from "@der/domain";
 import { compiledParsers } from "@der/domain/compiled";
-import { handleRunEventsSse } from "../src/http/sse";
-import { startServer, type RunningServer } from "../src/main";
+import { handleRunEventsSse } from "#http/sse";
+import { startServer, type RunningServer } from "#main";
 import {
   collectSseFrames,
   createTempDatabase,

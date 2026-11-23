@@ -3,7 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "bun:test";
 import type { ExecuteResult } from "@der/domain";
-import { openSqliteScriptRuns, openSqliteStore, type SqliteStore } from "../src/index";
+import { openSqliteScriptRuns, openSqliteStore, type SqliteStore } from "@der/storage";
 
 const tempDirs: string[] = [];
 

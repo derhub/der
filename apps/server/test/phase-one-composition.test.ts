@@ -20,8 +20,8 @@ import {
 } from "@der/domain";
 import { compiledParsers } from "@der/domain/compiled";
 import type { CommandExecOptions, CommandRunner, CommandSpawnHandle } from "@der/runtime/sandbox";
-import { parseServerConfig } from "../src/config";
-import { startServer } from "../src/main";
+import { parseServerConfig } from "#config";
+import { startServer } from "#main";
 import { allocateLocalTcpNumber, createTempDatabase, waitUntil } from "./fixtures/restate-harness";
 
 const cleanups: (() => Promise<void> | void)[] = [];

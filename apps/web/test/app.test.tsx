@@ -2,7 +2,7 @@ import { render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { describe, expect, it } from "vite-plus/test";
 import { formatSseEvent, PROBLEM_DETAILS_MEDIA_TYPE, type Message } from "@der/domain";
-import { App } from "../src/App";
+import { App } from "@/App";
 
 function parseJsonRequestBody(init: RequestInit | undefined): Record<string, unknown> {
   if (typeof init?.body !== "string" || init.body.length === 0) {

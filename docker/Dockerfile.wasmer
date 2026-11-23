@@ -21,8 +21,6 @@ RUN bun install --frozen-lockfile
 
 COPY packages/domain/ packages/domain/
 COPY packages/runtime/ packages/runtime/
-COPY docker/wasmer-runner.ts /app/docker/wasmer-runner.ts
-RUN ln -s /app/docker/wasmer-runner.ts /app/wasmer-runner.ts
 
 RUN mkdir -p /guests/cache /work \
   && bun -e 'async function dl(url: string, dest: string) { const res = await fetch(url); if (!res.ok) throw new Error(`${url}: HTTP ${res.status}`); await Bun.write(dest, new Uint8Array(await res.arrayBuffer())); } await Promise.all([dl(process.env["WASMER_BASH_URL"]!, "/guests/bash-1.0.25.webc"), dl(process.env["WASMER_PYTHON_URL"]!, "/guests/python-3.13.20.webc")]);' \
@@ -36,4 +34,4 @@ USER 1000:1000
 
 ENV DER_WASMER_ALLOWED_ROOTS=/work
 
-ENTRYPOINT ["bun", "run", "/app/wasmer-runner.ts"]
+ENTRYPOINT ["bun", "run", "/app/packages/runtime/src/sandbox/wasmer-runner.ts"]

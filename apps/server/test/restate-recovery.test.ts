@@ -6,7 +6,7 @@ import {
   type RunAdmission,
 } from "@der/domain";
 import { compiledParsers } from "@der/domain/compiled";
-import { startServer, type RunningServer } from "../src/main";
+import { startServer, type RunningServer } from "#main";
 import {
   allocateLocalTcpNumber,
   collectSseFrames,

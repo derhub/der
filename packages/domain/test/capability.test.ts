@@ -5,7 +5,7 @@ import {
   defineIntegration,
   IntegrationRegistry,
   type Capability,
-} from "../src/index";
+} from "@der/domain";
 
 const appendNote = defineCapability({
   id: "notes.append",

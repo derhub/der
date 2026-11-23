@@ -11,11 +11,11 @@ import {
   type Run,
 } from "@der/domain";
 import type { AnyTool } from "@tanstack/ai";
-import { createExecuteTool } from "../src/code-mode/execute";
-import { codeModeInstructions } from "../src/code-mode/instructions";
-import { createSearchTool } from "../src/code-mode/search";
-import { createFixtureCapabilities } from "../src/capabilities/fixture";
-import { startServer, type RunningServer } from "../src/main";
+import { createExecuteTool } from "#code-mode/execute";
+import { codeModeInstructions } from "#code-mode/instructions";
+import { createSearchTool } from "#code-mode/search";
+import { createFixtureCapabilities } from "#capabilities/fixture";
+import { startServer, type RunningServer } from "#main";
 import { createTempDatabase, waitUntil } from "./fixtures/restate-harness";
 import {
   admitOwningRun,

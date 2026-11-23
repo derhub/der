@@ -4,13 +4,13 @@ import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "nod
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { JsonValue } from "@der/domain";
-import { QUICKJS_GUEST_PIN } from "../../src/script/guest-pin";
+import { QUICKJS_GUEST_PIN } from "@der/runtime/guest-pin";
 import {
   runScript,
   ScriptRunnerError,
   type ScriptCallReply,
   type ScriptLimits,
-} from "../../src/script/script-runner";
+} from "@der/runtime";
 
 const START = 1_795_000_000_000;
 const MB = 1024 * 1024;

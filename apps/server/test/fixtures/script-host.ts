@@ -4,8 +4,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import * as z from "zod";
 import { CapabilityCatalog, defineCapability, type Capability, type Run } from "@der/domain";
-import { createFixtureCapabilities, type FixtureCall } from "../../src/capabilities/fixture";
-import type { RunningServer } from "../../src/main";
+import { createFixtureCapabilities, type FixtureCall } from "#capabilities/fixture";
+import type { RunningServer } from "#main";
 
 const GUEST_DIGEST = "sha256:0795ae56bbe46ac61429c42ade4f8ad69b393ff6b88f372f8298cff233d03d2c";
 

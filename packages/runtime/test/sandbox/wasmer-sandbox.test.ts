@@ -18,7 +18,7 @@ import {
   type WasmerGuestPin,
   type WasmerLaunchConfig,
   type WasmerRunOutput,
-} from "../../src/sandbox/index";
+} from "@der/runtime/sandbox";
 
 const tempDirs: string[] = [];
 const identityRealPath = (path: string): string => path;

@@ -3,12 +3,12 @@ import { mkdtempSync, readdirSync, readFileSync, rmSync, unlinkSync, writeFileSy
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DomainError } from "@der/domain";
-import { openSqliteStore } from "../../src/index";
+import { openSqliteStore } from "@der/storage";
 import {
   createMemoryProjection,
   MEMORY_ROUTINE_SLOTS_MIGRATION,
   openSqliteMemory,
-} from "../../src/memory/index";
+} from "@der/storage/memory";
 
 const tempDirs: string[] = [];
 

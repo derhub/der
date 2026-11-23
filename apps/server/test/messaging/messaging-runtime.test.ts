@@ -10,9 +10,9 @@ import type {
   RunAdmission,
 } from "@der/domain";
 import { openSqliteStore, type SqliteStore } from "@der/storage";
-import { parseServerConfig } from "../../src/config";
-import { startServer } from "../../src/main";
-import { createOutboxSender } from "../../src/messaging/index";
+import { parseServerConfig } from "#config";
+import { startServer } from "#main";
+import { createOutboxSender } from "#messaging/index";
 import { createTempDatabase } from "../fixtures/restate-harness";
 import { ensureScriptGuest } from "../fixtures/script-host";
 

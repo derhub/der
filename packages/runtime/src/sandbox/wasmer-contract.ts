@@ -29,7 +29,7 @@ export const WASMER_RUNNER_CONTRACT: WasmerRunnerContract = {
   imageTarget: "der-wasmer-runner",
   dockerfilePath: "docker/Dockerfile.wasmer",
   guestRoot: "/guests",
-  runnerEntrypoint: ["bun", "run", "/app/wasmer-runner.ts"],
+  runnerEntrypoint: ["bun", "run", "/app/packages/runtime/src/sandbox/wasmer-runner.ts"],
   networkMode: "disabled",
   guests: {
     bash: {

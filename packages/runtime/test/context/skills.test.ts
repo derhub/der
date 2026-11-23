@@ -3,7 +3,7 @@ import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DomainError } from "@der/domain";
-import { createSkillCatalog } from "../../src/context/index";
+import { createSkillCatalog } from "@der/runtime/context";
 
 const tempDirs: string[] = [];
 

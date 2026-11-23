@@ -3,9 +3,9 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DomainError } from "@der/domain";
-import { openSqliteStore } from "../../src/index";
-import { MEMORY_ROUTINE_SLOTS_MIGRATION } from "../../src/memory/index";
-import { openSqliteRoutines } from "../../src/routines/index";
+import { openSqliteStore } from "@der/storage";
+import { MEMORY_ROUTINE_SLOTS_MIGRATION } from "@der/storage/memory";
+import { openSqliteRoutines } from "@der/storage/routines";
 
 const tempDirs: string[] = [];
 

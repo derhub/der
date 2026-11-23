@@ -13,7 +13,7 @@ import {
   createClaudeCodeEngine,
   createCodexEngine,
   type ApprovalBroker,
-} from "../../src/engines/index";
+} from "@der/runtime/engines";
 
 function makeRun(overrides?: Partial<Run>): Run {
   return {

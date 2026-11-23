@@ -1,9 +1,5 @@
-import { compiledParsers } from "../packages/domain/src/compiled/index";
-import {
-  createSdkWasmerDriver,
-  createWasmerSandbox,
-  WASMER_RUNNER_CONTRACT,
-} from "../packages/runtime/src/sandbox/index";
+import { compiledParsers } from "@der/domain/compiled";
+import { createSdkWasmerDriver, createWasmerSandbox, WASMER_RUNNER_CONTRACT } from "./index";
 
 async function readRequestPayload(): Promise<string> {
   const flagIndex = process.argv.indexOf("--request-json");

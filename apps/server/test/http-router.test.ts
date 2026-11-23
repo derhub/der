@@ -26,15 +26,15 @@ import {
 } from "@der/domain";
 import { compiledParsers } from "@der/domain/compiled";
 import { openSqliteStore } from "@der/storage";
-import { parseServerConfig } from "../src/config";
+import { parseServerConfig } from "#config";
 import {
   createHttpApp,
   type HttpMemoryPort,
   type HttpRoutinePort,
   type HttpRouterDeps,
   type HttpSkillPort,
-} from "../src/http/index";
-import type { DurableWorkflow, RoutineScheduleClient } from "../src/workflows/index";
+} from "#http/index";
+import type { DurableWorkflow, RoutineScheduleClient } from "#workflows/index";
 import { collectSseFrames } from "./fixtures/restate-harness";
 
 const FIXED_NOW = new Date("2026-11-23T00:00:00.000Z");

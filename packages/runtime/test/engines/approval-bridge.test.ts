@@ -7,7 +7,7 @@ import {
   createDurableApprovalBridgeProvisioner,
   type ApprovalBroker,
   type ApprovalDecisionOutcome,
-} from "../../src/engines/index";
+} from "@der/runtime/engines";
 
 function sampleAcpPermissionRequest(
   overrides?: Partial<AcpPermissionRequest>,

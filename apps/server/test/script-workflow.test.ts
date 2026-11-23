@@ -1,6 +1,6 @@
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "bun:test";
 import { formatUtcTimestamp } from "@der/domain";
-import { startServer, type RunningServer } from "../src/main";
+import { startServer, type RunningServer } from "#main";
 import { createTempDatabase, waitUntil } from "./fixtures/restate-harness";
 import {
   admitOwningRun,

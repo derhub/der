@@ -15,7 +15,7 @@ import {
   type CommandRunner,
   type CommandSpawnHandle,
   type DockerContainerSpec,
-} from "../../src/sandbox/index";
+} from "@der/runtime/sandbox";
 
 const tempDirs: string[] = [];
 
