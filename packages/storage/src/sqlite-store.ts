@@ -72,10 +72,8 @@ import {
   type UpsertChannelBindingInput,
 } from "./channel-outbox";
 import {
-  dropEngineSession as dropEngineSessionCommand,
   getEngineSession as getEngineSessionQuery,
-  markEngineSessionPending as markEngineSessionPendingCommand,
-  saveEngineSession as saveEngineSessionCommand,
+  takeEngineSession as takeEngineSessionCommand,
 } from "./engine-sessions";
 import { SqliteDatabase, type SqliteDatabaseOptions } from "./database";
 import { notFoundError, validationError } from "./errors";
@@ -419,19 +417,11 @@ export class SqliteStore
   }
 
   getEngineSession(sessionId: SessionId, engine: EngineKind): EngineSession | null {
-    return getEngineSessionQuery(this.database, sessionId, engine);
+    return getEngineSessionQuery(this.database.db, sessionId, engine);
   }
 
-  markEngineSessionPending(sessionId: SessionId, engine: EngineKind, runId: RunId): void {
-    markEngineSessionPendingCommand(this.database, sessionId, engine, runId);
-  }
-
-  saveEngineSession(row: Omit<EngineSession, "pendingRunId" | "updatedAt">): void {
-    saveEngineSessionCommand(this.database.db, row, this.nowUtc());
-  }
-
-  dropEngineSession(sessionId: SessionId, engine: EngineKind): void {
-    dropEngineSessionCommand(this.database, sessionId, engine);
+  takeEngineSession(sessionId: SessionId, engine: EngineKind): EngineSession | null {
+    return takeEngineSessionCommand(this.database, sessionId, engine);
   }
 
   listSessionRuns(sessionId: SessionId): Run[] {

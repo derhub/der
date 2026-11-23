@@ -2,6 +2,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "bun:test";
+import type { EngineSessionInput, FinishRunInput } from "@der/domain";
 import { openSqliteStore, type SqliteStore } from "@der/storage";
 
 const tempDirs: string[] = [];
@@ -15,222 +16,167 @@ afterEach(() => {
 function openStore(): SqliteStore {
   const dir = mkdtempSync(join(tmpdir(), "der-engine-sessions-"));
   tempDirs.push(dir);
-  return openSqliteStore({
+  const store = openSqliteStore({
     filename: join(dir, "der.sqlite"),
     now: () => new Date("2026-03-04T05:06:07.000Z"),
   });
-}
-
-function seed(store: SqliteStore) {
   const bot = store.createBot({
     id: "bot-es",
     name: "Engine Session Bot",
     persona: "p",
     defaultEngine: "fixture",
-    allowedEngines: ["fixture", "codex"],
+    allowedEngines: ["fixture", "codex", "claude-code"],
   });
   store.createSession({ id: "sess-a", botId: bot.id, title: "A" });
   store.createSession({ id: "sess-b", botId: bot.id, title: "B" });
+  return store;
 }
 
-const rowA = {
+const rowA: EngineSessionInput = {
   sessionId: "sess-a",
   engine: "codex",
   vendorSessionId: "vendor-1",
   baseHash: "base-1",
   contextHash: "ctx-1",
   lastOrdinal: 4,
-} as const;
+};
 
-describe("engine session round trip", () => {
-  it("returns the saved row, replaces it on a second save and leaves another engine untouched", () => {
-    const store = openStore();
-    try {
-      seed(store);
-      expect(store.getEngineSession("sess-a", "codex")).toBeNull();
-
-      store.saveEngineSession(rowA);
-      store.saveEngineSession({ ...rowA, engine: "claude-code", vendorSessionId: "vendor-cc" });
-      expect(store.getEngineSession("sess-a", "codex")).toEqual({
-        ...rowA,
-        pendingRunId: null,
-        updatedAt: "2026-03-04T05:06:07.000Z",
-      });
-
-      store.saveEngineSession({
-        ...rowA,
-        vendorSessionId: "vendor-2",
-        contextHash: "ctx-2",
-        lastOrdinal: 9,
-      });
-      expect(store.getEngineSession("sess-a", "codex")).toEqual({
-        ...rowA,
-        vendorSessionId: "vendor-2",
-        contextHash: "ctx-2",
-        lastOrdinal: 9,
-        pendingRunId: null,
-        updatedAt: "2026-03-04T05:06:07.000Z",
-      });
-      expect(store.getEngineSession("sess-a", "claude-code")?.vendorSessionId).toBe("vendor-cc");
-    } finally {
-      store.close();
-    }
+async function admitRun(store: SqliteStore, row: EngineSessionInput): Promise<string> {
+  const { run } = await store.admit({
+    botId: "bot-es",
+    sessionId: row.sessionId,
+    origin: "http",
+    idempotencyKey: `${row.sessionId}:${row.engine}`,
+    engine: row.engine,
+    input: { parts: [{ type: "text", text: "hello" }] },
   });
-});
+  return run.id;
+}
 
-describe("engine session pending", () => {
-  it("marks an existing row pending, ignores a missing row and clears on save", () => {
-    const store = openStore();
-    try {
-      seed(store);
-      store.markEngineSessionPending("sess-a", "codex", "run-1");
-      expect(store.getEngineSession("sess-a", "codex")).toBeNull();
+function completion(runId: string, row: EngineSessionInput): FinishRunInput {
+  return {
+    runId,
+    status: "completed",
+    terminalEvent: { chunkKey: `${runId}:terminal`, chunk: { type: "RUN_FINISHED" } },
+    engineSession: row,
+  };
+}
 
-      store.saveEngineSession(rowA);
-      store.markEngineSessionPending("sess-a", "codex", "run-1");
-      expect(store.getEngineSession("sess-a", "codex")?.pendingRunId).toBe("run-1");
+async function finishWithEngineSession(store: SqliteStore, row: EngineSessionInput) {
+  await store.finishRun(completion(await admitRun(store, row), row));
+}
 
-      store.saveEngineSession({ ...rowA, lastOrdinal: 6 });
-      expect(store.getEngineSession("sess-a", "codex")?.pendingRunId).toBeNull();
-    } finally {
-      store.close();
-    }
-  });
-});
-
-describe("engine session save from an older finish", () => {
-  it.each([
-    { case: "an equal last ordinal", lastOrdinal: 9 },
-    { case: "a lower last ordinal", lastOrdinal: 4 },
-  ])("keeps the stored row and its pending mark on $case", ({ lastOrdinal }) => {
-    const store = openStore();
-    try {
-      seed(store);
-      store.saveEngineSession({ ...rowA, vendorSessionId: "vendor-new", lastOrdinal: 9 });
-      store.markEngineSessionPending("sess-a", "codex", "run-3");
-
-      store.saveEngineSession({
-        ...rowA,
-        vendorSessionId: "vendor-old",
-        contextHash: "ctx-old",
-        lastOrdinal,
-      });
-
-      expect(store.getEngineSession("sess-a", "codex")).toEqual({
-        ...rowA,
-        vendorSessionId: "vendor-new",
-        lastOrdinal: 9,
-        pendingRunId: "run-3",
-        updatedAt: "2026-03-04T05:06:07.000Z",
-      });
-    } finally {
-      store.close();
-    }
-  });
-});
-
-describe("save the engine session with the Run's finish", () => {
-  async function admitCodexRun(store: SqliteStore) {
-    const { run } = await store.admit({
-      botId: "bot-es",
-      sessionId: "sess-a",
-      origin: "http",
-      idempotencyKey: "finish-with-session",
-      engine: "codex",
-      input: { parts: [{ type: "text", text: "hello" }] },
-    });
-    return run.id;
-  }
-
+describe("store the engine session with the Run's finish", () => {
   it("writes the completed Run, its reply and the engine session at the reply's ordinal", async () => {
     const store = openStore();
     try {
-      seed(store);
-      const runId = await admitCodexRun(store);
-      store.saveEngineSession({ ...rowA, lastOrdinal: 0 });
-      store.markEngineSessionPending("sess-a", "codex", runId);
+      const runId = await admitRun(store, rowA);
 
       await store.finishRun({
-        runId,
-        status: "completed",
-        terminalEvent: { chunkKey: `${runId}:terminal`, chunk: { type: "RUN_FINISHED" } },
+        ...completion(runId, { ...rowA, lastOrdinal: 1 }),
         finalMessageParts: [{ type: "text", text: "hi" }],
-        engineSession: { ...rowA, vendorSessionId: "vendor-2", lastOrdinal: 1 },
       });
 
       expect([store.getRun(runId)?.status, store.getEngineSession("sess-a", "codex")]).toEqual([
         "completed",
-        {
-          ...rowA,
-          vendorSessionId: "vendor-2",
-          lastOrdinal: 2,
-          pendingRunId: null,
-          updatedAt: "2026-03-04T05:06:07.000Z",
-        },
+        { ...rowA, lastOrdinal: 2, updatedAt: "2026-03-04T05:06:07.000Z" },
       ]);
     } finally {
       store.close();
     }
   });
 
-  it("leaves the Run unfinished and the engine session unchanged when the session row is rejected", async () => {
+  it("writes nothing when a replayed finish finds the Run already terminal", async () => {
     const store = openStore();
     try {
-      seed(store);
-      const runId = await admitCodexRun(store);
-      store.saveEngineSession({ ...rowA, lastOrdinal: 0 });
-      store.markEngineSessionPending("sess-a", "codex", runId);
+      const runId = await admitRun(store, rowA);
+      await store.finishRun(completion(runId, rowA));
+      store.takeEngineSession("sess-a", "codex");
 
-      const failure = await store
-        .finishRun({
-          runId,
-          status: "completed",
-          terminalEvent: { chunkKey: `${runId}:terminal`, chunk: { type: "RUN_FINISHED" } },
-          engineSession: { ...rowA, vendorSessionId: "vendor-2", lastOrdinal: -1 },
-        })
-        .then(
-          () => "finished",
-          (error: unknown) => (error instanceof Error ? error.message : String(error)),
-        );
+      await store.finishRun(completion(runId, rowA));
+
+      expect(store.getEngineSession("sess-a", "codex")).toBeNull();
+    } finally {
+      store.close();
+    }
+  });
+
+  it("leaves the Run unfinished and stores no engine session when the session row is rejected", async () => {
+    const store = openStore();
+    try {
+      const runId = await admitRun(store, rowA);
+
+      const failure = await store.finishRun(completion(runId, { ...rowA, lastOrdinal: -1 })).then(
+        () => "finished",
+        (error: unknown) => (error instanceof Error ? error.message : String(error)),
+      );
 
       expect([
         failure,
         store.getRun(runId)?.status,
         store.readRunEventsAfter(runId, 0, 10),
         store.getEngineSession("sess-a", "codex"),
-      ]).toEqual([
-        "CHECK constraint failed: last_ordinal >= 0",
-        "queued",
-        [],
-        {
-          ...rowA,
-          lastOrdinal: 0,
-          pendingRunId: runId,
-          updatedAt: "2026-03-04T05:06:07.000Z",
-        },
-      ]);
+      ]).toEqual(["CHECK constraint failed: last_ordinal >= 0", "queued", [], null]);
     } finally {
       store.close();
     }
   });
 });
 
-describe("engine session drop", () => {
-  it("drops one engine row and deleting the session removes all of its rows", () => {
+describe("take the engine session when a Run plans its turn", () => {
+  it("returns the engine's row and deletes every row of that session only", async () => {
     const store = openStore();
     try {
-      seed(store);
-      store.saveEngineSession(rowA);
-      store.saveEngineSession({ ...rowA, engine: "claude-code" });
-      store.saveEngineSession({ ...rowA, sessionId: "sess-b" });
+      await finishWithEngineSession(store, rowA);
+      await finishWithEngineSession(store, { ...rowA, engine: "claude-code" });
+      await finishWithEngineSession(store, { ...rowA, sessionId: "sess-b" });
 
-      store.dropEngineSession("sess-a", "codex");
-      expect(store.getEngineSession("sess-a", "codex")).toBeNull();
-      expect(store.getEngineSession("sess-a", "claude-code")?.vendorSessionId).toBe("vendor-1");
+      const taken = store.takeEngineSession("sess-a", "codex");
+
+      expect([
+        taken,
+        store.getEngineSession("sess-a", "codex"),
+        store.getEngineSession("sess-a", "claude-code"),
+        store.getEngineSession("sess-b", "codex")?.vendorSessionId,
+      ]).toEqual([{ ...rowA, updatedAt: "2026-03-04T05:06:07.000Z" }, null, null, "vendor-1"]);
+    } finally {
+      store.close();
+    }
+  });
+
+  it("returns null and still clears the session when this engine has no row", async () => {
+    const store = openStore();
+    try {
+      await finishWithEngineSession(store, { ...rowA, engine: "claude-code" });
+
+      expect([
+        store.takeEngineSession("sess-a", "codex"),
+        store.getEngineSession("sess-a", "claude-code"),
+      ]).toEqual([null, null]);
+    } finally {
+      store.close();
+    }
+  });
+});
+
+describe("delete a session", () => {
+  it("removes its engine sessions and keeps other sessions' rows", async () => {
+    const store = openStore();
+    try {
+      const insert = store.database.db.query(
+        `INSERT INTO engine_sessions
+           (session_id, engine, vendor_session_id, base_hash, context_hash, last_ordinal, updated_at)
+         VALUES (?, 'codex', 'vendor-1', 'base-1', 'ctx-1', 4, '2026-03-04T05:06:07.000Z')`,
+      );
+      insert.run("sess-a");
+      insert.run("sess-b");
 
       store.database.db.query("DELETE FROM sessions WHERE id = ?").run("sess-a");
-      expect(store.getEngineSession("sess-a", "claude-code")).toBeNull();
-      expect(store.getEngineSession("sess-b", "codex")?.vendorSessionId).toBe("vendor-1");
+
+      expect([
+        store.getEngineSession("sess-a", "codex"),
+        store.getEngineSession("sess-b", "codex")?.vendorSessionId,
+      ]).toEqual([null, "vendor-1"]);
     } finally {
       store.close();
     }

@@ -6,13 +6,11 @@ import {
   type ApprovalId,
   type ApprovalResolutionInput,
   type ChannelIntakeMetadata,
-  type ContextMode,
   type EffectId,
   type EffectIdentity,
   type Engine,
   type EngineKind,
-  type EngineSession,
-  type EngineSessionStore,
+  type EngineSessionInput,
   type FinishRunInput,
   type FinishRunOutcome,
   type JsonValue,
@@ -27,7 +25,7 @@ import {
   type UtcTimestamp,
   type Workflow,
 } from "@der/domain";
-import { readRunUsage, readSessionIdChunk } from "@der/runtime/engines";
+import { readRunUsage } from "@der/runtime/engines";
 import type { ScriptRoutineDeps } from "./script-routine-stage";
 
 export interface AwaitApprovalInput {
@@ -51,26 +49,13 @@ export interface DurableWorkflow extends Workflow {
   awaitApproval?(input: AwaitApprovalInput, signal?: AbortSignal): Promise<AwaitApprovalOutcome>;
 }
 
-export type WorkflowStore = RunStore & ApprovalEffectStore & EngineSessionStore;
+export type WorkflowStore = RunStore & ApprovalEffectStore;
 
-/** How the context loader delivered one Run's context, handed to the engine step that consumes it. */
-export interface TurnRecord {
-  readonly contextMode: ContextMode;
-  /** Vendor session id the engine is asked to resume; absent on a rebuild. */
-  readonly resumedFrom?: string;
-  /** The engine can resume, so a finished turn leaves a vendor session to store. */
-  readonly saveable: boolean;
-  readonly baseHash: string;
-  readonly contextHash: string;
-  readonly lastOrdinal: number;
-}
-
-export type EngineSessionRow = Omit<EngineSession, "pendingRunId" | "updatedAt">;
-
-export interface TurnOutcome {
-  readonly contextMode: ContextMode;
-  readonly save?: EngineSessionRow;
-}
+/**
+ * The engine session a resumable engine's turn will leave, as planned by the context loader; the
+ * engine step completes it with the vendor session the turn ended on.
+ */
+export type TurnRecord = Omit<EngineSessionInput, "vendorSessionId">;
 
 export interface WorkflowDeps {
   readonly store: WorkflowStore;
@@ -98,7 +83,7 @@ export type RunStageResult =
       readonly kind: "completed";
       readonly finalMessageParts?: readonly MessagePart[];
       readonly usage?: RunUsage;
-      readonly turn?: TurnOutcome;
+      readonly engineSession?: EngineSessionInput;
     }
   | {
       readonly kind: "interrupted";
@@ -127,19 +112,6 @@ function isToolCallEnd(chunk: JsonValue): boolean {
     chunk !== null &&
     !Array.isArray(chunk) &&
     chunk["type"] === "TOOL_CALL_END"
-  );
-}
-
-function isAssistantContent(chunk: JsonValue): boolean {
-  if (typeof chunk !== "object" || chunk === null || Array.isArray(chunk)) {
-    return false;
-  }
-  const type = chunk["type"];
-  return (
-    typeof type === "string" &&
-    ["TEXT_MESSAGE_", "TOOL_CALL_", "REASONING_", "THINKING_"].some((prefix) =>
-      type.startsWith(prefix),
-    )
   );
 }
 
@@ -172,10 +144,6 @@ export async function loadAndStartRunStep(
   return { run: started, alreadyTerminal: false };
 }
 
-type EngineAttempt =
-  | RunStageResult
-  | { readonly kind: "resume-rejected"; readonly code: string; readonly detail: string };
-
 export async function executeEngineStage(deps: WorkflowDeps, run: Run): Promise<RunStageResult> {
   const kind = run.engine === "script" ? undefined : run.engine;
   const engine = kind === undefined ? undefined : deps.engines.get(kind);
@@ -202,15 +170,11 @@ export async function executeEngineStage(deps: WorkflowDeps, run: Run): Promise<
   }
 
   try {
-    const first = await runEngineAttempt(deps, run, engine, kind, earlier.keySuffix);
-    if (first.kind !== "resume-rejected") {
-      return first;
-    }
-    deps.store.dropEngineSession(run.sessionId, kind);
-    const rebuilt = await runEngineAttempt(deps, run, engine, kind, earlier.keySuffix);
-    return rebuilt.kind === "resume-rejected"
-      ? { kind: "failed", code: rebuilt.code, detail: rebuilt.detail }
-      : rebuilt;
+    const first = await runEngineAttempt(deps, run, engine, earlier.keySuffix);
+    // The refused attempt's plan took the stored session, so planning again rebuilds.
+    return first.kind === "failed" && first.code === "engine.resume_unavailable"
+      ? await runEngineAttempt(deps, run, engine, earlier.keySuffix)
+      : first;
   } finally {
     deps.turns?.delete(run.id);
   }
@@ -286,47 +250,14 @@ async function runEngineAttempt(
   deps: WorkflowDeps,
   run: Run,
   engine: Engine,
-  kind: EngineKind,
   keySuffix: string,
-): Promise<EngineAttempt> {
+): Promise<RunStageResult> {
   const batchSize = deps.eventBatchSize ?? DEFAULT_EVENT_BATCH_SIZE;
   const pendingChunks: {
     readonly chunkKey: string;
     readonly chunk: JsonValue;
     readonly isTerminal?: boolean;
   }[] = [];
-  let observedSessionId: string | undefined;
-  let sawContent = false;
-
-  const turnOutcome = (): TurnOutcome | undefined => {
-    const turn = deps.turns?.get(run.id);
-    if (turn === undefined) {
-      return undefined;
-    }
-    return {
-      contextMode: turn.contextMode,
-      ...(turn.saveable && observedSessionId !== undefined
-        ? {
-            save: {
-              sessionId: run.sessionId,
-              engine: kind,
-              vendorSessionId: observedSessionId,
-              baseHash: turn.baseHash,
-              contextHash: turn.contextHash,
-              lastOrdinal: turn.lastOrdinal,
-            },
-          }
-        : {}),
-    };
-  };
-
-  // A resumed attempt buffers its chunks until the vendor confirms the session and the first
-  // assistant content arrives: Antigravity echoes an unknown id and rejects only the prompt. A
-  // rejected resume leaves nothing in the run events and the rebuild's chunks do not collide.
-  const isAwaitingResumeConfirmation = (): boolean => {
-    const resumedFrom = deps.turns?.get(run.id)?.resumedFrom;
-    return resumedFrom !== undefined && (observedSessionId !== resumedFrom || !sawContent);
-  };
 
   const readInterruptedStage = async (
     fallbackDetail?: string,
@@ -372,28 +303,15 @@ async function runEngineAttempt(
       }
 
       if (event.type === "chunk") {
-        observedSessionId = readSessionIdChunk(event.chunk) ?? observedSessionId;
-        sawContent ||= isAssistantContent(event.chunk);
         pendingChunks.push({
           chunkKey: `${event.chunkKey}${keySuffix}`,
           chunk: event.chunk,
           ...(event.isTerminal !== undefined ? { isTerminal: event.isTerminal } : {}),
         });
-        if (
-          !isAwaitingResumeConfirmation() &&
-          (pendingChunks.length >= batchSize || isToolCallEnd(event.chunk))
-        ) {
+        if (pendingChunks.length >= batchSize || isToolCallEnd(event.chunk)) {
           await flush();
         }
         continue;
-      }
-
-      if (
-        event.type === "failed" &&
-        event.code === "engine.resume_unavailable" &&
-        isAwaitingResumeConfirmation()
-      ) {
-        return { kind: "resume-rejected", code: event.code, detail: event.detail };
       }
 
       await flush();
@@ -403,12 +321,14 @@ async function runEngineAttempt(
         if (postInterrupted) {
           return postInterrupted;
         }
-        const turn = turnOutcome();
+        const turn = deps.turns?.get(run.id);
         return {
           kind: "completed",
           ...(event.finalMessage ? { finalMessageParts: event.finalMessage.parts } : {}),
           ...(event.usage !== undefined ? { usage: event.usage } : {}),
-          ...(turn !== undefined ? { turn } : {}),
+          ...(turn !== undefined && event.vendorSessionId !== undefined
+            ? { engineSession: { ...turn, vendorSessionId: event.vendorSessionId } }
+            : {}),
         };
       }
 
@@ -612,8 +532,9 @@ export async function finalizeDirectRunStep(
         ? { finalMessageParts: input.outcome.finalMessageParts }
         : {}),
       ...(input.outcome.usage !== undefined ? { usage: input.outcome.usage } : {}),
-      ...(input.outcome.turn !== undefined ? { contextMode: input.outcome.turn.contextMode } : {}),
-      ...(input.outcome.turn?.save !== undefined ? { engineSession: input.outcome.turn.save } : {}),
+      ...(input.outcome.engineSession !== undefined
+        ? { engineSession: input.outcome.engineSession }
+        : {}),
     });
     return finished.run;
   }

@@ -4,7 +4,7 @@ import {
   formatUtcTimestamp,
   type CloudEvent,
   type ContextMode,
-  type EngineSession,
+  type EngineSessionInput,
   type JsonValue,
   type Message,
   type MessagePart,
@@ -54,9 +54,8 @@ export interface FinishRunInput {
   readonly detail?: string;
   readonly checkpoint?: JsonValue | null;
   readonly usage?: RunUsage;
-  readonly contextMode?: ContextMode;
-  /** Saved in the finish transaction at the reply's ordinal when there is one. */
-  readonly engineSession?: Omit<EngineSession, "pendingRunId" | "updatedAt">;
+  /** Stored at the reply's ordinal, only by the finish that first makes the Run terminal. */
+  readonly engineSession?: EngineSessionInput;
 }
 
 export interface FinishRunOutcome {
@@ -545,8 +544,7 @@ export async function finishRun(
            cached_input_tokens = COALESCE(?, cached_input_tokens),
            cache_write_tokens = COALESCE(?, cache_write_tokens),
            output_tokens = COALESCE(?, output_tokens),
-           reported_cost_usd = COALESCE(?, reported_cost_usd),
-           context_mode = COALESCE(?, context_mode)
+           reported_cost_usd = COALESCE(?, reported_cost_usd)
        WHERE id = ?`,
     ).run(
       input.status,
@@ -558,7 +556,6 @@ export async function finishRun(
       input.usage?.cacheWriteTokens ?? null,
       input.usage?.outputTokens ?? null,
       input.usage?.reportedCostUsd ?? null,
-      input.contextMode ?? null,
       input.runId,
     );
 
@@ -662,7 +659,7 @@ export async function finishRun(
       outboxEvents.push(...insertOutboxForBindings(db, botBindings, routineEnvelope, now));
     }
 
-    if (input.engineSession !== undefined) {
+    if (!existingTerminal && input.engineSession !== undefined) {
       saveEngineSession(
         db,
         {

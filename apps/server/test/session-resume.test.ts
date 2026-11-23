@@ -172,16 +172,18 @@ function createFakeClaude(
     },
   };
 
-  return { calls, runner };
+  return { calls, runner, forget: (id: string) => known.delete(id) };
 }
 
 type FakeClaude = ReturnType<typeof createFakeClaude>;
 
-/** Runs `afterFinish` once, when the next finish transaction has committed. */
+/** Records every finish and runs `afterFinish` once, when the next finish has committed. */
 class FinishHookStore extends SqliteStore {
   afterFinish: (() => Promise<void>) | undefined;
+  readonly finishes: FinishRunInput[] = [];
 
   override async finishRun(input: FinishRunInput): Promise<FinishRunOutcome> {
+    this.finishes.push(input);
     const finished = await super.finishRun(input);
     const hook = this.afterFinish;
     this.afterFinish = undefined;
@@ -288,7 +290,6 @@ describe("resume the vendor session on the second Run", () => {
     expect(ctx.server.store.getEngineSession(ctx.sessionId, "claude-code")).toMatchObject({
       vendorSessionId: "vendor-1",
       lastOrdinal: 4,
-      pendingRunId: null,
     });
   }, 60_000);
 });
@@ -333,16 +334,7 @@ describe("rebuild the context", () => {
       const cli = createFakeClaude(onRejectedResume ? { onRejectedResume } : {});
       const ctx = await startResumeServer(cli);
       await ask(ctx, "first question");
-      const stored = ctx.server.store.getEngineSession(ctx.sessionId, "claude-code")!;
-      ctx.server.store.dropEngineSession(ctx.sessionId, "claude-code");
-      ctx.server.store.saveEngineSession({
-        sessionId: ctx.sessionId,
-        engine: "claude-code",
-        vendorSessionId: "vendor-lost",
-        baseHash: stored.baseHash,
-        contextHash: stored.contextHash,
-        lastOrdinal: 2,
-      });
+      cli.forget("vendor-1");
 
       const second = await ask(ctx, "second question");
 
@@ -361,7 +353,7 @@ describe("rebuild the context", () => {
         chunks.includes("STALE ATTEMPT TEXT"),
         chunks.includes("vendor-replacement"),
       ]).toEqual([
-        [undefined, "vendor-lost", undefined],
+        [undefined, "vendor-1", undefined],
         true,
         true,
         "rebuilt",
@@ -484,6 +476,19 @@ describe("rebuild the context", () => {
     });
   }
 
+  const PARTIAL_THEN_CRASH: CliReply = {
+    lines: [
+      initLine("vendor-1"),
+      JSON.stringify({
+        type: "assistant",
+        parent_tool_use_id: null,
+        message: { id: "msg-partial", content: [{ type: "text", text: "PARTIAL" }] },
+      }),
+    ],
+    stderr: "boom",
+    exitCode: 1,
+  };
+
   it("finishes with the first answer and usage when a replayed engine step finds a persisted finish", async () => {
     const cli = createFakeClaude({
       onCall: (index) =>
@@ -534,21 +539,7 @@ describe("rebuild the context", () => {
 
   it("finishes rebuilt with only the new attempt's output when a replayed engine step finds no finish", async () => {
     const cli = createFakeClaude({
-      onCall: (index) =>
-        index === 1
-          ? {
-              lines: [
-                initLine("vendor-1"),
-                JSON.stringify({
-                  type: "assistant",
-                  parent_tool_use_id: null,
-                  message: { id: "msg-partial", content: [{ type: "text", text: "PARTIAL" }] },
-                }),
-              ],
-              stderr: "boom",
-              exitCode: 1,
-            }
-          : undefined,
+      onCall: (index) => (index === 1 ? PARTIAL_THEN_CRASH : undefined),
     });
     const ctx = await startResumeServer(cli);
     await ask(ctx, "first question");
@@ -581,24 +572,15 @@ describe("rebuild the context", () => {
     ]);
   }, 60_000);
 
-  it("rebuilds a replayed Run that was admitted the moment the Run before it finished", async () => {
-    const cli = createFakeClaude({
-      onCall: (index) =>
-        index === 2
-          ? {
-              lines: [
-                initLine("vendor-1"),
-                JSON.stringify({
-                  type: "assistant",
-                  parent_tool_use_id: null,
-                  message: { id: "msg-partial", content: [{ type: "text", text: "PARTIAL" }] },
-                }),
-              ],
-              stderr: "boom",
-              exitCode: 1,
-            }
-          : undefined,
-    });
+  /**
+   * Finishes "second question" and admits "third question" the moment that finish commits. The
+   * successor's engine step runs once, its result is lost, `beforeReplay` runs and the step runs
+   * again.
+   */
+  async function raceSuccessorAgainstFinish(
+    cli: FakeClaude,
+    beforeReplay: (store: FinishHookStore, predecessorId: string) => Promise<void>,
+  ): Promise<{ ctx: Awaited<ReturnType<typeof startResumeServer>>; successor: Run }> {
     let hookStore: FinishHookStore | undefined;
     const ctx = await startResumeServer(cli, undefined, (dbPath) => {
       hookStore = new FinishHookStore({
@@ -659,9 +641,18 @@ describe("rebuild the context", () => {
       input: { parts: [{ type: "text", text: "second question" }] },
     });
     await ctx.server.coordinator.executeRun(predecessor.id, inline);
+    await beforeReplay(hookStore!, predecessor.id);
     releaseReplay();
     await successorExecution;
-    const successor = await finished(ctx.server, successorId);
+    return { ctx, successor: await finished(ctx.server, successorId) };
+  }
+
+  it("rebuilds a replayed Run that was admitted the moment the Run before it finished", async () => {
+    const cli = createFakeClaude({
+      onCall: (index) => (index === 2 ? PARTIAL_THEN_CRASH : undefined),
+    });
+
+    const { ctx, successor } = await raceSuccessorAgainstFinish(cli, async () => {});
 
     expect([
       resumeTarget(cli.calls[3]),
@@ -670,5 +661,39 @@ describe("rebuild the context", () => {
       successor.contextMode,
       ctx.server.store.getEngineSession(ctx.sessionId, "claude-code")?.vendorSessionId,
     ]).toEqual([undefined, true, "completed", "rebuilt", "vendor-2"]);
+  }, 60_000);
+
+  it("keeps a refused vendor session gone when the finish before it replays during the rebuild", async () => {
+    const cli = createFakeClaude({
+      onCall: (index) =>
+        index === 2
+          ? { lines: [], stderr: `${UNKNOWN_SESSION}: vendor-1`, exitCode: 1 }
+          : index === 3
+            ? PARTIAL_THEN_CRASH
+            : undefined,
+    });
+    let afterReplayedFinish: unknown;
+
+    const { ctx, successor } = await raceSuccessorAgainstFinish(
+      cli,
+      async (store, predecessorId) => {
+        await store.finishRun(store.finishes.find((input) => input.runId === predecessorId)!);
+        afterReplayedFinish = store.getEngineSession("sess-resume", "claude-code");
+      },
+    );
+
+    expect([
+      cli.calls.map((call) => resumeTarget(call)),
+      afterReplayedFinish,
+      successor.status,
+      successor.contextMode,
+      ctx.server.store.getEngineSession(ctx.sessionId, "claude-code")?.vendorSessionId,
+    ]).toEqual([
+      [undefined, "vendor-1", "vendor-1", undefined, undefined],
+      null,
+      "completed",
+      "rebuilt",
+      "vendor-2",
+    ]);
   }, 60_000);
 });

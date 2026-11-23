@@ -1,10 +1,6 @@
 import { describe, expect, it } from "bun:test";
 import type { EngineEvent, EngineReadiness, Run } from "@der/domain";
-import {
-  claudeCodeResume,
-  createClaudeCodeEngine,
-  type EngineRunInput,
-} from "@der/runtime/engines";
+import { createClaudeCodeEngine, type EngineRunInput } from "@der/runtime/engines";
 import type {
   SandboxCapabilities,
   SandboxHandle,
@@ -205,15 +201,38 @@ describe("resume a Claude Code session", () => {
         { role: "user", content: "second question" },
       ],
       resumeSessionId: "vendor-1",
-      requireResume: true,
     });
 
     const argv = JSON.parse(cli.argvFiles[0]!) as string[];
     expect([argv[argv.indexOf("--resume") + 1], cli.stdin.join(""), events.at(-1)]).toEqual([
       "vendor-1",
       "second question",
-      { type: "completed", finalMessage: { parts: [{ type: "text", text: "Second answer." }] } },
+      {
+        type: "completed",
+        vendorSessionId: "vendor-1",
+        finalMessage: { parts: [{ type: "text", text: "Second answer." }] },
+      },
     ]);
+  });
+
+  it("accepts the resumed session on its first answer when the CLI reports no session id", async () => {
+    const cli = fakeClaudeCli({
+      lines: [
+        acceptedTurn("vendor-1")[1]!,
+        JSON.stringify({ type: "result", subtype: "success", result: "Second answer." }),
+      ],
+    });
+
+    const events = await runEngine(cli, {
+      messages: [{ role: "user", content: "second question" }],
+      resumeSessionId: "vendor-1",
+    });
+
+    expect(events.at(-1)).toEqual({
+      type: "completed",
+      vendorSessionId: "vendor-1",
+      finalMessage: { parts: [{ type: "text", text: "Second answer." }] },
+    });
   });
 
   it("starts a fresh CLI session without --resume when no session id is given", async () => {
@@ -227,23 +246,21 @@ describe("resume a Claude Code session", () => {
 
 describe("detect a Claude Code session the CLI rejects", () => {
   it.each([
-    {
-      case: "the recorded unknown-session error",
-      message: `Agent process exited with code 1: ${UNKNOWN_SESSION_STDERR}`,
-      expected: true,
-    },
-    {
-      case: "an unrelated error that mentions a thread",
-      message: "Agent process exited with code 1: thread pool exhausted",
-      expected: false,
-    },
-    {
-      case: "an unrelated error that mentions a session",
-      message: "Agent process exited with code 1: session token expired, run /login",
-      expected: false,
-    },
-  ])("treats $case as resume failure: $expected", ({ message, expected }) => {
-    expect(claudeCodeResume.isResumeFailure(message)).toBe(expected);
+    { case: "mentions a thread", stderr: "thread pool exhausted" },
+    { case: "mentions a session", stderr: "session token expired, run /login" },
+  ])("reports an unrelated CLI error that $case as transport loss", async ({ stderr }) => {
+    const cli = fakeClaudeCli({ lines: [], stderrLines: [stderr], exitCode: 1 });
+
+    const events = await runEngine(cli, {
+      messages: [{ role: "user", content: "second question" }],
+      resumeSessionId: "vendor-1",
+    });
+
+    expect(events.at(-1)).toEqual({
+      type: "failed",
+      code: "engine.transport_lost",
+      detail: `Agent process exited with code 1: ${stderr}`,
+    });
   });
 
   it("reports engine.resume_unavailable when the CLI exits with the unknown-session error", async () => {
@@ -252,7 +269,6 @@ describe("detect a Claude Code session the CLI rejects", () => {
     const events = await runEngine(cli, {
       messages: [{ role: "user", content: "second question" }],
       resumeSessionId: "00000000-0000-4000-8000-000000000000",
-      requireResume: true,
     });
 
     expect(events.at(-1)).toEqual({
@@ -268,7 +284,6 @@ describe("detect a Claude Code session the CLI rejects", () => {
     const events = await runEngine(cli, {
       messages: [{ role: "user", content: "second question" }],
       resumeSessionId: "vendor-1",
-      requireResume: true,
     });
 
     expect(events.at(-1)).toEqual({
@@ -279,7 +294,7 @@ describe("detect a Claude Code session the CLI rejects", () => {
     });
   });
 
-  it("reports a dropped stream after the CLI accepted the session as transport loss, not a rejected resume", async () => {
+  it("reports a stream that drops before the first answer as engine.resume_unavailable", async () => {
     const cli = fakeClaudeCli({
       lines: [JSON.stringify({ type: "system", subtype: "init", session_id: "vendor-1" })],
     });
@@ -287,12 +302,11 @@ describe("detect a Claude Code session the CLI rejects", () => {
     const events = await runEngine(cli, {
       messages: [{ role: "user", content: "second question" }],
       resumeSessionId: "vendor-1",
-      requireResume: true,
     });
 
     expect(events.at(-1)).toEqual({
       type: "failed",
-      code: "engine.transport_lost",
+      code: "engine.resume_unavailable",
       detail: "Engine process transport closed before completing the run.",
     });
   });

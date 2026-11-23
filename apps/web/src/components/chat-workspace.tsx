@@ -648,12 +648,7 @@ export function ChatWorkspace({
         const detail = await api.getRun(runId);
         setActiveRun(detail.run);
         setActiveApproval(detail.approval);
-        if (
-          detail.run.status === "completed" ||
-          detail.run.status === "failed" ||
-          detail.run.status === "interrupted" ||
-          detail.run.status === "cancelled"
-        ) {
+        if (isTerminalRunStatus(detail.run.status)) {
           writePersistedCursor(session.id, null);
         }
       } catch (error) {

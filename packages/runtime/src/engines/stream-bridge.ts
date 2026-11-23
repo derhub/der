@@ -11,46 +11,11 @@ export interface EngineRunInput {
   readonly tools?: Array<AnyTool>;
   readonly signal?: AbortSignal;
   readonly approvalBroker?: ApprovalBroker;
+  /** Vendor session to resume; the turn fails with `engine.resume_unavailable` if it is refused. */
   readonly resumeSessionId?: string;
-  readonly requireResume?: boolean;
 }
 
 export type LoadEngineRunInput = (run: Run) => Promise<EngineRunInput>;
-
-export interface EngineResumeTraits {
-  /** The engine resumes its vendor session between Runs; otherwise every Run rebuilds. */
-  readonly resumable: boolean;
-  /** True when an engine error message means the vendor refused the session it was asked to resume. */
-  readonly isResumeFailure: (message: string) => boolean;
-}
-
-/** Vendor session id carried by an engine's `<engine>.session-id` chunk, if `chunk` is one. */
-export function readSessionIdChunk(chunk: JsonValue): string | undefined {
-  if (
-    !isRecord(chunk) ||
-    chunk["type"] !== "CUSTOM" ||
-    typeof chunk["name"] !== "string" ||
-    !chunk["name"].endsWith(".session-id") ||
-    !isRecord(chunk["value"])
-  ) {
-    return undefined;
-  }
-  const sessionId = chunk["value"]["sessionId"];
-  return typeof sessionId === "string" && sessionId.length > 0 ? sessionId : undefined;
-}
-
-export function extractCheckpointSessionId(run: Run): string | undefined {
-  if (
-    run.checkpoint !== null &&
-    typeof run.checkpoint === "object" &&
-    !Array.isArray(run.checkpoint) &&
-    typeof run.checkpoint["sessionId"] === "string" &&
-    run.checkpoint["sessionId"].length > 0
-  ) {
-    return run.checkpoint["sessionId"];
-  }
-  return undefined;
-}
 
 export function checkRunReadinessGate(
   run: Run,
@@ -134,7 +99,7 @@ function isTransportLossMessage(message: string): boolean {
   );
 }
 
-export function isBroadResumeFailureMessage(message: string): boolean {
+function isBroadResumeFailureMessage(message: string): boolean {
   const lower = message.toLowerCase();
   const mentionsSession =
     lower.includes("resume") ||
@@ -145,6 +110,16 @@ export function isBroadResumeFailureMessage(message: string): boolean {
   return mentionsSession || isTransportLossMessage(message);
 }
 
+function isAssistantOutput(chunkType: string): boolean {
+  return chunkType === "TEXT_MESSAGE_CONTENT" || chunkType.startsWith("TOOL_CALL_");
+}
+
+/**
+ * Translates adapter chunks into engine events. A resumed turn holds its chunks until the first
+ * assistant content or tool call, the point where the vendor has accepted the session; a failure
+ * before it is `engine.resume_unavailable` and yields none of them. `isResumeFailure` narrows
+ * which vendor-reported errors count, so a transient vendor error does not discard the session.
+ */
 export async function* bridgeAdapterStream(options: {
   readonly run: Run;
   readonly stream: AsyncIterable<StreamChunk>;
@@ -152,20 +127,21 @@ export async function* bridgeAdapterStream(options: {
   readonly abortController: AbortController;
   readonly approvalBridge?: ApprovalBridge;
   readonly sessionIdEventName: string;
-  readonly expectedResumeSessionId?: string;
-  readonly requireResume?: boolean;
+  readonly resumeSessionId?: string;
   readonly isResumeFailure?: (message: string) => boolean;
 }): AsyncIterable<EngineEvent> {
   const isResumeFailure = options.isResumeFailure ?? isBroadResumeFailureMessage;
+  const resumeSessionId = options.resumeSessionId;
   let seq = 0;
   let assistantText = "";
   let sawTerminal = false;
-  let resumeMismatchDetail: string | undefined;
-  let resumeAccepted = false;
-  const isUnacceptedResume = () =>
-    options.requireResume === true &&
-    options.expectedResumeSessionId !== undefined &&
-    !resumeAccepted;
+  let vendorSessionId = resumeSessionId;
+  let held: EngineEvent[] | undefined = resumeSessionId !== undefined ? [] : undefined;
+  const release = (): EngineEvent[] => {
+    const released = held ?? [];
+    held = undefined;
+    return released;
+  };
 
   try {
     for await (const rawChunk of options.stream) {
@@ -182,34 +158,20 @@ export async function* bridgeAdapterStream(options: {
       const chunk = rawChunk as Record<string, unknown>;
       const chunkType = typeof chunk["type"] === "string" ? chunk["type"] : "UNKNOWN";
 
-      if (
-        options.requireResume &&
-        options.expectedResumeSessionId !== undefined &&
-        chunkType === "CUSTOM" &&
-        chunk["name"] === options.sessionIdEventName &&
-        chunk["value"] !== null &&
-        typeof chunk["value"] === "object"
-      ) {
-        const value = chunk["value"] as Record<string, unknown>;
-        const observedSessionId =
-          typeof value["sessionId"] === "string" ? value["sessionId"] : undefined;
-        if (observedSessionId === options.expectedResumeSessionId) {
-          resumeAccepted = true;
-        }
-        if (
-          observedSessionId !== undefined &&
-          observedSessionId !== options.expectedResumeSessionId
-        ) {
-          resumeMismatchDetail = `Engine could not resume session "${options.expectedResumeSessionId}"; started fresh session "${observedSessionId}" instead.`;
-          options.approvalBridge?.markTransportLost(resumeMismatchDetail);
-          options.abortController.abort(resumeMismatchDetail);
-          yield {
-            type: "failed",
-            code: "engine.resume_unavailable",
-            detail: resumeMismatchDetail,
-          };
+      const sessionValue =
+        chunkType === "CUSTOM" && chunk["name"] === options.sessionIdEventName
+          ? chunk["value"]
+          : undefined;
+      if (isRecord(sessionValue) && typeof sessionValue["sessionId"] === "string") {
+        const observedSessionId = sessionValue["sessionId"];
+        if (held !== undefined && observedSessionId !== resumeSessionId) {
+          const detail = `Engine could not resume session "${resumeSessionId}"; started fresh session "${observedSessionId}" instead.`;
+          options.approvalBridge?.markTransportLost(detail);
+          options.abortController.abort(detail);
+          yield { type: "failed", code: "engine.resume_unavailable", detail };
           return;
         }
+        vendorSessionId = observedSessionId;
       }
 
       if (chunkType === "TEXT_MESSAGE_CONTENT" && typeof chunk["delta"] === "string") {
@@ -232,12 +194,12 @@ export async function* bridgeAdapterStream(options: {
           };
           return;
         }
-        if (isUnacceptedResume() && isResumeFailure(message)) {
+        if (held !== undefined && isResumeFailure(message)) {
           options.approvalBridge?.markTransportLost(message);
           yield {
             type: "failed",
             code: "engine.resume_unavailable",
-            detail: `Unable to resume session "${options.expectedResumeSessionId}": ${message}`,
+            detail: `Unable to resume session "${resumeSessionId}": ${message}`,
           };
           return;
         }
@@ -273,6 +235,7 @@ export async function* bridgeAdapterStream(options: {
           };
           return;
         }
+        yield* release();
         seq += 1;
         const normalizedChunk: JsonValue = normalizeToJsonValue(chunk);
         yield compiledParsers.engineEvent.parse({
@@ -285,6 +248,7 @@ export async function* bridgeAdapterStream(options: {
         yield compiledParsers.engineEvent.parse({
           type: "completed",
           ...(usage !== undefined ? { usage } : {}),
+          ...(vendorSessionId !== undefined ? { vendorSessionId } : {}),
           ...(assistantText.length > 0
             ? { finalMessage: { parts: [{ type: "text", text: assistantText }] } }
             : {}),
@@ -294,11 +258,17 @@ export async function* bridgeAdapterStream(options: {
 
       seq += 1;
       const normalizedChunk: JsonValue = normalizeToJsonValue(chunk);
-      yield compiledParsers.engineEvent.parse({
+      const event = compiledParsers.engineEvent.parse({
         type: "chunk",
         chunkKey: `${options.run.id}:${seq}:${chunkType}`,
         chunk: normalizedChunk,
       });
+      if (held !== undefined && !isAssistantOutput(chunkType)) {
+        held.push(event);
+        continue;
+      }
+      yield* release();
+      yield event;
     }
   } catch (error) {
     const message = redactDiagnostics(error instanceof Error ? error.message : String(error));
@@ -314,13 +284,9 @@ export async function* bridgeAdapterStream(options: {
     options.approvalBridge?.markTransportLost(message);
     yield {
       type: "failed",
-      code: isUnacceptedResume() ? "engine.resume_unavailable" : "engine.transport_lost",
+      code: held !== undefined ? "engine.resume_unavailable" : "engine.transport_lost",
       detail: message,
     };
-    return;
-  }
-
-  if (resumeMismatchDetail !== undefined) {
     return;
   }
 
@@ -338,7 +304,7 @@ export async function* bridgeAdapterStream(options: {
     options.approvalBridge?.markTransportLost("Engine stream ended without a terminal event.");
     yield {
       type: "failed",
-      code: isUnacceptedResume() ? "engine.resume_unavailable" : "engine.transport_lost",
+      code: held !== undefined ? "engine.resume_unavailable" : "engine.transport_lost",
       detail: "Engine process transport closed before completing the run.",
     };
   }

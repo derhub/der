@@ -65,6 +65,8 @@ export function createFixtureEngine(
       };
 
       if (firstText.startsWith("fail:")) {
+        // Like an official engine, whose vendor call fails only after the turn was planned.
+        await loadRunInput(run);
         yield {
           type: "failed",
           code: "engine.fixture_failed",

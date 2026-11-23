@@ -177,7 +177,7 @@ function createFakeAgy(options: { readonly staleText?: string } = {}) {
     },
   };
 
-  return { prompts, runner };
+  return { prompts, runner, forget: (id: string) => known.delete(id) };
 }
 
 type FakeAgy = ReturnType<typeof createFakeAgy>;
@@ -244,19 +244,6 @@ async function askAndSettle(
   );
 }
 
-function pointRowAtLostTrajectory(ctx: { server: RunningServer; sessionId: string }) {
-  const stored = ctx.server.store.getEngineSession(ctx.sessionId, "antigravity")!;
-  ctx.server.store.dropEngineSession(ctx.sessionId, "antigravity");
-  ctx.server.store.saveEngineSession({
-    sessionId: ctx.sessionId,
-    engine: "antigravity",
-    vendorSessionId: "acp-lost",
-    baseHash: stored.baseHash,
-    contextHash: stored.contextHash,
-    lastOrdinal: stored.lastOrdinal,
-  });
-}
-
 function assistantTexts(ctx: { server: RunningServer; sessionId: string }): string[] {
   return ctx.server.store
     .listMessages(ctx.sessionId)
@@ -271,7 +258,7 @@ describe("rebuild when Antigravity rejects a resumed trajectory on the first pro
     const agy = createFakeAgy();
     const ctx = await startAgyServer(agy);
     await askAndSettle(ctx, "first question");
-    pointRowAtLostTrajectory(ctx);
+    agy.forget("acp-1");
 
     const second = await askAndSettle(ctx, "second question");
 
@@ -282,7 +269,7 @@ describe("rebuild when Antigravity rejects a resumed trajectory on the first pro
       ctx.server.store.getEngineSession(ctx.sessionId, "antigravity")?.vendorSessionId,
       assistantTexts(ctx),
     ]).toEqual([
-      ["acp-1", "acp-lost", "acp-2"],
+      ["acp-1", "acp-1", "acp-2"],
       "completed",
       "rebuilt",
       "acp-2",
@@ -294,7 +281,7 @@ describe("rebuild when Antigravity rejects a resumed trajectory on the first pro
     const agy = createFakeAgy({ staleText: "STALE ATTEMPT TEXT" });
     const ctx = await startAgyServer(agy);
     await askAndSettle(ctx, "first question");
-    pointRowAtLostTrajectory(ctx);
+    agy.forget("acp-1");
 
     const second = await askAndSettle(ctx, "second question");
 
@@ -302,6 +289,6 @@ describe("rebuild when Antigravity rejects a resumed trajectory on the first pro
       agy.prompts.map((prompt) => prompt.sessionId),
       second.status,
       assistantTexts(ctx),
-    ]).toEqual([["acp-1", "acp-lost"], "failed", ["answer from acp-1"]]);
+    ]).toEqual([["acp-1", "acp-1"], "failed", ["answer from acp-1"]]);
   }, 60_000);
 });

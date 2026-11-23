@@ -478,6 +478,7 @@ describe("adapt Codex, Claude Code, and Antigravity ACP engines in contained san
     expect(events.some((event) => event.type === "chunk")).toBe(true);
     expect(events.at(-1)).toEqual({
       type: "completed",
+      vendorSessionId: "codex-thread-1",
       finalMessage: {
         parts: [{ type: "text", text: "Native codex answer." }],
       },
@@ -568,6 +569,7 @@ describe("adapt Codex, Claude Code, and Antigravity ACP engines in contained san
     expect(brokerCalls).toEqual(["claude-code:Bash"]);
     expect(events.at(-1)).toEqual({
       type: "completed",
+      vendorSessionId: "claude-sess-1",
       finalMessage: {
         parts: [{ type: "text", text: "Claude reply via sandbox." }],
       },
@@ -614,6 +616,7 @@ describe("adapt Codex, Claude Code, and Antigravity ACP engines in contained san
     expect(observedAcpOutcome).toEqual({ outcome: "selected", optionId: "allow-once-id" });
     expect(events.at(-1)).toEqual({
       type: "completed",
+      vendorSessionId: "acp-session-new",
       finalMessage: {
         parts: [{ type: "text", text: "Permission approved and executed." }],
       },
@@ -727,7 +730,7 @@ describe("enforce eligibility gates, cancellation, transport loss, and non-resum
     expect(fakeSandbox.destroyCount()).toBeGreaterThanOrEqual(1);
   });
 
-  it("reports engine.resume_unavailable when an engine process cannot resume a checkpointed session", async () => {
+  it("reports engine.resume_unavailable when an engine process cannot resume the session", async () => {
     const codexSandbox = createFakeSandboxProvider({
       onSpawn: () =>
         createScriptedSpawnHandle({
@@ -743,18 +746,10 @@ describe("enforce eligibility gates, cancellation, transport loss, and non-resum
       loadRunInput: async () => ({
         messages: [{ role: "user", content: "Continue prior run" }],
         resumeSessionId: "codex-dead-session",
-        requireResume: true,
       }),
     });
 
-    const codexEvents = await collectEvents(
-      codexEngine.run(
-        makeRun({
-          engine: "codex",
-          checkpoint: { sessionId: "codex-dead-session" },
-        }),
-      ),
-    );
+    const codexEvents = await collectEvents(codexEngine.run(makeRun({ engine: "codex" })));
     expect(codexEvents.at(-1)).toMatchObject({
       type: "failed",
       code: "engine.resume_unavailable",
@@ -775,18 +770,10 @@ describe("enforce eligibility gates, cancellation, transport loss, and non-resum
       loadRunInput: async () => ({
         messages: [{ role: "user", content: "Continue prior ACP turn" }],
         resumeSessionId: "acp-dead-session",
-        requireResume: true,
       }),
     });
 
-    const acpEvents = await collectEvents(
-      acpEngine.run(
-        makeRun({
-          engine: "antigravity",
-          checkpoint: { sessionId: "acp-dead-session" },
-        }),
-      ),
-    );
+    const acpEvents = await collectEvents(acpEngine.run(makeRun({ engine: "antigravity" })));
     expect(acpEvents.at(-1)).toMatchObject({
       type: "failed",
       code: "engine.resume_unavailable",

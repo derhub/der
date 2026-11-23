@@ -22,7 +22,6 @@ import type { Message, MessagePart } from "../schemas/message";
 import type { Routine, RoutineTarget } from "../schemas/routine";
 import type {
   ChannelIntakeMetadata,
-  ContextMode,
   Run,
   RunAdmission,
   RunEvent,
@@ -71,9 +70,11 @@ export interface FinishRunInput {
   readonly detail?: string;
   readonly checkpoint?: JsonValue | null;
   readonly usage?: RunUsage;
-  readonly contextMode?: ContextMode;
-  /** Saved in the finish transaction at the reply's ordinal when there is one. */
-  readonly engineSession?: Omit<EngineSession, "pendingRunId" | "updatedAt">;
+  /**
+   * Stored at the reply's ordinal when there is one, and only by the finish that first makes the
+   * Run terminal: a replayed finish writes nothing.
+   */
+  readonly engineSession?: EngineSessionInput;
 }
 
 export interface FinishRunOutcome {
@@ -177,21 +178,20 @@ export interface EngineSession {
   readonly contextHash: string;
   /** Highest message ordinal the vendor session has seen. */
   readonly lastOrdinal: number;
-  /** Run whose engine call is in flight; null once the call finished. */
-  readonly pendingRunId: RunId | null;
   readonly updatedAt: UtcTimestamp;
 }
 
+/** An engine session as a finished turn hands it to `finishRun`, which stamps `updatedAt`. */
+export type EngineSessionInput = Omit<EngineSession, "updatedAt">;
+
 export interface EngineSessionStore {
   getEngineSession(sessionId: SessionId, engine: EngineKind): EngineSession | null;
-  /** No-op when the session has no row for the engine. */
-  markEngineSessionPending(sessionId: SessionId, engine: EngineKind, runId: RunId): void;
   /**
-   * Upsert; clears `pendingRunId` and stamps `updatedAt`. Replaces a stored row only when the
-   * incoming `lastOrdinal` is greater, so a replayed older finish is a no-op.
+   * Returns the session's row for `engine` and deletes every row of the session in one
+   * transaction. The Run that takes it owns the vendor session; no row exists again until that
+   * Run's finish stores one.
    */
-  saveEngineSession(row: Omit<EngineSession, "pendingRunId" | "updatedAt">): void;
-  dropEngineSession(sessionId: SessionId, engine: EngineKind): void;
+  takeEngineSession(sessionId: SessionId, engine: EngineKind): EngineSession | null;
 }
 
 export interface Store

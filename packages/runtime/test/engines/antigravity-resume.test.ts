@@ -1,10 +1,6 @@
 import { describe, expect, it } from "bun:test";
 import type { EngineEvent, EngineReadiness, Run } from "@der/domain";
-import {
-  antigravityResume,
-  createAntigravityEngine,
-  type EngineRunInput,
-} from "@der/runtime/engines";
+import { createAntigravityEngine, type EngineRunInput } from "@der/runtime/engines";
 import type {
   SandboxCapabilities,
   SandboxHandle,
@@ -251,7 +247,6 @@ const resumedInput: EngineRunInput = {
   messages: [{ role: "user", content: "second question" }],
   systemPrompts: ["You are the base persona."],
   resumeSessionId: "vendor-1",
-  requireResume: true,
 };
 
 describe("resume an Antigravity session", () => {
@@ -263,7 +258,11 @@ describe("resume an Antigravity session", () => {
     expect([agy.loadedSessionIds, agy.prompts, events.at(-1)]).toEqual([
       ["vendor-1"],
       ["second question"],
-      { type: "completed", finalMessage: { parts: [{ type: "text", text: "Second answer." }] } },
+      {
+        type: "completed",
+        vendorSessionId: "vendor-1",
+        finalMessage: { parts: [{ type: "text", text: "Second answer." }] },
+      },
     ]);
   });
 
@@ -277,33 +276,9 @@ describe("resume an Antigravity session", () => {
 
     expect(agy.prompts).toEqual(["You are the base persona.\n\nfirst question"]);
   });
-
-  it("is flagged resumable", () => {
-    expect(antigravityResume.resumable).toBe(true);
-  });
 });
 
 describe("detect an Antigravity session the agent rejects", () => {
-  it.each([
-    {
-      case: "the recorded unknown-trajectory error",
-      message: UNKNOWN_TRAJECTORY_ERROR,
-      expected: true,
-    },
-    {
-      case: "an unrelated error that mentions a session",
-      message: "session token expired, run /login",
-      expected: false,
-    },
-    {
-      case: "an unrelated error that mentions a thread",
-      message: "thread pool exhausted",
-      expected: false,
-    },
-  ])("treats $case as resume failure: $expected", ({ message, expected }) => {
-    expect(antigravityResume.isResumeFailure(message)).toBe(expected);
-  });
-
   it("reports engine.resume_unavailable when the agent loads an unknown id and then refuses the prompt", async () => {
     const agy = fakeAgy({ promptError: UNKNOWN_TRAJECTORY_ERROR });
 
@@ -319,15 +294,19 @@ describe("detect an Antigravity session the agent rejects", () => {
     });
   });
 
-  it("keeps an unrelated prompt error as a plain run error", async () => {
-    const agy = fakeAgy({ promptError: "quota exceeded" });
+  it.each([
+    { case: "a quota error", promptError: "quota exceeded" },
+    { case: "an error that mentions a session", promptError: "session token expired, run /login" },
+    { case: "an error that mentions a thread", promptError: "thread pool exhausted" },
+  ])("keeps $case on the first prompt as a plain run error", async ({ promptError }) => {
+    const agy = fakeAgy({ promptError });
 
     const events = await runEngine(agy, resumedInput);
 
     expect(events.at(-1)).toEqual({
       type: "failed",
       code: "engine.run_error",
-      detail: "quota exceeded",
+      detail: promptError,
     });
   });
 

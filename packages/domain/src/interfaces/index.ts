@@ -24,6 +24,7 @@ export type {
   BotStore,
   CreateRoutineInput,
   EngineSession,
+  EngineSessionInput,
   EngineSessionStore,
   FinishRunInput,
   FinishRunOutcome,

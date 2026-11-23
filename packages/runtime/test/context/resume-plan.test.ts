@@ -1,11 +1,6 @@
 import { describe, expect, it } from "bun:test";
 import type { EngineSession, Message, MessagePart } from "@der/domain";
-import {
-  baseHashWithModel,
-  composeResumeText,
-  planTurn,
-  type TurnPlan,
-} from "@der/runtime/context";
+import { composeResumeText, planTurn, type TurnPlan } from "@der/runtime/context";
 
 const STORED: EngineSession = {
   sessionId: "sess-1",
@@ -14,7 +9,6 @@ const STORED: EngineSession = {
   baseHash: "base-a",
   contextHash: "ctx-a",
   lastOrdinal: 4,
-  pendingRunId: null,
   updatedAt: "2026-11-23T10:00:00.000Z",
 };
 
@@ -37,13 +31,11 @@ function message(ordinal: number, role: Message["role"], parts: MessagePart[]): 
 
 function plan(overrides: Partial<Parameters<typeof planTurn>[0]> = {}): TurnPlan {
   return planTurn({
-    engineResumable: true,
     stored: STORED,
     baseHash: "base-a",
     contextHash: "ctx-a",
     contextBlock: "[Bot Memory v2]\nlikes tea",
     messagesAfterLastOrdinal: [userText(5, "next question")],
-    previousRunOnOtherEngine: false,
     ...overrides,
   });
 }
@@ -70,31 +62,14 @@ describe("decide whether a Run resumes the vendor session or rebuilds", () => {
     });
   });
 
-  it.each<{ name: string; input: Partial<Parameters<typeof planTurn>[0]>; plan: TurnPlan }>([
+  it.each<{ name: string; input: Partial<Parameters<typeof planTurn>[0]> }>([
     {
-      name: "the engine cannot resume",
-      input: { engineResumable: false },
-      plan: { mode: "rebuild", reason: "not-resumable" },
-    },
-    {
-      name: "the session has no stored vendor session for this engine",
+      name: "the Run took no vendor session for this engine",
       input: { stored: null },
-      plan: { mode: "rebuild", reason: "none" },
-    },
-    {
-      name: "the stored row is still pending from a Run that never saved",
-      input: { stored: { ...STORED, pendingRunId: "run-1" } },
-      plan: { mode: "rebuild", reason: "pending" },
-    },
-    {
-      name: "the previous Run of the session ran on another engine",
-      input: { previousRunOnOtherEngine: true },
-      plan: { mode: "rebuild", reason: "gap" },
     },
     {
       name: "the persona, system messages, code-mode text or model changed",
       input: { baseHash: "base-b" },
-      plan: { mode: "rebuild", reason: "base-changed" },
     },
     {
       name: "an assistant message from another engine sits after the last ordinal",
@@ -104,7 +79,6 @@ describe("decide whether a Run resumes the vendor session or rebuilds", () => {
           userText(6, "next question"),
         ],
       },
-      plan: { mode: "rebuild", reason: "gap" },
     },
     {
       name: "a new user message carries a non-text part",
@@ -116,7 +90,6 @@ describe("decide whether a Run resumes the vendor session or rebuilds", () => {
           ]),
         ],
       },
-      plan: { mode: "rebuild", reason: "gap" },
     },
     {
       name: "a system message was added after the last ordinal",
@@ -126,22 +99,13 @@ describe("decide whether a Run resumes the vendor session or rebuilds", () => {
           userText(6, "next question"),
         ],
       },
-      plan: { mode: "rebuild", reason: "gap" },
     },
     {
       name: "no message follows the last ordinal",
       input: { messagesAfterLastOrdinal: [] },
-      plan: { mode: "rebuild", reason: "gap" },
     },
-  ])("rebuilds when $name", ({ input, plan: expected }) => {
-    expect(plan(input)).toEqual(expected);
-  });
-
-  it("reports not-resumable ahead of none when the engine cannot resume and has no row", () => {
-    expect(plan({ engineResumable: false, stored: null })).toEqual({
-      mode: "rebuild",
-      reason: "not-resumable",
-    });
+  ])("rebuilds when $name", ({ input }) => {
+    expect(plan(input)).toEqual({ mode: "rebuild" });
   });
 });
 
@@ -154,18 +118,5 @@ describe("compose the one user message of a resumed turn", () => {
 
   it("puts the context note before the new user text", () => {
     expect(composeResumeText("[note]", [userText(5, "first")])).toBe("[note]\n\nfirst");
-  });
-});
-
-describe("fold the engine model into the base hash", () => {
-  it("keeps a base hash stable for one model and changes it for another", () => {
-    expect([
-      baseHashWithModel("base-a", "claude-sonnet-4-5") ===
-        baseHashWithModel("base-a", "claude-sonnet-4-5"),
-      baseHashWithModel("base-a", "claude-sonnet-4-5") ===
-        baseHashWithModel("base-a", "claude-opus-4-5"),
-      baseHashWithModel("base-a", "claude-sonnet-4-5") ===
-        baseHashWithModel("base-b", "claude-sonnet-4-5"),
-    ]).toEqual([true, false, false]);
   });
 });
