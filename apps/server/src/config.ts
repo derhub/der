@@ -129,6 +129,8 @@ const serverConfigSchema = z
     skillsRootDir: z.string().min(1).default("./data/skills"),
     workspaceRootDir: z.string().min(1).default("./data/workspaces"),
     contextMaxTokens: z.number().int().positive().default(32_000),
+    memoryPromptMaxBytes: z.number().int().positive().default(24_000),
+    skillCatalogMaxBytes: z.number().int().positive().default(8_000),
     allowedOrigins: z
       .array(originString)
       .default([
@@ -282,6 +284,14 @@ export function parseServerConfig(
     env["DER_CONTEXT_MAX_TOKENS"],
     "DER_CONTEXT_MAX_TOKENS",
   );
+  const memoryPromptMaxBytes = parseOptionalInt(
+    env["DER_MEMORY_PROMPT_MAX_BYTES"],
+    "DER_MEMORY_PROMPT_MAX_BYTES",
+  );
+  const skillCatalogMaxBytes = parseOptionalInt(
+    env["DER_SKILL_CATALOG_MAX_BYTES"],
+    "DER_SKILL_CATALOG_MAX_BYTES",
+  );
   const seedFixture = parseOptionalBoolean(env["DER_SEED_FIXTURE"], "DER_SEED_FIXTURE");
   const restateAutoRegister = parseOptionalBoolean(
     env["DER_RESTATE_AUTO_REGISTER"],
@@ -365,6 +375,8 @@ export function parseServerConfig(
     ...(env["DER_SKILLS_ROOT_DIR"] ? { skillsRootDir: env["DER_SKILLS_ROOT_DIR"] } : {}),
     ...(env["DER_WORKSPACE_ROOT_DIR"] ? { workspaceRootDir: env["DER_WORKSPACE_ROOT_DIR"] } : {}),
     ...(contextMaxTokens !== undefined ? { contextMaxTokens } : {}),
+    ...(memoryPromptMaxBytes !== undefined ? { memoryPromptMaxBytes } : {}),
+    ...(skillCatalogMaxBytes !== undefined ? { skillCatalogMaxBytes } : {}),
     ...(allowedOrigins !== undefined ? { allowedOrigins } : {}),
     ...(approvalTimeoutMs !== undefined ? { approvalTimeoutMs } : {}),
     ...(scriptMaxCalls !== undefined ? { scriptMaxCalls } : {}),
