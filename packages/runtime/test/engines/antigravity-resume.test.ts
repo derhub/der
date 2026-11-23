@@ -39,7 +39,6 @@ interface FakeAgy {
   readonly provider: SandboxProvider;
   readonly loadedSessionIds: string[];
   readonly prompts: string[];
-  readonly cancelledSessionIds: string[];
 }
 
 /** Stands in for `agy acp`: the only external process. */
@@ -47,11 +46,9 @@ function fakeAgy(behavior: {
   readonly loadFails?: boolean;
   readonly promptError?: string;
   readonly thought?: string;
-  readonly reply?: string;
 }): FakeAgy {
   const loadedSessionIds: string[] = [];
   const prompts: string[] = [];
-  const cancelledSessionIds: string[] = [];
   const queue: string[] = [];
   let notify: (() => void) | undefined;
   let closed = false;
@@ -111,13 +108,11 @@ function fakeAgy(behavior: {
           sessionId: message.params?.sessionId,
           update: {
             sessionUpdate: "agent_message_chunk",
-            content: { type: "text", text: behavior.reply ?? "Second answer." },
+            content: { type: "text", text: "Second answer." },
           },
         },
       });
       push({ id: message.id, result: { stopReason: "end_turn" } });
-    } else if (message.method === "session/cancel") {
-      cancelledSessionIds.push(message.params?.sessionId ?? "");
     }
   };
 
@@ -242,7 +237,7 @@ function fakeAgy(behavior: {
     },
     async destroy() {},
   };
-  return { provider, loadedSessionIds, prompts, cancelledSessionIds };
+  return { provider, loadedSessionIds, prompts };
 }
 
 async function runEngine(agy: FakeAgy, input: EngineRunInput): Promise<EngineEvent[]> {
@@ -327,23 +322,19 @@ describe("detect an Antigravity session the agent rejects", () => {
     });
   });
 
-  it("cancels the fresh session and reports engine.resume_unavailable with no assistant text on a session id mismatch", async () => {
-    const agy = fakeAgy({ loadFails: true, reply: "answer from a blank session" });
+  it("sends no prompt and reports engine.resume_unavailable when the agent cannot load the session", async () => {
+    const agy = fakeAgy({ loadFails: true });
 
     const events = await runEngine(agy, resumedInput);
 
-    expect([
-      agy.cancelledSessionIds,
-      JSON.stringify(events).includes("blank session"),
-      events.at(-1),
-    ]).toEqual([
-      ["acp-session-new"],
-      false,
+    expect([agy.loadedSessionIds, agy.prompts, events.at(-1)]).toEqual([
+      ["vendor-1"],
+      [],
       {
         type: "failed",
         code: "engine.resume_unavailable",
         detail:
-          'Engine could not resume session "vendor-1"; started fresh session "acp-session-new" instead.',
+          'Unable to resume session "vendor-1": session/load failed; refused the fresh-session fallback',
       },
     ]);
   });

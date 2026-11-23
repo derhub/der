@@ -73,8 +73,8 @@ export interface FinishRunInput {
   readonly usage?: RunUsage;
   /**
    * The finish that first makes the Run terminal replaces the session's engine sessions with this
-   * one, at the reply's ordinal when there is one, or with none when absent. A replayed finish
-   * writes nothing.
+   * one, at the reply's ordinal when there is one, or with none when absent. A finish of a Run
+   * that is already terminal writes nothing.
    */
   readonly engineSession?: EngineSessionInput;
 }

@@ -650,9 +650,9 @@ export async function finishRun(
       outboxEvents.push(...insertOutboxForBindings(db, botBindings, routineEnvelope, now));
     }
 
-    // Only the first terminal write hands over: the Run is then still the session's active Run,
-    // so no successor exists whose row this could replace.
-    if (!existingTerminal) {
+    // Only the write that ends an active Run hands over: no successor exists yet whose row this
+    // could replace.
+    if (["queued", "running", "waiting_approval"].includes(runRow.status)) {
       handOverEngineSession(
         db,
         runRow.session_id,

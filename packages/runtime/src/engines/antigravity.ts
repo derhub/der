@@ -1,6 +1,6 @@
 import type { Engine, EngineEvent, EngineReadiness, Run } from "@der/domain";
 import { chat } from "@tanstack/ai";
-import { acpCompatible } from "@tanstack/ai-acp";
+import { acpCompatible, buildAcpPrompt } from "@tanstack/ai-acp";
 import { defineSandbox, withSandbox, type SandboxProvider } from "@tanstack/ai-sandbox";
 import { DEFAULT_ENGINE_SHADOW_HOMES } from "../sandbox/docker-policy";
 import { createApprovalBridge, type CallbackContinuityState } from "./approval-bridge";
@@ -13,9 +13,12 @@ import {
 
 /**
  * `agy acp` answers `session/load` for an unknown id with that same id, then fails the first
- * prompt with "not_found: trajectory not found: <id>".
+ * prompt with "not_found: trajectory not found: <id>". When `session/load` itself fails, the ACP
+ * adapter opens a fresh session and asks `buildPrompt` for a prompt without a session id; that
+ * call throws `FRESH_FALLBACK_REFUSED`, which the adapter reports before sending any prompt.
  */
-const UNKNOWN_TRAJECTORY_MESSAGE = /trajectory not found/i;
+const FRESH_FALLBACK_REFUSED = "session/load failed; refused the fresh-session fallback";
+const RESUME_REFUSAL_MESSAGE = /trajectory not found|refused the fresh-session fallback/i;
 
 export interface AntigravityEngineConfig {
   readonly model: string;
@@ -93,6 +96,12 @@ export function createAntigravityEngine(config: AntigravityEngineConfig): Engine
           ...config.env,
         },
         onPermissionRequest: (request) => approvalBridge.mediateAcpPermission(request),
+        buildPrompt: (messages, sessionId) => {
+          if (resumeSessionId !== undefined && sessionId === undefined) {
+            throw new Error(FRESH_FALLBACK_REFUSED);
+          }
+          return buildAcpPrompt(messages, sessionId, "antigravity");
+        },
       });
 
       const sandbox = defineSandbox({
@@ -122,7 +131,7 @@ export function createAntigravityEngine(config: AntigravityEngineConfig): Engine
           abortController: controller,
           approvalBridge,
           sessionIdEventName: "antigravity.session-id",
-          isResumeFailure: (message) => UNKNOWN_TRAJECTORY_MESSAGE.test(message),
+          isResumeFailure: (message) => RESUME_REFUSAL_MESSAGE.test(message),
           ...(resumeSessionId !== undefined ? { resumeSessionId } : {}),
         });
       } finally {

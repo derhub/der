@@ -138,6 +138,25 @@ describe("hand the engine session over with the Run's finish", () => {
     }
   });
 
+  it("keeps the successor's engine session when a finished Run is finished again under another key", async () => {
+    const store = openStore();
+    try {
+      const first = await admitRun(store, rowA, "first");
+      await store.finishRun(completion(first, rowA));
+      const second = await admitRun(store, rowA, "second");
+      await store.finishRun(completion(second, { ...rowA, vendorSessionId: "vendor-b" }));
+
+      await store.finishRun({
+        ...completion(first),
+        terminalEvent: { chunkKey: `${first}:terminal-late`, chunk: { type: "RUN_FINISHED" } },
+      });
+
+      expect(store.getEngineSession("sess-a", "codex")?.vendorSessionId).toBe("vendor-b");
+    } finally {
+      store.close();
+    }
+  });
+
   it("leaves the Run unfinished and stores no engine session when the session row is rejected", async () => {
     const store = openStore();
     try {

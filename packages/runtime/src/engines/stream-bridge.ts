@@ -166,8 +166,6 @@ export async function* bridgeAdapterStream(options: {
       if (isRecord(sessionValue) && typeof sessionValue["sessionId"] === "string") {
         const observedSessionId = sessionValue["sessionId"];
         if (held !== undefined && observedSessionId !== resumeSessionId) {
-          // The abort makes the adapter cancel the fresh session, but an ACP adapter has already
-          // sent it the prompt: whatever the vendor does before the cancel lands is not undone.
           const detail = `Engine could not resume session "${resumeSessionId}"; started fresh session "${observedSessionId}" instead.`;
           options.approvalBridge?.markTransportLost(detail);
           options.abortController.abort(detail);

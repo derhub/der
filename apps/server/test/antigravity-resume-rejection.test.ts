@@ -16,10 +16,12 @@ afterEach(async () => {
 
 /**
  * Stands in for `agy acp`, the only external process. Like the recorded CLI, `session/load`
- * echoes any id; a prompt to an id it never created fails with the trajectory error, optionally
- * after streaming `staleText`.
+ * echoes any id unless `rejectsUnknownLoad`; a prompt to an id it never created fails with the
+ * trajectory error, optionally after streaming `staleText`.
  */
-function createFakeAgy(options: { readonly staleText?: string } = {}) {
+function createFakeAgy(
+  options: { readonly staleText?: string; readonly rejectsUnknownLoad?: boolean } = {},
+) {
   const known = new Set<string>();
   const prompts: { readonly sessionId: string; readonly text: string }[] = [];
   let created = 0;
@@ -68,7 +70,15 @@ function createFakeAgy(options: { readonly staleText?: string } = {}) {
           result: { protocolVersion: 1, agentCapabilities: { loadSession: true } },
         });
       } else if (message.method === "session/load") {
-        push({ id: message.id, result: { sessionId: message.params?.sessionId } });
+        const sessionId = message.params?.sessionId ?? "";
+        push(
+          options.rejectsUnknownLoad === true && !known.has(sessionId)
+            ? {
+                id: message.id,
+                error: { code: -32002, message: `session not found: ${sessionId}` },
+              }
+            : { id: message.id, result: { sessionId } },
+        );
       } else if (message.method === "session/new") {
         created += 1;
         const sessionId = `acp-${created}`;
@@ -290,5 +300,26 @@ describe("rebuild when Antigravity rejects a resumed trajectory on the first pro
       second.status,
       assistantTexts(ctx),
     ]).toEqual([["acp-1", "acp-1"], "failed", ["answer from acp-1"]]);
+  }, 60_000);
+});
+
+describe("rebuild when Antigravity cannot load the resumed session", () => {
+  it("sends no prompt to the fallback session and finishes rebuilt on a new one", async () => {
+    const agy = createFakeAgy({ rejectsUnknownLoad: true });
+    const ctx = await startAgyServer(agy);
+    await askAndSettle(ctx, "first question");
+    agy.forget("acp-1");
+
+    const second = await askAndSettle(ctx, "second question");
+
+    expect([
+      agy.prompts.map((prompt) => prompt.sessionId),
+      agy.prompts[1]?.text.endsWith(
+        "Previous conversation:\nUser: first question\nAssistant: answer from acp-1\n\nsecond question",
+      ),
+      second.status,
+      second.contextMode,
+      ctx.server.store.getEngineSession(ctx.sessionId, "antigravity")?.vendorSessionId,
+    ]).toEqual([["acp-1", "acp-3"], true, "completed", "rebuilt", "acp-3"]);
   }, 60_000);
 });
