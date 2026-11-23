@@ -4,6 +4,18 @@ import { Card } from "@astryxdesign/core/Card";
 import { EmptyState } from "@astryxdesign/core/EmptyState";
 import { Heading } from "@astryxdesign/core/Heading";
 import { Text } from "@astryxdesign/core/Text";
+import {
+  colorVars,
+  durationVars,
+  easeVars,
+  focusVars,
+  fontWeightVars,
+  radiusVars,
+  spacingVars,
+  textSizeVars,
+  typographyVars,
+} from "@astryxdesign/core/theme/tokens.stylex";
+import * as stylex from "@stylexjs/stylex";
 import { BookOpenIcon, RefreshCwIcon, ShieldAlertIcon } from "lucide-react";
 import { useCallback, useEffect, useState } from "react";
 import type { ProblemDetails } from "@der/domain";
@@ -14,7 +26,177 @@ import {
   type SkillDetailResponse,
   type SkillsCatalogResponse,
 } from "@/lib/schemas";
-import { cn } from "@/lib/utils";
+
+const styles = stylex.create({
+  root: {
+    display: "flex",
+    flexDirection: "column",
+    gap: spacingVars["--spacing-5"],
+  },
+  header: {
+    display: "flex",
+    flexWrap: "wrap",
+    alignItems: "center",
+    justifyContent: "space-between",
+    gap: spacingVars["--spacing-3"],
+  },
+  titleGroup: {
+    display: "flex",
+    flexDirection: "column",
+    gap: spacingVars["--spacing-0-5"],
+  },
+  splitGrid: {
+    display: "grid",
+    gap: spacingVars["--spacing-4"],
+    gridTemplateColumns: {
+      default: "minmax(0, 1fr)",
+      "@media (min-width: 1024px)": "20rem minmax(0, 1fr)",
+    },
+  },
+  skillList: {
+    display: "flex",
+    flexDirection: "column",
+    gap: spacingVars["--spacing-2"],
+  },
+  skillButton: {
+    display: "flex",
+    width: "100%",
+    flexDirection: "column",
+    gap: spacingVars["--spacing-1"],
+    borderRadius: radiusVars["--radius-container"],
+    borderWidth: 1,
+    borderStyle: "solid",
+    borderColor: colorVars["--color-border"],
+    backgroundColor: {
+      default: colorVars["--color-background-card"],
+      ":hover": colorVars["--color-background-muted"],
+    },
+    paddingInline: "0.875rem",
+    paddingBlock: "0.875rem",
+    textAlign: "left",
+    transitionProperty: "color, background-color, border-color",
+    transitionDuration: durationVars["--duration-fast"],
+    transitionTimingFunction: easeVars["--ease-standard"],
+    outlineStyle: {
+      default: null,
+      ":focus-visible": "solid",
+    },
+    outlineWidth: {
+      default: null,
+      ":focus-visible": focusVars["--focus-outline-width"],
+    },
+    outlineColor: {
+      default: null,
+      ":focus-visible": colorVars["--color-info"],
+    },
+  },
+  skillButtonSelected: {
+    borderColor: colorVars["--color-border-emphasized"],
+    backgroundColor: {
+      default: colorVars["--color-accent-muted"],
+      ":hover": colorVars["--color-accent-muted"],
+    },
+  },
+  skillRowHeader: {
+    display: "flex",
+    alignItems: "center",
+    justifyContent: "space-between",
+    gap: spacingVars["--spacing-2"],
+  },
+  skillName: {
+    fontFamily: typographyVars["--font-family-code"],
+    fontSize: textSizeVars["--font-size-base"],
+    fontWeight: fontWeightVars["--font-weight-semibold"],
+  },
+  skillDescription: {
+    fontSize: textSizeVars["--font-size-sm"],
+    color: colorVars["--color-text-secondary"],
+    lineHeight: 1.625,
+  },
+  skillPath: {
+    fontFamily: typographyVars["--font-family-code"],
+    fontSize: textSizeVars["--font-size-sm"],
+    color: colorVars["--color-text-secondary"],
+  },
+  detailCard: {
+    display: "flex",
+    flexDirection: "column",
+    gap: spacingVars["--spacing-3"],
+  },
+  detailHeader: {
+    display: "flex",
+    flexDirection: "column",
+    gap: spacingVars["--spacing-1"],
+  },
+  monoHeading: {
+    fontFamily: typographyVars["--font-family-code"],
+  },
+  toolBadges: {
+    display: "flex",
+    flexWrap: "wrap",
+    alignItems: "center",
+    gap: spacingVars["--spacing-1-5"],
+    paddingTop: spacingVars["--spacing-1"],
+  },
+  skillBody: {
+    maxHeight: "30rem",
+    overflow: "auto",
+    borderRadius: radiusVars["--radius-element"],
+    borderWidth: 1,
+    borderStyle: "solid",
+    borderColor: colorVars["--color-border"],
+    backgroundColor: colorVars["--color-background-muted"],
+    paddingInline: spacingVars["--spacing-4"],
+    paddingBlock: spacingVars["--spacing-4"],
+    fontFamily: typographyVars["--font-family-code"],
+    fontSize: textSizeVars["--font-size-sm"],
+    lineHeight: 1.625,
+    whiteSpace: "pre-wrap",
+  },
+  rejectedHeadingRow: {
+    display: "flex",
+    alignItems: "center",
+    gap: spacingVars["--spacing-2"],
+  },
+  warningIcon: {
+    width: "1rem",
+    height: "1rem",
+    color: colorVars["--color-icon-warning"],
+  },
+  rejectedList: {
+    display: "flex",
+    flexDirection: "column",
+    gap: spacingVars["--spacing-2"],
+  },
+  rejectedItem: {
+    display: "flex",
+    flexDirection: "column",
+    gap: spacingVars["--spacing-0-5"],
+    borderRadius: radiusVars["--radius-element"],
+    borderWidth: 1,
+    borderStyle: "solid",
+    borderColor: colorVars["--color-border"],
+    backgroundColor: colorVars["--color-background-muted"],
+    paddingInline: spacingVars["--spacing-3"],
+    paddingBlock: spacingVars["--spacing-2"],
+    fontSize: textSizeVars["--font-size-sm"],
+  },
+  rejectedPath: {
+    fontFamily: typographyVars["--font-family-code"],
+    fontWeight: fontWeightVars["--font-weight-medium"],
+  },
+  rejectedReason: {
+    color: colorVars["--color-text-secondary"],
+  },
+  iconSm: {
+    width: "0.875rem",
+    height: "0.875rem",
+  },
+  iconLg: {
+    width: "1.5rem",
+    height: "1.5rem",
+  },
+});
 
 export interface SkillsPanelProps {
   readonly api: OperatorApi;
@@ -82,9 +264,9 @@ export function SkillsPanel({ api }: SkillsPanelProps) {
   }, [api, selectedSkillId]);
 
   return (
-    <div className="flex flex-col gap-5">
-      <div className="flex flex-wrap items-center justify-between gap-3">
-        <div className="flex flex-col gap-0.5">
+    <div {...stylex.props(styles.root)}>
+      <div {...stylex.props(styles.header)}>
+        <div {...stylex.props(styles.titleGroup)}>
           <Heading level={2}>Skill catalog</Heading>
           <Text type="supporting" as="p">
             Read-only Agent Skills packages validated from the server skills root.
@@ -94,7 +276,7 @@ export function SkillsPanel({ api }: SkillsPanelProps) {
           variant="secondary"
           size="sm"
           label={loading ? "Reloading..." : "Reload catalog"}
-          icon={<RefreshCwIcon className="size-3.5" aria-hidden="true" />}
+          icon={<RefreshCwIcon {...stylex.props(styles.iconSm)} aria-hidden="true" />}
           isDisabled={loading}
           onClick={() => void loadCatalog()}
         />
@@ -104,13 +286,13 @@ export function SkillsPanel({ api }: SkillsPanelProps) {
 
       {catalog.skills.length === 0 ? (
         <EmptyState
-          icon={<BookOpenIcon className="size-6" aria-hidden="true" />}
+          icon={<BookOpenIcon {...stylex.props(styles.iconLg)} aria-hidden="true" />}
           title="No valid skills found"
           description="Mount read-only SKILL.md packages into the server skills directory to expose them here."
         />
       ) : (
-        <div className="grid gap-4 lg:grid-cols-[20rem_minmax(0,1fr)]">
-          <ul className="flex flex-col gap-2" aria-label="Available skills">
+        <div {...stylex.props(styles.splitGrid)}>
+          <ul {...stylex.props(styles.skillList)} aria-label="Available skills">
             {catalog.skills.map((entry) => {
               const isSelected = entry.id === selectedSkillId;
               return (
@@ -119,19 +301,14 @@ export function SkillsPanel({ api }: SkillsPanelProps) {
                     type="button"
                     onClick={() => setSelectedSkillId(entry.id)}
                     aria-current={isSelected ? "true" : undefined}
-                    className={cn(
-                      "flex w-full flex-col gap-1 rounded-lg border p-3.5 text-left transition-colors focus-visible:outline-2 focus-visible:outline-info",
-                      isSelected
-                        ? "border-border-strong bg-accent-muted"
-                        : "border-border bg-card hover:bg-muted",
-                    )}
+                    {...stylex.props(styles.skillButton, isSelected && styles.skillButtonSelected)}
                   >
-                    <div className="flex items-center justify-between gap-2">
-                      <span className="font-mono text-sm font-semibold">{entry.name}</span>
+                    <div {...stylex.props(styles.skillRowHeader)}>
+                      <span {...stylex.props(styles.skillName)}>{entry.name}</span>
                       {entry.license ? <Badge variant="neutral" label={entry.license} /> : null}
                     </div>
-                    <p className="text-xs text-secondary leading-relaxed">{entry.description}</p>
-                    <span className="font-mono text-xs text-secondary">{entry.relativePath}</span>
+                    <p {...stylex.props(styles.skillDescription)}>{entry.description}</p>
+                    <span {...stylex.props(styles.skillPath)}>{entry.relativePath}</span>
                   </button>
                 </li>
               );
@@ -139,9 +316,9 @@ export function SkillsPanel({ api }: SkillsPanelProps) {
           </ul>
 
           <Card>
-            <div className="flex flex-col gap-3">
-              <div className="flex flex-col gap-1">
-                <Heading level={3} className="font-mono">
+            <div {...stylex.props(styles.detailCard)}>
+              <div {...stylex.props(styles.detailHeader)}>
+                <Heading level={3} xstyle={styles.monoHeading}>
                   {detail?.skill.name ?? selectedSkillId ?? "Skill details"}
                 </Heading>
                 <Text type="supporting" as="p">
@@ -149,7 +326,7 @@ export function SkillsPanel({ api }: SkillsPanelProps) {
                     "Select a skill to inspect its SKILL.md instructions."}
                 </Text>
                 {detail?.skill.allowedTools && detail.skill.allowedTools.length > 0 ? (
-                  <div className="flex flex-wrap items-center gap-1.5 pt-1">
+                  <div {...stylex.props(styles.toolBadges)}>
                     {detail.skill.allowedTools.map((tool) => (
                       <Badge key={tool} variant="neutral" label={tool} />
                     ))}
@@ -162,7 +339,7 @@ export function SkillsPanel({ api }: SkillsPanelProps) {
                   Loading skill instructions...
                 </Text>
               ) : detail ? (
-                <pre className="max-h-[30rem] overflow-auto rounded-md border border-border bg-muted p-4 font-mono text-xs leading-relaxed whitespace-pre-wrap">
+                <pre {...stylex.props(styles.skillBody)}>
                   {detail.body || "(Empty SKILL.md body)"}
                 </pre>
               ) : null}
@@ -173,24 +350,24 @@ export function SkillsPanel({ api }: SkillsPanelProps) {
 
       {catalog.rejected.length > 0 ? (
         <Card>
-          <div className="flex flex-col gap-3">
-            <div className="flex flex-col gap-1">
-              <div className="flex items-center gap-2">
-                <ShieldAlertIcon className="size-4 text-warning" aria-hidden="true" />
+          <div {...stylex.props(styles.detailCard)}>
+            <div {...stylex.props(styles.detailHeader)}>
+              <div {...stylex.props(styles.rejectedHeadingRow)}>
+                <ShieldAlertIcon {...stylex.props(styles.warningIcon)} aria-hidden="true" />
                 <Heading level={3}>Rejected skill packages ({catalog.rejected.length})</Heading>
               </div>
               <Text type="supporting" as="p">
                 Entries rejected by frontmatter or path containment validation.
               </Text>
             </div>
-            <ul className="flex flex-col gap-2">
+            <ul {...stylex.props(styles.rejectedList)}>
               {catalog.rejected.map((item) => (
                 <li
                   key={`${item.relativePath}:${item.reason}`}
-                  className="flex flex-col gap-0.5 rounded-md border border-border bg-muted px-3 py-2 text-xs"
+                  {...stylex.props(styles.rejectedItem)}
                 >
-                  <span className="font-mono font-medium">{item.relativePath}</span>
-                  <span className="text-secondary">{item.reason}</span>
+                  <span {...stylex.props(styles.rejectedPath)}>{item.relativePath}</span>
+                  <span {...stylex.props(styles.rejectedReason)}>{item.reason}</span>
                 </li>
               ))}
             </ul>

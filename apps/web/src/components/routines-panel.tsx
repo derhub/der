@@ -10,13 +10,201 @@ import { Switch } from "@astryxdesign/core/Switch";
 import { Text } from "@astryxdesign/core/Text";
 import { TextArea } from "@astryxdesign/core/TextArea";
 import { TextInput } from "@astryxdesign/core/TextInput";
+import {
+  colorVars,
+  durationVars,
+  easeVars,
+  focusVars,
+  fontWeightVars,
+  radiusVars,
+  spacingVars,
+  textSizeVars,
+  typographyVars,
+} from "@astryxdesign/core/theme/tokens.stylex";
+import * as stylex from "@stylexjs/stylex";
 import { CalendarClockIcon, PlusIcon, RefreshCwIcon } from "lucide-react";
 import { useCallback, useEffect, useState, type FormEvent } from "react";
 import type { Bot, EngineKind, ProblemDetails, Routine, Session } from "@der/domain";
 import { ProblemAlert } from "@/components/problem-alert";
 import type { OperatorApi } from "@/lib/operator-api";
 import { toOperatorProblem, type RoutineDetailResponse } from "@/lib/schemas";
-import { cn } from "@/lib/utils";
+
+const styles = stylex.create({
+  root: {
+    display: "flex",
+    flexDirection: "column",
+    gap: spacingVars["--spacing-5"],
+  },
+  header: {
+    display: "flex",
+    flexWrap: "wrap",
+    alignItems: "center",
+    justifyContent: "space-between",
+    gap: spacingVars["--spacing-3"],
+  },
+  titleGroup: {
+    display: "flex",
+    flexDirection: "column",
+    gap: spacingVars["--spacing-0-5"],
+  },
+  actions: {
+    display: "flex",
+    alignItems: "center",
+    gap: spacingVars["--spacing-2"],
+  },
+  splitGrid: {
+    display: "grid",
+    gap: spacingVars["--spacing-4"],
+    gridTemplateColumns: {
+      default: "minmax(0, 1fr)",
+      "@media (min-width: 1024px)": "22rem minmax(0, 1fr)",
+    },
+  },
+  routineList: {
+    display: "flex",
+    flexDirection: "column",
+    gap: spacingVars["--spacing-2"],
+  },
+  routineItem: {
+    display: "flex",
+    flexDirection: "column",
+    gap: "0.625rem",
+    borderRadius: radiusVars["--radius-container"],
+    borderWidth: 1,
+    borderStyle: "solid",
+    borderColor: colorVars["--color-border"],
+    backgroundColor: colorVars["--color-background-card"],
+    paddingInline: "0.875rem",
+    paddingBlock: "0.875rem",
+    transitionProperty: "color, background-color, border-color",
+    transitionDuration: durationVars["--duration-fast"],
+    transitionTimingFunction: easeVars["--ease-standard"],
+  },
+  routineItemSelected: {
+    borderColor: colorVars["--color-border-emphasized"],
+    backgroundColor: colorVars["--color-accent-muted"],
+  },
+  routineTopRow: {
+    display: "flex",
+    alignItems: "flex-start",
+    justifyContent: "space-between",
+    gap: spacingVars["--spacing-2"],
+  },
+  routineSelectButton: {
+    display: "flex",
+    flexDirection: "column",
+    alignItems: "flex-start",
+    gap: spacingVars["--spacing-0-5"],
+    textAlign: "left",
+    outlineStyle: {
+      default: null,
+      ":focus-visible": "solid",
+    },
+    outlineWidth: {
+      default: null,
+      ":focus-visible": focusVars["--focus-outline-width"],
+    },
+    outlineColor: {
+      default: null,
+      ":focus-visible": colorVars["--color-info"],
+    },
+  },
+  routineName: {
+    fontSize: textSizeVars["--font-size-base"],
+    fontWeight: fontWeightVars["--font-weight-semibold"],
+  },
+  routineCron: {
+    fontFamily: typographyVars["--font-family-code"],
+    fontSize: textSizeVars["--font-size-sm"],
+    color: colorVars["--color-text-secondary"],
+  },
+  badgeRow: {
+    display: "flex",
+    flexWrap: "wrap",
+    alignItems: "center",
+    gap: spacingVars["--spacing-1-5"],
+  },
+  detailCard: {
+    display: "flex",
+    flexDirection: "column",
+    gap: spacingVars["--spacing-4"],
+  },
+  detailSection: {
+    display: "flex",
+    flexDirection: "column",
+    gap: spacingVars["--spacing-1"],
+  },
+  slotsSection: {
+    display: "flex",
+    flexDirection: "column",
+    gap: spacingVars["--spacing-2"],
+  },
+  promptBox: {
+    borderRadius: radiusVars["--radius-element"],
+    borderWidth: 1,
+    borderStyle: "solid",
+    borderColor: colorVars["--color-border"],
+    backgroundColor: colorVars["--color-background-muted"],
+    paddingInline: spacingVars["--spacing-3"],
+    paddingBlock: spacingVars["--spacing-2"],
+    fontSize: textSizeVars["--font-size-base"],
+    lineHeight: 1.625,
+  },
+  slotList: {
+    display: "flex",
+    flexDirection: "column",
+    gap: spacingVars["--spacing-1-5"],
+  },
+  slotItem: {
+    display: "flex",
+    flexWrap: "wrap",
+    alignItems: "center",
+    justifyContent: "space-between",
+    gap: spacingVars["--spacing-2"],
+    borderRadius: radiusVars["--radius-element"],
+    borderWidth: 1,
+    borderStyle: "solid",
+    borderColor: colorVars["--color-border"],
+    paddingInline: spacingVars["--spacing-3"],
+    paddingBlock: spacingVars["--spacing-2"],
+    fontSize: textSizeVars["--font-size-sm"],
+  },
+  monoText: {
+    fontFamily: typographyVars["--font-family-code"],
+  },
+  slotMeta: {
+    display: "flex",
+    alignItems: "center",
+    gap: spacingVars["--spacing-2"],
+  },
+  slotRunId: {
+    fontFamily: typographyVars["--font-family-code"],
+    fontSize: textSizeVars["--font-size-sm"],
+    color: colorVars["--color-text-secondary"],
+  },
+  dialogFields: {
+    display: "flex",
+    flexDirection: "column",
+    gap: spacingVars["--spacing-4"],
+  },
+  monoControl: {
+    fontFamily: typographyVars["--font-family-code"],
+    fontSize: textSizeVars["--font-size-sm"],
+  },
+  dialogFooterActions: {
+    display: "flex",
+    justifyContent: "flex-end",
+    gap: spacingVars["--spacing-2"],
+  },
+  iconSm: {
+    width: "0.875rem",
+    height: "0.875rem",
+  },
+  iconLg: {
+    width: "1.5rem",
+    height: "1.5rem",
+  },
+});
 
 export interface RoutinesPanelProps {
   readonly api: OperatorApi;
@@ -174,7 +362,7 @@ export function RoutinesPanel({ api, bot, sessions, onAnnounce }: RoutinesPanelP
   if (!bot) {
     return (
       <EmptyState
-        icon={<CalendarClockIcon className="size-6" aria-hidden="true" />}
+        icon={<CalendarClockIcon {...stylex.props(styles.iconLg)} aria-hidden="true" />}
         title="No bot selected"
         description="Select a bot to inspect and configure its UTC Routines."
       />
@@ -192,9 +380,9 @@ export function RoutinesPanel({ api, bot, sessions, onAnnounce }: RoutinesPanelP
   }));
 
   return (
-    <div className="flex flex-col gap-5">
-      <div className="flex flex-wrap items-center justify-between gap-3">
-        <div className="flex flex-col gap-0.5">
+    <div {...stylex.props(styles.root)}>
+      <div {...stylex.props(styles.header)}>
+        <div {...stylex.props(styles.titleGroup)}>
           <Heading level={2}>Routines for {bot.name}</Heading>
           <Text type="supporting" as="p">
             Durable UTC cron schedules backed by Restate Virtual Objects and unattended engine
@@ -202,12 +390,12 @@ export function RoutinesPanel({ api, bot, sessions, onAnnounce }: RoutinesPanelP
           </Text>
         </div>
 
-        <div className="flex items-center gap-2">
+        <div {...stylex.props(styles.actions)}>
           <Button
             variant="secondary"
             size="sm"
             label="Refresh"
-            icon={<RefreshCwIcon className="size-3.5" aria-hidden="true" />}
+            icon={<RefreshCwIcon {...stylex.props(styles.iconSm)} aria-hidden="true" />}
             isDisabled={loading}
             onClick={() => void loadRoutines(bot.id)}
           />
@@ -215,7 +403,7 @@ export function RoutinesPanel({ api, bot, sessions, onAnnounce }: RoutinesPanelP
             variant="primary"
             size="sm"
             label="New routine"
-            icon={<PlusIcon className="size-3.5" aria-hidden="true" />}
+            icon={<PlusIcon {...stylex.props(styles.iconSm)} aria-hidden="true" />}
             isDisabled={sessions.length === 0}
             onClick={openCreateDialog}
           />
@@ -226,7 +414,7 @@ export function RoutinesPanel({ api, bot, sessions, onAnnounce }: RoutinesPanelP
 
       {routines.length === 0 ? (
         <EmptyState
-          icon={<CalendarClockIcon className="size-6" aria-hidden="true" />}
+          icon={<CalendarClockIcon {...stylex.props(styles.iconLg)} aria-hidden="true" />}
           title="No routines scheduled"
           description={
             sessions.length === 0
@@ -239,33 +427,30 @@ export function RoutinesPanel({ api, bot, sessions, onAnnounce }: RoutinesPanelP
                 variant="primary"
                 size="sm"
                 label="New routine"
-                icon={<PlusIcon className="size-3.5" aria-hidden="true" />}
+                icon={<PlusIcon {...stylex.props(styles.iconSm)} aria-hidden="true" />}
                 onClick={openCreateDialog}
               />
             ) : undefined
           }
         />
       ) : (
-        <div className="grid gap-4 lg:grid-cols-[22rem_minmax(0,1fr)]">
-          <ul className="flex flex-col gap-2" aria-label="Bot routines">
+        <div {...stylex.props(styles.splitGrid)}>
+          <ul {...stylex.props(styles.routineList)} aria-label="Bot routines">
             {routines.map((entry) => {
               const isSelected = entry.id === selectedRoutineId;
               return (
                 <li
                   key={entry.id}
-                  className={cn(
-                    "flex flex-col gap-2.5 rounded-lg border p-3.5 transition-colors",
-                    isSelected ? "border-border-strong bg-accent-muted" : "border-border bg-card",
-                  )}
+                  {...stylex.props(styles.routineItem, isSelected && styles.routineItemSelected)}
                 >
-                  <div className="flex items-start justify-between gap-2">
+                  <div {...stylex.props(styles.routineTopRow)}>
                     <button
                       type="button"
                       onClick={() => setSelectedRoutineId(entry.id)}
-                      className="flex flex-col items-start gap-0.5 text-left focus-visible:outline-2 focus-visible:outline-info"
+                      {...stylex.props(styles.routineSelectButton)}
                     >
-                      <span className="text-sm font-semibold">{entry.name}</span>
-                      <span className="font-mono text-xs text-secondary">{entry.cron} UTC</span>
+                      <span {...stylex.props(styles.routineName)}>{entry.name}</span>
+                      <span {...stylex.props(styles.routineCron)}>{entry.cron} UTC</span>
                     </button>
                     <Switch
                       label={`Toggle routine ${entry.name}`}
@@ -276,7 +461,7 @@ export function RoutinesPanel({ api, bot, sessions, onAnnounce }: RoutinesPanelP
                       onChange={(checked) => void handleToggle(entry, checked)}
                     />
                   </div>
-                  <div className="flex flex-wrap items-center gap-1.5">
+                  <div {...stylex.props(styles.badgeRow)}>
                     <Badge
                       variant={entry.enabled ? "success" : "neutral"}
                       label={entry.enabled ? "Enabled" : "Paused"}
@@ -290,8 +475,8 @@ export function RoutinesPanel({ api, bot, sessions, onAnnounce }: RoutinesPanelP
           </ul>
 
           <Card>
-            <div className="flex flex-col gap-4">
-              <div className="flex flex-col gap-1">
+            <div {...stylex.props(styles.detailCard)}>
+              <div {...stylex.props(styles.detailSection)}>
                 <Heading level={3}>{detail?.routine.name ?? "Routine detail"}</Heading>
                 <Text type="code" color="secondary" as="p">
                   {detail
@@ -302,16 +487,14 @@ export function RoutinesPanel({ api, bot, sessions, onAnnounce }: RoutinesPanelP
 
               {detail ? (
                 <>
-                  <div className="flex flex-col gap-1">
+                  <div {...stylex.props(styles.detailSection)}>
                     <Text type="label" color="secondary">
                       Prompt
                     </Text>
-                    <p className="rounded-md border border-border bg-muted px-3 py-2 text-sm leading-relaxed">
-                      {detail.routine.prompt}
-                    </p>
+                    <p {...stylex.props(styles.promptBox)}>{detail.routine.prompt}</p>
                   </div>
 
-                  <div className="flex flex-col gap-2">
+                  <div {...stylex.props(styles.slotsSection)}>
                     <Text type="label" color="secondary">
                       Recorded UTC slots ({detail.slots.length})
                     </Text>
@@ -320,22 +503,20 @@ export function RoutinesPanel({ api, bot, sessions, onAnnounce }: RoutinesPanelP
                         No UTC slots have fired yet for this routine.
                       </Text>
                     ) : (
-                      <ul className="flex flex-col gap-1.5">
+                      <ul {...stylex.props(styles.slotList)}>
                         {detail.slots.map((slot) => (
                           <li
                             key={`${slot.slot}:${slot.revision}`}
-                            className="flex flex-wrap items-center justify-between gap-2 rounded-md border border-border px-3 py-2 text-xs"
+                            {...stylex.props(styles.slotItem)}
                           >
-                            <span className="font-mono">{slot.slot}</span>
-                            <div className="flex items-center gap-2">
+                            <span {...stylex.props(styles.monoText)}>{slot.slot}</span>
+                            <div {...stylex.props(styles.slotMeta)}>
                               <Badge
                                 variant={dispositionBadgeVariant(slot.disposition)}
                                 label={slot.disposition}
                               />
                               {slot.runId ? (
-                                <span className="font-mono text-xs text-secondary">
-                                  run {slot.runId}
-                                </span>
+                                <span {...stylex.props(styles.slotRunId)}>run {slot.runId}</span>
                               ) : null}
                             </div>
                           </li>
@@ -364,7 +545,7 @@ export function RoutinesPanel({ api, bot, sessions, onAnnounce }: RoutinesPanelP
             }
             content={
               <LayoutContent isScrollable={false}>
-                <div className="flex flex-col gap-4">
+                <div {...stylex.props(styles.dialogFields)}>
                   {formProblem ? (
                     <ProblemAlert problem={formProblem} onDismiss={() => setFormProblem(null)} />
                   ) : null}
@@ -398,7 +579,7 @@ export function RoutinesPanel({ api, bot, sessions, onAnnounce }: RoutinesPanelP
                     placeholder="0 8 * * *"
                     isRequired
                     width="100%"
-                    controlClassName="font-mono text-xs"
+                    controlXstyle={styles.monoControl}
                   />
 
                   <Selector
@@ -435,7 +616,7 @@ export function RoutinesPanel({ api, bot, sessions, onAnnounce }: RoutinesPanelP
             }
             footer={
               <LayoutFooter hasDivider>
-                <div className="flex justify-end gap-2">
+                <div {...stylex.props(styles.dialogFooterActions)}>
                   <Button variant="secondary" label="Cancel" onClick={() => setCreateOpen(false)} />
                   <Button
                     type="submit"

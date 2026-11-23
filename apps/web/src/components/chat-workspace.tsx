@@ -17,6 +17,15 @@ import { EmptyState } from "@astryxdesign/core/EmptyState";
 import { Heading } from "@astryxdesign/core/Heading";
 import { Selector } from "@astryxdesign/core/Selector";
 import { Text } from "@astryxdesign/core/Text";
+import {
+  colorVars,
+  fontWeightVars,
+  radiusVars,
+  spacingVars,
+  textSizeVars,
+  typographyVars,
+} from "@astryxdesign/core/theme/tokens.stylex";
+import * as stylex from "@stylexjs/stylex";
 import { CheckIcon, MessageSquareIcon, RefreshCwIcon, ShieldAlertIcon, XIcon } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState, type KeyboardEvent } from "react";
 import type {
@@ -40,6 +49,208 @@ import {
   type RunStreamStatus,
 } from "@/lib/run-stream";
 import { toOperatorProblem } from "@/lib/schemas";
+
+const styles = stylex.create({
+  root: {
+    display: "flex",
+    flexDirection: "column",
+    gap: spacingVars["--spacing-4"],
+  },
+  toolbar: {
+    display: "flex",
+    flexWrap: "wrap",
+    alignItems: "center",
+    justifyContent: "space-between",
+    gap: spacingVars["--spacing-3"],
+    borderRadius: radiusVars["--radius-container"],
+    borderWidth: 1,
+    borderStyle: "solid",
+    borderColor: colorVars["--color-border"],
+    backgroundColor: colorVars["--color-background-card"],
+    paddingInline: spacingVars["--spacing-4"],
+    paddingBlock: spacingVars["--spacing-3"],
+  },
+  inlineGroup: {
+    display: "flex",
+    flexWrap: "wrap",
+    alignItems: "center",
+    gap: spacingVars["--spacing-2"],
+  },
+  sessionTitle: {
+    fontSize: textSizeVars["--font-size-base"],
+    fontWeight: fontWeightVars["--font-weight-semibold"],
+  },
+  verticalDivider: {
+    height: spacingVars["--spacing-4"],
+  },
+  monoMuted: {
+    fontFamily: typographyVars["--font-family-code"],
+    fontSize: textSizeVars["--font-size-sm"],
+    color: colorVars["--color-text-secondary"],
+  },
+  approvalBody: {
+    display: "flex",
+    flexDirection: "column",
+    gap: spacingVars["--spacing-3"],
+  },
+  columnGap1: {
+    display: "flex",
+    flexDirection: "column",
+    gap: spacingVars["--spacing-1"],
+  },
+  columnGap2: {
+    display: "flex",
+    flexDirection: "column",
+    gap: spacingVars["--spacing-2"],
+  },
+  columnGap05: {
+    display: "flex",
+    flexDirection: "column",
+    gap: spacingVars["--spacing-0-5"],
+  },
+  rowBetweenWrap: {
+    display: "flex",
+    flexWrap: "wrap",
+    alignItems: "center",
+    justifyContent: "space-between",
+    gap: spacingVars["--spacing-2"],
+  },
+  rowCenterGap2: {
+    display: "flex",
+    alignItems: "center",
+    gap: spacingVars["--spacing-2"],
+  },
+  warningIcon: {
+    width: "1rem",
+    height: "1rem",
+    color: colorVars["--color-icon-warning"],
+  },
+  approvalGrid: {
+    display: "grid",
+    gap: spacingVars["--spacing-2"],
+    fontSize: textSizeVars["--font-size-sm"],
+    gridTemplateColumns: {
+      default: "minmax(0, 1fr)",
+      "@media (min-width: 640px)": "repeat(2, minmax(0, 1fr))",
+      "@media (min-width: 1024px)": "repeat(4, minmax(0, 1fr))",
+    },
+  },
+  mutedLabel: {
+    fontSize: textSizeVars["--font-size-sm"],
+    color: colorVars["--color-text-secondary"],
+  },
+  monoMedium: {
+    fontFamily: typographyVars["--font-family-code"],
+    fontWeight: fontWeightVars["--font-weight-medium"],
+  },
+  monoInline: {
+    fontFamily: typographyVars["--font-family-code"],
+  },
+  canonicalArgs: {
+    overflowX: "auto",
+    borderRadius: radiusVars["--radius-element"],
+    borderWidth: 1,
+    borderStyle: "solid",
+    borderColor: colorVars["--color-border"],
+    backgroundColor: colorVars["--color-background-card"],
+    paddingInline: spacingVars["--spacing-3"],
+    paddingBlock: spacingVars["--spacing-3"],
+    fontFamily: typographyVars["--font-family-code"],
+    fontSize: textSizeVars["--font-size-sm"],
+    lineHeight: 1.625,
+  },
+  approvalActions: {
+    display: "flex",
+    flexWrap: "wrap",
+    justifyContent: "flex-end",
+    gap: spacingVars["--spacing-2"],
+    paddingTop: spacingVars["--spacing-1"],
+  },
+  transcriptHeader: {
+    display: "flex",
+    alignItems: "center",
+    justifyContent: "space-between",
+    gap: spacingVars["--spacing-2"],
+    borderBottomWidth: 1,
+    borderBottomStyle: "solid",
+    borderBottomColor: colorVars["--color-border"],
+    paddingInline: spacingVars["--spacing-4"],
+    paddingBlock: spacingVars["--spacing-3"],
+  },
+  chatLayout: {
+    minHeight: "26rem",
+    maxHeight: "38rem",
+  },
+  promptTextarea: {
+    width: "100%",
+    resize: "vertical",
+    backgroundColor: "transparent",
+    fontSize: textSizeVars["--font-size-base"],
+    color: colorVars["--color-text-primary"],
+    outlineStyle: "none",
+    "::placeholder": {
+      color: colorVars["--color-text-secondary"],
+    },
+  },
+  toolDetailBox: {
+    display: "flex",
+    flexDirection: "column",
+    gap: spacingVars["--spacing-2"],
+    fontFamily: typographyVars["--font-family-code"],
+    fontSize: textSizeVars["--font-size-sm"],
+  },
+  toolArgsPre: {
+    overflowX: "auto",
+    whiteSpace: "pre-wrap",
+    color: colorVars["--color-text-secondary"],
+  },
+  toolResultPre: {
+    overflowX: "auto",
+    whiteSpace: "pre-wrap",
+    borderTopWidth: 1,
+    borderTopStyle: "solid",
+    borderTopColor: colorVars["--color-border"],
+    paddingTop: spacingVars["--spacing-2"],
+  },
+  toolResultSoloPre: {
+    overflowX: "auto",
+    fontFamily: typographyVars["--font-family-code"],
+    fontSize: textSizeVars["--font-size-sm"],
+    whiteSpace: "pre-wrap",
+  },
+  messageText: {
+    fontSize: textSizeVars["--font-size-base"],
+    lineHeight: 1.625,
+    whiteSpace: "pre-wrap",
+    overflowWrap: "break-word",
+  },
+  thinkingBox: {
+    borderRadius: radiusVars["--radius-element"],
+    borderWidth: 1,
+    borderStyle: "dashed",
+    borderColor: colorVars["--color-border"],
+    backgroundColor: colorVars["--color-background-muted"],
+    paddingInline: spacingVars["--spacing-3"],
+    paddingBlock: spacingVars["--spacing-2"],
+    fontSize: textSizeVars["--font-size-sm"],
+    color: colorVars["--color-text-secondary"],
+    fontStyle: "italic",
+    whiteSpace: "pre-wrap",
+  },
+  waitingHint: {
+    fontSize: textSizeVars["--font-size-sm"],
+    fontStyle: "italic",
+    opacity: 0.75,
+  },
+  iconSm: {
+    width: "0.875rem",
+    height: "0.875rem",
+  },
+  iconLg: {
+    width: "1.5rem",
+    height: "1.5rem",
+  },
+});
 
 interface PersistedRunCursor {
   readonly runId: string;
@@ -164,14 +375,10 @@ function extractToolCallItems(parts: UIMessage["parts"]): ChatToolCallItem[] {
         status,
         ...(isError ? { errorMessage: "Tool returned an error outcome." } : {}),
         resultDetail: (
-          <div className="flex flex-col gap-2 font-mono text-xs">
-            <pre className="overflow-x-auto whitespace-pre-wrap text-secondary">
-              {part.arguments}
-            </pre>
+          <div {...stylex.props(styles.toolDetailBox)}>
+            <pre {...stylex.props(styles.toolArgsPre)}>{part.arguments}</pre>
             {resultText !== null ? (
-              <pre className="overflow-x-auto whitespace-pre-wrap border-t border-border pt-2">
-                {resultText}
-              </pre>
+              <pre {...stylex.props(styles.toolResultPre)}>{resultText}</pre>
             ) : null}
           </div>
         ),
@@ -189,9 +396,7 @@ function extractToolCallItems(parts: UIMessage["parts"]): ChatToolCallItem[] {
         name: part.toolCallId,
         status: isError ? "error" : "complete",
         ...(isError ? { errorMessage: "Tool returned an error outcome." } : {}),
-        resultDetail: (
-          <pre className="overflow-x-auto font-mono text-xs whitespace-pre-wrap">{resultText}</pre>
-        ),
+        resultDetail: <pre {...stylex.props(styles.toolResultSoloPre)}>{resultText}</pre>,
       });
     }
   }
@@ -482,21 +687,21 @@ export function ChatWorkspace({
   const engineOptions = bot.allowedEngines.map((kind) => ({ value: kind, label: kind }));
 
   return (
-    <div className="flex flex-col gap-4">
-      <div className="flex flex-wrap items-center justify-between gap-3 rounded-lg border border-border bg-card px-4 py-3">
-        <div className="flex flex-wrap items-center gap-2">
-          <span className="text-sm font-semibold">{session.title}</span>
+    <div {...stylex.props(styles.root)}>
+      <div {...stylex.props(styles.toolbar)}>
+        <div {...stylex.props(styles.inlineGroup)}>
+          <span {...stylex.props(styles.sessionTitle)}>{session.title}</span>
           <Badge variant="neutral" label={session.id} />
           {activeRun ? (
             <>
-              <Divider orientation="vertical" className="h-4" />
-              <span className="font-mono text-xs text-secondary">run {activeRun.id}</span>
+              <Divider orientation="vertical" xstyle={styles.verticalDivider} />
+              <span {...stylex.props(styles.monoMuted)}>run {activeRun.id}</span>
               <Badge variant={runStatusBadgeVariant(activeRun.status)} label={activeRun.status} />
             </>
           ) : null}
         </div>
 
-        <div className="flex flex-wrap items-center gap-2">
+        <div {...stylex.props(styles.inlineGroup)}>
           <Badge
             variant="neutral"
             label={`SSE: ${streamStatusLabel(streamStatus)}${committedCursor > 0 ? ` · seq #${committedCursor}` : ""}`}
@@ -506,7 +711,7 @@ export function ChatWorkspace({
               size="sm"
               variant="secondary"
               label={resumingStream ? "Reconnecting..." : "Resume stream"}
-              icon={<RefreshCwIcon className="size-3.5" aria-hidden="true" />}
+              icon={<RefreshCwIcon {...stylex.props(styles.iconSm)} aria-hidden="true" />}
               isDisabled={resumingStream}
               onClick={() => void handleReconnectRun()}
             />
@@ -515,7 +720,7 @@ export function ChatWorkspace({
             size="sm"
             variant="ghost"
             label="Sync history"
-            icon={<RefreshCwIcon className="size-3.5" aria-hidden="true" />}
+            icon={<RefreshCwIcon {...stylex.props(styles.iconSm)} aria-hidden="true" />}
             isDisabled={historyLoading}
             onClick={() => void refreshHistory()}
           />
@@ -540,11 +745,11 @@ export function ChatWorkspace({
           variant={activeApproval.decision.status === "pending" ? "yellow" : "default"}
           data-approval-id={activeApproval.id}
         >
-          <div className="flex flex-col gap-3">
-            <div className="flex flex-col gap-1">
-              <div className="flex flex-wrap items-center justify-between gap-2">
-                <div className="flex items-center gap-2">
-                  <ShieldAlertIcon className="size-4 text-warning" aria-hidden="true" />
+          <div {...stylex.props(styles.approvalBody)}>
+            <div {...stylex.props(styles.columnGap1)}>
+              <div {...stylex.props(styles.rowBetweenWrap)}>
+                <div {...stylex.props(styles.rowCenterGap2)}>
+                  <ShieldAlertIcon {...stylex.props(styles.warningIcon)} aria-hidden="true" />
                   <Heading level={3}>Exact-operation approval</Heading>
                 </div>
                 <Badge
@@ -557,51 +762,63 @@ export function ChatWorkspace({
               </Text>
             </div>
 
-            <div className="grid gap-2 text-xs sm:grid-cols-2 lg:grid-cols-4">
-              <div className="flex flex-col gap-0.5">
-                <span className="text-secondary">Operation kind</span>
-                <span className="font-mono font-medium">{activeApproval.effect.operationKind}</span>
+            <div {...stylex.props(styles.approvalGrid)}>
+              <div {...stylex.props(styles.columnGap05)}>
+                <span {...stylex.props(styles.mutedLabel)}>Operation kind</span>
+                <span {...stylex.props(styles.monoMedium)}>
+                  {activeApproval.effect.operationKind}
+                </span>
               </div>
-              <div className="flex flex-col gap-0.5">
-                <span className="text-secondary">Operation ID</span>
-                <span className="font-mono font-medium">{activeApproval.effect.operationId}</span>
+              <div {...stylex.props(styles.columnGap05)}>
+                <span {...stylex.props(styles.mutedLabel)}>Operation ID</span>
+                <span {...stylex.props(styles.monoMedium)}>
+                  {activeApproval.effect.operationId}
+                </span>
               </div>
-              <div className="flex flex-col gap-0.5">
-                <span className="text-secondary">Attempt ID</span>
-                <span className="font-mono font-medium">{activeApproval.effect.attemptId}</span>
+              <div {...stylex.props(styles.columnGap05)}>
+                <span {...stylex.props(styles.mutedLabel)}>Attempt ID</span>
+                <span {...stylex.props(styles.monoMedium)}>{activeApproval.effect.attemptId}</span>
               </div>
-              <div className="flex flex-col gap-0.5">
-                <span className="text-secondary">Deadline (UTC)</span>
-                <span className="font-mono font-medium">{activeApproval.deadline}</span>
+              <div {...stylex.props(styles.columnGap05)}>
+                <span {...stylex.props(styles.mutedLabel)}>Deadline (UTC)</span>
+                <span {...stylex.props(styles.monoMedium)}>{activeApproval.deadline}</span>
               </div>
             </div>
 
-            <div className="flex flex-col gap-1">
-              <span className="text-xs text-secondary">Canonical arguments</span>
-              <pre className="overflow-x-auto rounded-md border border-border bg-card p-3 font-mono text-xs leading-relaxed">
+            <div {...stylex.props(styles.columnGap1)}>
+              <span {...stylex.props(styles.mutedLabel)}>Canonical arguments</span>
+              <pre {...stylex.props(styles.canonicalArgs)}>
                 {JSON.stringify(activeApproval.effect.canonicalArguments, null, 2)}
               </pre>
             </div>
 
             {activeApproval.decision.status === "approved" ||
             activeApproval.decision.status === "denied" ? (
-              <p className="text-xs text-secondary">
-                Decided by <span className="font-mono">{activeApproval.decision.actor}</span> at{" "}
-                <span className="font-mono">{activeApproval.decision.decidedAt}</span>.
+              <p {...stylex.props(styles.mutedLabel)}>
+                Decided by{" "}
+                <span {...stylex.props(styles.monoInline)}>{activeApproval.decision.actor}</span> at{" "}
+                <span {...stylex.props(styles.monoInline)}>
+                  {activeApproval.decision.decidedAt}
+                </span>
+                .
               </p>
             ) : activeApproval.decision.status === "expired" ? (
-              <p className="text-xs text-secondary">
-                Expired at <span className="font-mono">{activeApproval.decision.decidedAt}</span>.
+              <p {...stylex.props(styles.mutedLabel)}>
+                Expired at{" "}
+                <span {...stylex.props(styles.monoInline)}>
+                  {activeApproval.decision.decidedAt}
+                </span>
+                .
               </p>
             ) : null}
 
             {activeApproval.decision.status === "pending" ? (
-              <div className="flex flex-wrap justify-end gap-2 pt-1">
+              <div {...stylex.props(styles.approvalActions)}>
                 <Button
                   variant="secondary"
                   size="sm"
                   label="Deny effect"
-                  icon={<XIcon className="size-3.5" aria-hidden="true" />}
+                  icon={<XIcon {...stylex.props(styles.iconSm)} aria-hidden="true" />}
                   isDisabled={decidingApproval}
                   onClick={() => void handleApprovalDecision("denied")}
                 />
@@ -609,7 +826,7 @@ export function ChatWorkspace({
                   variant="primary"
                   size="sm"
                   label={decidingApproval ? "Submitting..." : "Approve effect"}
-                  icon={<CheckIcon className="size-3.5" aria-hidden="true" />}
+                  icon={<CheckIcon {...stylex.props(styles.iconSm)} aria-hidden="true" />}
                   isDisabled={decidingApproval}
                   onClick={() => void handleApprovalDecision("approved")}
                 />
@@ -620,24 +837,24 @@ export function ChatWorkspace({
       ) : null}
 
       <Card padding={0}>
-        <div className="flex items-center justify-between gap-2 border-b border-border px-4 py-3">
-          <div className="flex flex-col gap-0.5">
+        <div {...stylex.props(styles.transcriptHeader)}>
+          <div {...stylex.props(styles.columnGap05)}>
             <Heading level={3}>Scoped transcript</Heading>
             <Text type="supporting">
               Ordered messages for session {session.id} and live native TanStack AI run chunks.
             </Text>
           </div>
-          <span className="font-mono text-xs text-secondary">
+          <span {...stylex.props(styles.monoMuted)}>
             {displayedMessages.length} {displayedMessages.length === 1 ? "message" : "messages"}
           </span>
         </div>
 
         <ChatLayout
           density="compact"
-          className="min-h-[26rem] max-h-[38rem]"
+          xstyle={styles.chatLayout}
           emptyState={
             <EmptyState
-              icon={<MessageSquareIcon className="size-6" aria-hidden="true" />}
+              icon={<MessageSquareIcon {...stylex.props(styles.iconLg)} aria-hidden="true" />}
               title="No messages in this session"
               description={`Send a prompt below to admit a durable run on ${selectedEngine}.`}
             />
@@ -654,7 +871,7 @@ export function ChatWorkspace({
               isDisabled={chat.isLoading}
               placeholder={`Send an instruction to ${bot.name}...`}
               headerContext={
-                <span className="text-xs text-secondary">
+                <span {...stylex.props(styles.mutedLabel)}>
                   {chat.isLoading
                     ? "Streaming native chunks over SSE..."
                     : "Retries preserve the active Idempotency-Key until admitted."}
@@ -670,11 +887,11 @@ export function ChatWorkspace({
                   onKeyDown={handleTextareaKeyDown}
                   placeholder={`Send an instruction to ${bot.name}...`}
                   disabled={chat.isLoading}
-                  className="w-full resize-y bg-transparent text-sm text-primary outline-none placeholder:text-secondary"
+                  {...stylex.props(styles.promptTextarea)}
                 />
               }
               footerActions={
-                <div className="flex flex-wrap items-center gap-2">
+                <div {...stylex.props(styles.inlineGroup)}>
                   <Selector
                     id="composer-engine-select"
                     label="Engine"
@@ -688,7 +905,7 @@ export function ChatWorkspace({
                     placeholder="Engine"
                   />
                   {activeIdempotencyKey ? (
-                    <span className="font-mono text-xs text-secondary">
+                    <span {...stylex.props(styles.monoMuted)}>
                       Idempotency-Key: {activeIdempotencyKey}
                     </span>
                   ) : null}
@@ -721,24 +938,18 @@ export function ChatWorkspace({
                       }
                     >
                       {textParts.length > 0 ? (
-                        <div className="flex flex-col gap-2">
+                        <div {...stylex.props(styles.columnGap2)}>
                           {textParts.map((part, index) => {
                             if (part.type === "text") {
                               return (
-                                <p
-                                  key={`text-${index}`}
-                                  className="text-sm leading-relaxed whitespace-pre-wrap break-words"
-                                >
+                                <p key={`text-${index}`} {...stylex.props(styles.messageText)}>
                                   {part.content}
                                 </p>
                               );
                             }
                             if (part.type === "thinking") {
                               return (
-                                <div
-                                  key={`think-${index}`}
-                                  className="rounded-md border border-dashed border-border bg-muted px-3 py-2 text-xs text-secondary italic whitespace-pre-wrap"
-                                >
+                                <div key={`think-${index}`} {...stylex.props(styles.thinkingBox)}>
                                   {part.content}
                                 </div>
                               );
@@ -747,7 +958,7 @@ export function ChatWorkspace({
                           })}
                         </div>
                       ) : toolCalls.length === 0 ? (
-                        <span className="text-xs italic opacity-75">
+                        <span {...stylex.props(styles.waitingHint)}>
                           Waiting for stream chunks...
                         </span>
                       ) : null}
