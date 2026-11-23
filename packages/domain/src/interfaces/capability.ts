@@ -5,6 +5,7 @@ import type { JsonValue } from "../schemas/common";
 import type { CapabilityDescriptor, CapabilitySearchHit } from "../schemas/execution";
 
 export interface CapabilityContext {
+  readonly botId?: string;
   readonly effect?: EffectIdentity;
   readonly signal?: AbortSignal;
 }
