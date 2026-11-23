@@ -10,6 +10,8 @@ import {
   type EffectIdentity,
   type Engine,
   type EngineKind,
+  type FinishRunInput,
+  type FinishRunOutcome,
   type JsonValue,
   type MessagePart,
   type Run,
@@ -55,6 +57,16 @@ export interface WorkflowDeps {
   readonly eventBatchSize?: number;
   readonly now?: () => Date;
   readonly reconcileEffect?: (effect: EffectIdentity) => Promise<ToolResult | undefined>;
+  readonly onRunFinished?: (run: Run) => Promise<void>;
+}
+
+async function finishRunAndNotify(
+  deps: Pick<WorkflowDeps, "store" | "onRunFinished">,
+  input: FinishRunInput,
+): Promise<FinishRunOutcome> {
+  const finished = await deps.store.finishRun(input);
+  await deps.onRunFinished?.(finished.run);
+  return finished;
 }
 
 export type PreApprovalStageResult =
@@ -456,7 +468,7 @@ export async function finalizeCompletedWithEffectStep(
     },
   ]);
 
-  const finished = await deps.store.finishRun({
+  const finished = await finishRunAndNotify(deps, {
     runId: input.run.id,
     status: "completed",
     terminalEvent: {
@@ -516,7 +528,7 @@ export async function finalizeRejectedApprovalStep(
     },
   ]);
 
-  const finished = await deps.store.finishRun({
+  const finished = await finishRunAndNotify(deps, {
     runId: input.run.id,
     status: input.status === "denied" ? "completed" : "cancelled",
     terminalEvent: {
@@ -535,7 +547,7 @@ export async function finalizeRejectedApprovalStep(
 }
 
 export async function finalizeInterruptedUncertainStep(
-  deps: Pick<WorkflowDeps, "store" | "now">,
+  deps: Pick<WorkflowDeps, "store" | "now" | "onRunFinished">,
   input: {
     readonly run: Run;
     readonly effectId: EffectId;
@@ -543,7 +555,7 @@ export async function finalizeInterruptedUncertainStep(
   },
 ): Promise<Run> {
   const now = deps.now ? deps.now() : new Date();
-  const finished = await deps.store.finishRun({
+  const finished = await finishRunAndNotify(deps, {
     runId: input.run.id,
     status: "interrupted",
     terminalEvent: {
@@ -580,7 +592,7 @@ export async function finalizeDirectRunStep(
 
   if (input.outcome.kind === "interrupted") {
     const now = deps.now ? deps.now() : new Date();
-    const finished = await deps.store.finishRun({
+    const finished = await finishRunAndNotify(deps, {
       runId: input.run.id,
       status: "interrupted",
       terminalEvent: {
@@ -607,7 +619,7 @@ export async function finalizeDirectRunStep(
   }
 
   if (input.outcome.kind === "completed") {
-    const finished = await deps.store.finishRun({
+    const finished = await finishRunAndNotify(deps, {
       runId: input.run.id,
       status: "completed",
       terminalEvent: {
@@ -625,7 +637,7 @@ export async function finalizeDirectRunStep(
     return finished.run;
   }
 
-  const finished = await deps.store.finishRun({
+  const finished = await finishRunAndNotify(deps, {
     runId: input.run.id,
     status: "failed",
     terminalEvent: {

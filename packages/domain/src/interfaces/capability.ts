@@ -32,6 +32,7 @@ export interface Capability<
 export interface Catalog {
   list(): CapabilityDescriptor[];
   search(query: string, limit?: number): CapabilitySearchHit[];
+  requiresApproval(id: string, input: JsonValue): boolean;
   invoke(id: string, input: JsonValue, ctx: CapabilityContext): Promise<JsonValue>;
 }
 
@@ -277,7 +278,7 @@ export class CapabilityCatalog implements Catalog {
       }));
   }
 
-  async invoke(id: string, input: JsonValue, ctx: CapabilityContext): Promise<JsonValue> {
+  private require(id: string): Capability {
     const capability = this.capabilities.get(id);
     if (capability === undefined) {
       throw new DomainError({
@@ -289,6 +290,20 @@ export class CapabilityCatalog implements Catalog {
         code: "capability.unknown",
       });
     }
+    return capability;
+  }
+
+  requiresApproval(id: string, input: JsonValue): boolean {
+    const capability = this.require(id);
+    if (capability.approval === "none" || capability.approval === "always") {
+      return capability.approval === "always";
+    }
+    const parsed = capability.input.safeParse(input);
+    return parsed.success && capability.approval(parsed.data);
+  }
+
+  async invoke(id: string, input: JsonValue, ctx: CapabilityContext): Promise<JsonValue> {
+    const capability = this.require(id);
     const parsed = capability.input.safeParse(input);
     if (!parsed.success) {
       throw new DomainError({

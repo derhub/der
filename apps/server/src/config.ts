@@ -142,6 +142,7 @@ const serverConfigSchema = z
     scriptActiveMs: z.number().int().positive().default(30_000),
     scriptMemoryBytes: z.number().int().positive().default(268_435_456),
     scriptOutputBytes: z.number().int().positive().default(1_048_576),
+    scriptResultBytes: z.number().int().positive().default(65_536),
     scriptGuestArtifactPath: z.string().min(1).optional(),
     ssePollIntervalMs: z.number().int().positive().default(25),
     sseKeepAliveMs: z.number().int().positive().default(15_000),
@@ -269,6 +270,10 @@ export function parseServerConfig(
     env["DER_SCRIPT_OUTPUT_BYTES"],
     "DER_SCRIPT_OUTPUT_BYTES",
   );
+  const scriptResultBytes = parseOptionalInt(
+    env["DER_SCRIPT_RESULT_BYTES"],
+    "DER_SCRIPT_RESULT_BYTES",
+  );
   const ssePollIntervalMs = parseOptionalInt(
     env["DER_SSE_POLL_INTERVAL_MS"],
     "DER_SSE_POLL_INTERVAL_MS",
@@ -367,6 +372,7 @@ export function parseServerConfig(
     ...(scriptActiveMs !== undefined ? { scriptActiveMs } : {}),
     ...(scriptMemoryBytes !== undefined ? { scriptMemoryBytes } : {}),
     ...(scriptOutputBytes !== undefined ? { scriptOutputBytes } : {}),
+    ...(scriptResultBytes !== undefined ? { scriptResultBytes } : {}),
     ...(env["DER_SCRIPT_GUEST_ARTIFACT_PATH"]
       ? { scriptGuestArtifactPath: env["DER_SCRIPT_GUEST_ARTIFACT_PATH"] }
       : {}),

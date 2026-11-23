@@ -177,6 +177,53 @@ describe("list the catalog", () => {
   });
 });
 
+describe("decide whether a call needs approval", () => {
+  const transfer = defineCapability({
+    id: "bank.transfer",
+    description: "Move money.",
+    input: z.object({ amount: z.number() }),
+    output: z.object({ ok: z.boolean() }),
+    effect: "write",
+    approval: (input) => input.amount > 100,
+    execute: async () => ({ ok: true }),
+  });
+  const removeNote = defineCapability({
+    id: "notes.delete",
+    description: "Delete a note.",
+    input: z.object({ id: z.string() }),
+    output: z.object({ ok: z.boolean() }),
+    effect: "write",
+    approval: "always",
+    execute: async () => ({ ok: true }),
+  });
+
+  it.each([
+    { id: "bank.transfer", input: { amount: 500 }, expected: true },
+    { id: "bank.transfer", input: { amount: 5 }, expected: false },
+    { id: "notes.append", input: { text: "x" }, expected: false },
+    { id: "notes.delete", input: { id: "n1" }, expected: true },
+    { id: "weather.read", input: { city: "Oslo" }, expected: false },
+  ])("answers $expected for $id with $input", async ({ id, input, expected }) => {
+    const registry = await registryWith(transfer, removeNote, appendNote, readWeather);
+
+    expect(registry.catalog.requiresApproval(id, input)).toBe(expected);
+  });
+
+  it("answers false for input the capability rejects, because invoke fails before any effect", async () => {
+    const registry = await registryWith(transfer);
+
+    expect(registry.catalog.requiresApproval("bank.transfer", { amount: "lots" })).toBe(false);
+  });
+
+  it("rejects an unknown capability id", async () => {
+    const registry = await registryWith(transfer);
+
+    expect(() => registry.catalog.requiresApproval("bank.unknown", {})).toThrow(
+      'Capability "bank.unknown" is not registered.',
+    );
+  });
+});
+
 describe("invoke a capability", () => {
   it("validates the input and returns the output", async () => {
     const registry = await registryWith(readWeather);

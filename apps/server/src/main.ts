@@ -108,6 +108,10 @@ import {
   type RoutineScheduleClient,
   type RunCoordinator,
 } from "./workflows/index";
+import { createHostCapabilities } from "./capabilities/index";
+import { createExecuteTool } from "./code-mode/execute";
+import { codeModeInstructions } from "./code-mode/instructions";
+import { createCatalogSearchCapability, createSearchTool } from "./code-mode/search";
 import type { ScriptExecutionDeps } from "./scripts/script-execution";
 import {
   createDirectScriptRuns,
@@ -551,6 +555,12 @@ function createContextLoader(input: {
   readonly coordinator: RunCoordinator;
   readonly reconcileEffect?: (effect: EffectIdentity) => Promise<ToolResult | undefined>;
   readonly maxTokens: number;
+  readonly codeMode?: {
+    readonly catalog: Catalog;
+    readonly scriptRunStore: SqliteScriptRuns;
+    readonly scriptRuns: ScriptRuns;
+    readonly maxResultBytes: number;
+  };
 }): LoadEngineRunInput {
   return async (run: Run) => {
     const bot = input.store.getBot(run.botId);
@@ -581,10 +591,27 @@ function createContextLoader(input: {
       ...(input.reconcileEffect ? { reconcileEffect: input.reconcileEffect } : {}),
     });
 
+    const codeMode = input.codeMode;
     return {
       messages: [...built.messages],
-      systemPrompts: [...built.systemPrompts],
-      tools: hostTools,
+      systemPrompts: codeMode
+        ? [...built.systemPrompts, codeModeInstructions(codeMode.catalog)]
+        : [...built.systemPrompts],
+      tools: codeMode
+        ? [
+            ...hostTools,
+            createSearchTool({
+              catalog: codeMode.catalog,
+              maxResultBytes: codeMode.maxResultBytes,
+            }),
+            createExecuteTool({
+              run,
+              scriptRunStore: codeMode.scriptRunStore,
+              scriptRuns: codeMode.scriptRuns,
+              maxResultBytes: codeMode.maxResultBytes,
+            }),
+          ]
+        : hostTools,
       approvalBroker,
     };
   };
@@ -825,6 +852,27 @@ export async function startServer(options: CreateServerOptions = {}): Promise<Ru
         }),
       );
 
+      const registry = integrationRegistry;
+      registry.registerSync(
+        defineIntegration({
+          id: "host",
+          setup: () => ({
+            capabilities: [
+              ...createHostCapabilities({
+                bots: store,
+                sessions: store,
+                memory,
+                routines,
+                routineSchedule: { configure: (id, input) => routineSchedule.configure(id, input) },
+                skills,
+                sandboxes: { docker: dockerSandbox, wasmer: wasmerSandbox },
+              }),
+              createCatalogSearchCapability(registry.catalog, config.scriptResultBytes),
+            ],
+          }),
+        }),
+      );
+
       if (config.mcpServers.length > 0) {
         integrationRegistry.registerSync(
           createMcpIntegration({
@@ -850,6 +898,12 @@ export async function startServer(options: CreateServerOptions = {}): Promise<Ru
 
     let coordinator: RunCoordinator;
     let routineSchedule: RoutineScheduleClient;
+
+    const cancelUnfinishedScriptRuns = async (run: Run): Promise<void> => {
+      for (const scriptRun of scriptRunStore.listUnfinished(run.id)) {
+        await scriptRuns?.cancel(scriptRun.id);
+      }
+    };
 
     const scriptExecutionDeps = (scriptCatalog: Catalog): ScriptExecutionDeps => ({
       store,
@@ -877,6 +931,7 @@ export async function startServer(options: CreateServerOptions = {}): Promise<Ru
         driver: directDriver,
         approvalTimeoutMs: config.approvalTimeoutMs,
         now: clockNow,
+        onRunFinished: cancelUnfinishedScriptRuns,
         ...(options.reconcileEffect ? { reconcileEffect: options.reconcileEffect } : {}),
       });
       directDriver.setRunner((runId) => coordinator.executeRun(runId, directDriver));
@@ -918,6 +973,7 @@ export async function startServer(options: CreateServerOptions = {}): Promise<Ru
         driver: restateDriver,
         approvalTimeoutMs: config.approvalTimeoutMs,
         now: clockNow,
+        onRunFinished: cancelUnfinishedScriptRuns,
         ...(options.reconcileEffect ? { reconcileEffect: options.reconcileEffect } : {}),
       });
       routineSchedule = createRoutineScheduleClient(config.restateIngressUrl);
@@ -962,6 +1018,16 @@ export async function startServer(options: CreateServerOptions = {}): Promise<Ru
       coordinator,
       ...(options.reconcileEffect ? { reconcileEffect: options.reconcileEffect } : {}),
       maxTokens: config.contextMaxTokens,
+      ...(catalog !== undefined && scriptRuns !== undefined
+        ? {
+            codeMode: {
+              catalog,
+              scriptRunStore,
+              scriptRuns,
+              maxResultBytes: config.scriptResultBytes,
+            },
+          }
+        : {}),
     });
 
     if (options.engines === undefined) {

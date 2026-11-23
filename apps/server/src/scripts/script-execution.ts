@@ -280,7 +280,7 @@ export async function executeScriptRun(
         attemptId: `${scriptRunId}:${ordinal}`,
       };
       let approvalId: string | undefined;
-      if (descriptor.requiresApproval) {
+      if (deps.catalog.requiresApproval(id, input)) {
         const asked = await askApproval(name, id, input, effect);
         if ("reply" in asked) {
           return asked.reply;

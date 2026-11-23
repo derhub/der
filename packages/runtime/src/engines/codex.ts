@@ -6,7 +6,12 @@ import {
   type CodexModel,
   type CodexSandboxMode,
 } from "@tanstack/ai-codex";
-import { defineSandbox, withSandbox, type SandboxProvider } from "@tanstack/ai-sandbox";
+import {
+  BRIDGED_MCP_SERVER_NAME,
+  defineSandbox,
+  withSandbox,
+  type SandboxProvider,
+} from "@tanstack/ai-sandbox";
 import { DEFAULT_ENGINE_SHADOW_HOMES } from "../sandbox/docker-policy";
 import {
   bridgeAdapterStream,
@@ -27,6 +32,9 @@ export interface CodexEngineConfig {
   readonly approvalPolicy?: CodexApprovalMode;
   readonly env?: Record<string, string>;
 }
+
+// Codex cuts a bridged tool call at its per-server timeout; `execute` blocks on operator approvals.
+const BRIDGE_TOOL_TIMEOUT_SEC = 3900;
 
 export function createCodexEngine(config: CodexEngineConfig): Engine {
   return {
@@ -66,6 +74,10 @@ export function createCodexEngine(config: CodexEngineConfig): Engine {
           ? { codexExecutable: config.codexExecutable }
           : {}),
         env: containerEnv,
+        config: {
+          [`mcp_servers.${BRIDGED_MCP_SERVER_NAME}.tool_timeout_sec`]:
+            String(BRIDGE_TOOL_TIMEOUT_SEC),
+        },
       });
 
       const sandbox = defineSandbox({
