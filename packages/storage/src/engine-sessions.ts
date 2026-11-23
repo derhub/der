@@ -64,7 +64,8 @@ export function saveEngineSession(
          context_hash = excluded.context_hash,
          last_ordinal = excluded.last_ordinal,
          pending_run_id = NULL,
-         updated_at = excluded.updated_at`,
+         updated_at = excluded.updated_at
+       WHERE excluded.last_ordinal > engine_sessions.last_ordinal`,
     )
     .run(
       row.sessionId,

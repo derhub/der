@@ -1,6 +1,6 @@
-import { render, screen } from "@testing-library/react";
-import { describe, expect, it } from "vite-plus/test";
-import type { Bot, Session } from "@der/domain";
+import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { afterEach, describe, expect, it, vi } from "vite-plus/test";
+import { formatSseEvent, type Bot, type Session } from "@der/domain";
 import { ChatWorkspace } from "@/components/chat-workspace";
 import { createOperatorApi } from "@/lib/operator-api";
 
@@ -138,5 +138,103 @@ describe("show usage for a session's Runs", () => {
       await screen.findByText("Session total · input 600 · cached - · cache write - · output 21"),
     ).toBeTruthy();
     expect(screen.queryByText(/total cost/i)).toBeNull();
+  });
+});
+
+describe("show usage for a Run that just finished", () => {
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it("re-fetches the session's Runs once when the watched Run settles before its usage is saved", async () => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"], shouldAdvanceTime: true });
+    const runListResponses = [
+      [],
+      [runRecord("run-1", { usage: null, contextMode: null })],
+      [runRecord("run-1", { usage: usage(42), contextMode: "resumed" })],
+    ];
+    let runListFetches = 0;
+    const fetcher: typeof fetch = async (input, init) => {
+      const url = new URL(
+        typeof input === "string" ? input : input instanceof URL ? input.href : input.url,
+        "http://127.0.0.1:5173",
+      );
+      const method = init?.method ?? "GET";
+      if (url.pathname === "/api/sessions/sess-1/messages") {
+        return Response.json({ messages: [] });
+      }
+      if (method === "GET" && url.pathname === "/api/sessions/sess-1/runs") {
+        const runs = runListResponses[Math.min(runListFetches, runListResponses.length - 1)];
+        runListFetches += 1;
+        return Response.json({ runs });
+      }
+      if (method === "POST" && url.pathname === "/api/sessions/sess-1/runs") {
+        return Response.json(
+          {
+            run: runRecord("run-1", { status: "running", finishedAt: null }),
+            initialMessage: {
+              id: "msg-1",
+              botId: "bot-1",
+              sessionId: "sess-1",
+              ordinal: 1,
+              role: "user",
+              parts: [{ type: "text", text: "count" }],
+              runId: "run-1",
+              createdAt: "2026-01-01T00:00:01.000Z",
+            },
+            isDuplicate: false,
+            payloadFingerprint: "fp-1",
+          },
+          { status: 202 },
+        );
+      }
+      if (url.pathname === "/api/runs/run-1/events") {
+        const body = [
+          formatSseEvent({
+            id: 1,
+            data: { type: "RUN_STARTED", runId: "run-1", threadId: "sess-1" },
+          }),
+          formatSseEvent({
+            id: 2,
+            data: { type: "RUN_FINISHED", runId: "run-1", threadId: "sess-1" },
+          }),
+        ].join("");
+        return new Response(body, {
+          status: 200,
+          headers: { "content-type": "text/event-stream; charset=utf-8" },
+        });
+      }
+      if (url.pathname === "/api/runs/run-1") {
+        return Response.json({
+          run: runRecord("run-1", { usage: null, contextMode: null }),
+          approval: null,
+        });
+      }
+      return new Response("Not found", { status: 404 });
+    };
+    render(
+      <ChatWorkspace
+        api={createOperatorApi({ fetcher })}
+        fetcher={fetcher}
+        bot={bot}
+        session={session}
+        actor="operator"
+        onAnnounce={() => {}}
+      />,
+    );
+    await waitFor(() => expect(runListFetches).toBe(1));
+
+    const prompt = screen.getByPlaceholderText("Send an instruction to Usage Bot...");
+    fireEvent.change(prompt, { target: { value: "count" } });
+    fireEvent.keyDown(prompt, { key: "Enter" });
+    await waitFor(() => expect(runListFetches).toBe(2));
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(1_000);
+    });
+
+    await waitFor(() => expect(runListFetches).toBe(3));
+    expect(
+      await screen.findByText("run-1 · input 42 · cached - · cache write - · output 7 · resumed"),
+    ).toBeTruthy();
   });
 });

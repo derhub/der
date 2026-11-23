@@ -329,6 +329,17 @@ export interface ChatWorkspaceProps {
   readonly onAnnounce: (message: string) => void;
 }
 
+const USAGE_RETRY_DELAY_MS = 1_000;
+
+function isTerminalRunStatus(status: Run["status"]): boolean {
+  return (
+    status === "completed" ||
+    status === "failed" ||
+    status === "interrupted" ||
+    status === "cancelled"
+  );
+}
+
 function cursorStorageKey(sessionId: string): string {
   return `der:activeRun:${sessionId}`;
 }
@@ -603,6 +614,7 @@ export function ChatWorkspace({
   const cursorMapRef = useRef<Map<string, number>>(new Map());
   const resumeAbortRef = useRef<AbortController | null>(null);
   const setChatMessagesRef = useRef<((msgs: ReadonlyArray<UIMessage>) => void) | null>(null);
+  const usageRetryRef = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
 
   const refreshHistory = useCallback(async () => {
     setHistoryLoading(true);
@@ -617,11 +629,14 @@ export function ChatWorkspace({
     }
   }, [api, session.id]);
 
-  const refreshSessionRuns = useCallback(async () => {
+  const refreshSessionRuns = useCallback(async (): Promise<readonly Run[] | undefined> => {
     try {
-      setSessionRuns(await api.listSessionRuns(session.id));
+      const runs = await api.listSessionRuns(session.id);
+      setSessionRuns(runs);
+      return runs;
     } catch (error) {
       setProblem(toOperatorProblem(error, `/api/sessions/${session.id}/runs`));
+      return undefined;
     }
   }, [api, session.id]);
 
@@ -692,7 +707,20 @@ export function ChatWorkspace({
     (runId: string) => {
       void refreshRunState(runId);
       void refreshHistory();
-      void refreshSessionRuns();
+      void refreshSessionRuns().then((runs) => {
+        // The stream can close before the finish step saves usage; look once more after a delay.
+        const watched = runs?.find((sessionRun) => sessionRun.id === runId);
+        if (
+          watched !== undefined &&
+          isTerminalRunStatus(watched.status) &&
+          watched.usage === null
+        ) {
+          clearTimeout(usageRetryRef.current);
+          usageRetryRef.current = setTimeout(() => {
+            void refreshSessionRuns();
+          }, USAGE_RETRY_DELAY_MS);
+        }
+      });
     },
     [refreshHistory, refreshRunState, refreshSessionRuns],
   );
@@ -747,6 +775,7 @@ export function ChatWorkspace({
     }
     return () => {
       resumeAbortRef.current?.abort();
+      clearTimeout(usageRetryRef.current);
     };
   }, [refreshHistory, refreshRunState, refreshSessionRuns, session.id]);
 

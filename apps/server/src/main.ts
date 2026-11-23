@@ -423,10 +423,15 @@ function planRunTurn(
       ? messages.filter((message) => message.ordinal > stored.lastOrdinal)
       : [];
 
+  // Newest first, so the entry after this Run is the session's most recent earlier Run.
+  const sessionRuns = resumable ? input.store.listSessionRuns(run.sessionId) : [];
+  const runIndex = sessionRuns.findIndex((each) => each.id === run.id);
+  const previousRun = runIndex >= 0 ? sessionRuns[runIndex + 1] : undefined;
+
   const plan = planTurn({
     engineResumable: resumable,
     stored,
-    runId: run.id,
+    previousRunOnOtherEngine: previousRun !== undefined && previousRun.engine !== run.engine,
     baseHash,
     contextHash: built.contextHash,
     contextBlock: built.contextBlock,

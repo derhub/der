@@ -90,8 +90,39 @@ describe("engine session pending", () => {
       store.markEngineSessionPending("sess-a", "codex", "run-1");
       expect(store.getEngineSession("sess-a", "codex")?.pendingRunId).toBe("run-1");
 
-      store.saveEngineSession(rowA);
+      store.saveEngineSession({ ...rowA, lastOrdinal: 6 });
       expect(store.getEngineSession("sess-a", "codex")?.pendingRunId).toBeNull();
+    } finally {
+      store.close();
+    }
+  });
+});
+
+describe("engine session save from an older finish", () => {
+  it.each([
+    { case: "an equal last ordinal", lastOrdinal: 9 },
+    { case: "a lower last ordinal", lastOrdinal: 4 },
+  ])("keeps the stored row and its pending mark on $case", ({ lastOrdinal }) => {
+    const store = openStore();
+    try {
+      seed(store);
+      store.saveEngineSession({ ...rowA, vendorSessionId: "vendor-new", lastOrdinal: 9 });
+      store.markEngineSessionPending("sess-a", "codex", "run-3");
+
+      store.saveEngineSession({
+        ...rowA,
+        vendorSessionId: "vendor-old",
+        contextHash: "ctx-old",
+        lastOrdinal,
+      });
+
+      expect(store.getEngineSession("sess-a", "codex")).toEqual({
+        ...rowA,
+        vendorSessionId: "vendor-new",
+        lastOrdinal: 9,
+        pendingRunId: "run-3",
+        updatedAt: "2026-03-04T05:06:07.000Z",
+      });
     } finally {
       store.close();
     }

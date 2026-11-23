@@ -147,13 +147,31 @@ describe("cap memory and the skill catalog in a Run's prompt", () => {
 
   it("reads both caps from the environment", () => {
     const config = parseServerConfig(undefined, {
-      DER_MEMORY_PROMPT_MAX_BYTES: "500",
-      DER_SKILL_CATALOG_MAX_BYTES: "700",
+      DER_MEMORY_PROMPT_MAX_BYTES: "1500",
+      DER_SKILL_CATALOG_MAX_BYTES: "1700",
     });
 
-    expect(config.memoryPromptMaxBytes).toBe(500);
-    expect(config.skillCatalogMaxBytes).toBe(700);
+    expect(config.memoryPromptMaxBytes).toBe(1500);
+    expect(config.skillCatalogMaxBytes).toBe(1700);
   });
+
+  it.each([
+    { name: "DER_MEMORY_PROMPT_MAX_BYTES", memory: 1024, catalog: 8_000 },
+    { name: "DER_SKILL_CATALOG_MAX_BYTES", memory: 24_000, catalog: 1024 },
+  ])("accepts 1024 for $name", ({ name, memory, catalog }) => {
+    const config = parseServerConfig(undefined, { [name]: "1024" });
+
+    expect([config.memoryPromptMaxBytes, config.skillCatalogMaxBytes]).toEqual([memory, catalog]);
+  });
+
+  it.each(["DER_MEMORY_PROMPT_MAX_BYTES", "DER_SKILL_CATALOG_MAX_BYTES"])(
+    "rejects 1023 for %s",
+    (name) => {
+      expect(() => parseServerConfig(undefined, { [name]: "1023" })).toThrow(
+        "Too small: expected number to be >=1024",
+      );
+    },
+  );
 
   it("defaults the compact window to 100,000 tokens", () => {
     expect(parseServerConfig(undefined, {}).engineCompactTokens).toBe(100_000);
@@ -185,7 +203,7 @@ describe("cap memory and the skill catalog in a Run's prompt", () => {
           dockerHost: "unix:///run/der-rootless/docker.sock",
           enabledEngines: ["antigravity"],
         },
-        { DER_MEMORY_PROMPT_MAX_BYTES: "300" },
+        { DER_MEMORY_PROMPT_MAX_BYTES: "1024" },
       ),
       commandRunner: createRunner(prompts),
     });
