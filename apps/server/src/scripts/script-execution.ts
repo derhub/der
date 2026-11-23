@@ -229,30 +229,36 @@ export async function executeScriptRun(
     context: ScriptCallContext,
   ): Promise<CallStepResult> =>
     driver.runStep(name, async (): Promise<CallStepResult> => {
-      if (isCancelled()) {
-        return {
-          kind: "reply",
-          reply: {
-            ok: false,
-            error: { kind: "cancelled", message: "script cancelled" },
-            now: nowMs(),
-          },
-        };
-      }
-      if (context.settled()) {
-        return { kind: "abandoned" };
-      }
-      const current = await deps.store.getRun(run.id);
-      if (current !== undefined && isEndedRunStatus(current.status)) {
-        return { kind: "run-ended", detail: `owning Run ${run.id} has ended as ${current.status}` };
-      }
-      const doubtful = await deps.store.findWriteInDoubt(run.id);
-      if (doubtful !== undefined && doubtful.identity.attemptId !== effect.attemptId) {
-        return {
-          kind: "doubt",
-          effectId: doubtful.id,
-          detail: uncertainWriteDetail(doubtful.identity),
-        };
+      const own = await deps.store.getEffect(effect);
+      if (own === undefined) {
+        if (isCancelled()) {
+          return {
+            kind: "reply",
+            reply: {
+              ok: false,
+              error: { kind: "cancelled", message: "script cancelled" },
+              now: nowMs(),
+            },
+          };
+        }
+        if (context.settled()) {
+          return { kind: "abandoned" };
+        }
+        const current = await deps.store.getRun(run.id);
+        if (current !== undefined && isEndedRunStatus(current.status)) {
+          return {
+            kind: "run-ended",
+            detail: `owning Run ${run.id} has ended as ${current.status}`,
+          };
+        }
+        const doubtful = await deps.store.findWriteInDoubt(run.id);
+        if (doubtful !== undefined) {
+          return {
+            kind: "doubt",
+            effectId: doubtful.id,
+            detail: uncertainWriteDetail(doubtful.identity),
+          };
+        }
       }
       await deps.scriptRuns.setStatus(scriptRunId, "running");
       const begin = await deps.store.beginEffect(effect, approvalId ? { approvalId } : undefined);

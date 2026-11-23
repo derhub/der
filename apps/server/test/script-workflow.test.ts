@@ -909,3 +909,172 @@ describe("cancel a script run whose write is in flight", () => {
     expect(server.scriptRunStore.get(writing.id)?.status).toBe("cancelled");
   }, 60_000);
 });
+
+describe("re-enter a write step whose effect was already begun", () => {
+  const ownEffect = (
+    owner: { readonly run: { readonly id: string } },
+    scriptRunId: string,
+    ordinal: number,
+  ) => ({
+    runId: owner.run.id,
+    operationKind: "capability" as const,
+    operationId: "ledger.post",
+    canonicalArguments: { text: "entry" },
+    attemptId: `${scriptRunId}:${ordinal}`,
+  });
+
+  it("re-entered: a write step with its own effect begun marks it unknown even when the verdict is already set", async () => {
+    const { server, host } = await startDirectServer({ scriptActiveMs: 400 });
+    const applied: string[] = [];
+    host.catalog.add(
+      defineCapability({
+        id: "ledger.post",
+        description: "Post an entry",
+        input: z.object({ text: z.string() }),
+        output: z.object({ posted: z.boolean() }),
+        effect: "write",
+        approval: "always",
+        async execute(input) {
+          applied.push(input.text);
+          return { posted: true };
+        },
+      }) as unknown as Capability,
+    );
+    const owner = await admitOwningRun(server, "re-entered-verdict");
+    const { scriptRun } = await server.scriptRunStore.acquire({
+      runId: owner.run.id,
+      botId: owner.botId,
+      source: `der.ledger.post({ text: "entry" }); for (;;) {}`,
+    });
+    await server.store.beginEffect(ownEffect(owner, scriptRun.id, 1));
+    await server.scriptRuns!.submit(scriptRun.id);
+    const approval = await awaitPendingApproval(server, owner.run.id);
+    await Bun.sleep(1_500);
+    await server.coordinator.decide(decision(approval, owner, "approved"));
+
+    await server.scriptRuns!.attach(scriptRun.id, AbortSignal.timeout(30_000));
+
+    expect(server.store.getEffect(ownEffect(owner, scriptRun.id, 1))?.status).toBe("unknown");
+    expect(server.scriptRunStore.get(scriptRun.id)?.status).toBe("interrupted");
+    expect(applied).toEqual([]);
+  }, 60_000);
+
+  it("re-entered: a write step with its own effect begun marks it unknown even when the run has ended", async () => {
+    const { server, host } = await startDirectServer();
+    const applied: string[] = [];
+    host.catalog.add(ledgerCapability(applied));
+    const gate = gateCapability();
+    host.catalog.add(gate.capability);
+    const owner = await admitOwningRun(server, "re-entered-ended");
+    const { scriptRun } = await server.scriptRunStore.acquire({
+      runId: owner.run.id,
+      botId: owner.botId,
+      source: WAIT_THEN_WRITE,
+    });
+    await server.store.beginEffect(ownEffect(owner, scriptRun.id, 2));
+    await server.scriptRuns!.submit(scriptRun.id);
+    await gate.reached;
+    await server.store.finishRun({
+      runId: owner.run.id,
+      status: "cancelled",
+      terminalEvent: {
+        chunkKey: `${owner.run.id}:terminal`,
+        chunk: {
+          type: "RUN_ERROR",
+          message: "stopped",
+          code: "run.cancelled",
+          runId: owner.run.id,
+          threadId: owner.sessionId,
+        },
+      },
+    });
+    gate.release();
+
+    await server.scriptRuns!.attach(scriptRun.id, AbortSignal.timeout(30_000));
+
+    expect(server.store.getEffect(ownEffect(owner, scriptRun.id, 2))?.status).toBe("unknown");
+    expect(server.scriptRunStore.get(scriptRun.id)?.status).toBe("interrupted");
+    expect(applied).toEqual([]);
+  }, 60_000);
+});
+
+describe("recover script runs after a restart in direct mode", () => {
+  async function restartWithAbandonedScriptRun(key: string, withWrite: boolean) {
+    const tempDb = createTempDatabase("der-script-startup-");
+    const host: NoteHost = createNoteHost();
+    const applied: string[] = [];
+    host.catalog.add(ledgerCapability(applied));
+    const config = (seedFixture: boolean) => ({
+      host: "127.0.0.1",
+      port: 0,
+      restateMode: "direct" as const,
+      databasePath: tempDb.dbPath,
+      memoryProjectionDir: `${tempDb.dir}/memory`,
+      skillsRootDir: `${tempDb.dir}/skills`,
+      workspaceRootDir: `${tempDb.dir}/workspaces`,
+      enabledEngines: ["fixture" as const],
+      approvalTimeoutMs: 30_000,
+      seedFixture,
+    });
+    const before = await startServer({ config: config(true), catalog: host.catalog });
+    const owner = await admitOwningRun(before, key);
+    const { scriptRun } = await before.scriptRunStore.acquire({
+      runId: owner.run.id,
+      botId: owner.botId,
+      source: `await der.ledger.post({ text: "entry" }); return 1;`,
+    });
+    if (withWrite) {
+      await before.store.beginEffect({
+        runId: owner.run.id,
+        operationKind: "capability",
+        operationId: "ledger.post",
+        canonicalArguments: { text: "entry" },
+        attemptId: `${scriptRun.id}:1`,
+      });
+    }
+    await before.close();
+    const server = await startServer({ config: config(false), catalog: host.catalog });
+    cleanups.push(async () => {
+      await server.close();
+      tempDb.cleanup();
+    });
+    return { server, owner, scriptRun, applied };
+  }
+
+  it("startup: a script run left running by a previous process is interrupted and a different script runs normally", async () => {
+    const { server, owner, scriptRun } = await restartWithAbandonedScriptRun(
+      "startup-plain",
+      false,
+    );
+
+    expect(server.scriptRunStore.get(scriptRun.id)?.status).toBe("interrupted");
+    await server.scriptRunStore.markDelivered(scriptRun.id);
+    const next = await submitScript(server, owner, `return 2;`);
+    const result = await server.scriptRuns!.attach(next.id, AbortSignal.timeout(30_000));
+
+    expect(result).toEqual({ ok: true, result: 2, logs: [], truncated: false });
+    expect(server.store.getRun(owner.run.id)?.status).not.toBe("interrupted");
+  }, 60_000);
+
+  it("startup: a write that was in flight in the previous process interrupts the run and calls no capability", async () => {
+    const { server, owner, scriptRun, applied } = await restartWithAbandonedScriptRun(
+      "startup-write",
+      true,
+    );
+
+    await server.scriptRunStore.markDelivered(scriptRun.id);
+    const next = await submitScript(server, owner, `return 2;`);
+    const result = await server.scriptRuns!.attach(next.id, AbortSignal.timeout(30_000));
+
+    expect(result).toEqual({
+      ok: false,
+      error: {
+        kind: "capability",
+        message: `The outcome of a previous write in this Run (capability:ledger.post, ${scriptRun.id}:1) is unknown, so the Run was interrupted.`,
+      },
+      logs: [],
+    });
+    expect(applied).toEqual([]);
+    expect(server.store.getRun(owner.run.id)?.status).toBe("interrupted");
+  }, 60_000);
+});

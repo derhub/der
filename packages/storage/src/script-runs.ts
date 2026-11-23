@@ -74,6 +74,12 @@ const CANCELLED_RESULT: ExecuteResult = {
   logs: [],
 };
 
+const INTERRUPTED_RESULT: ExecuteResult = {
+  ok: false,
+  error: { kind: "capability", message: "script was interrupted by a server restart" },
+  logs: [],
+};
+
 export class ScriptRunBusyError extends Error {
   readonly blockedBy: ScriptRun;
 
@@ -196,6 +202,19 @@ export class SqliteScriptRuns {
         id,
       );
     });
+  }
+
+  async interruptAbandoned(): Promise<number> {
+    const now = formatUtcTimestamp(this.database.now());
+    return this.database.inTransactionWithRetry(
+      (db) =>
+        db
+          .query(
+            `UPDATE script_runs SET status = 'interrupted', result_json = ?, updated_at = ?
+             WHERE status IN ('running', 'waiting_approval')`,
+          )
+          .run(JSON.stringify(INTERRUPTED_RESULT), now).changes,
+    );
   }
 
   async requestCancel(id: string): Promise<void> {

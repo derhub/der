@@ -75,7 +75,7 @@ An id is dot-separated, with at least two segments, and every segment matches `[
 
 A denied or expired Approval ends the Script with error kind `denied` or `expired`.
 
-Scripts run one at a time per Run. A call a Script issues without `await` is still carried to its recorded outcome before the Script ends, and if it fails with a capability error that error becomes the Script's result. A `write` is refused, and the Run interrupted, when the Run has a write whose outcome is unknown.
+Scripts run one at a time per Run. A call a Script issues without `await` is carried to its recorded outcome before the Script's result is reported, unless the Script has already hit a limit or been cancelled; a call that ends in a `capability`, `denied`, `expired` or `cancelled` error replaces the Script's own result with that error. A `write` is refused, and the Run interrupted, when the Run has a write whose outcome is unknown.
 
 ### Errors
 

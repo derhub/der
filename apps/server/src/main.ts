@@ -704,6 +704,7 @@ export async function startServer(options: CreateServerOptions = {}): Promise<Ru
       });
       directDriver.setRunner((runId) => coordinator.executeRun(runId, directDriver));
       closeDirectDriver = () => directDriver.close();
+      await scriptRunStore.interruptAbandoned();
       const directScriptRuns = createDirectScriptRuns({
         ...scriptExecutionDeps(),
         driver: directDriver,

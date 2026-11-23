@@ -574,13 +574,18 @@ describe("run a script", () => {
   });
 
   describe("a call outlives the verdict", () => {
+    const untilSettled = async (settled: () => boolean): Promise<void> => {
+      while (!settled()) {
+        await new Promise((resolve) => setTimeout(resolve, 5));
+      }
+    };
+
     const limitCases: ReadonlyArray<readonly [string, string, ScriptLimits]> = [
       [
         "output limit",
-        `der.ledger.post({}); for (let i = 0; i < 3000000; i++) {} console.log("x".repeat(5000)); return 1;`,
+        `der.ledger.post({}); console.log("x".repeat(5000)); return 1;`,
         { ...roomyLimits, outputBytes: 2_000 },
       ],
-      ["time limit", `der.ledger.post({}); for (;;) {}`, { ...roomyLimits, activeMs: 300 }],
       [
         "memory limit",
         `der.ledger.post({}); const keep = []; for (;;) keep.push(new Uint8Array(4_000_000).fill(1));`,
@@ -589,15 +594,18 @@ describe("run a script", () => {
     ];
 
     it.each(limitCases)(
-      "returns only after the write in flight finished when the script hits its %s",
+      "returns only after any write already started has finished when the script hits its %s",
       async (_name, script, limits) => {
-        let recorded = false;
+        let started = false;
+        let finished = false;
 
         const result = await runScript({
           script,
-          call: async () => {
-            await new Promise((resolve) => setTimeout(resolve, 600));
-            recorded = true;
+          call: async (_id, _input, context) => {
+            started = true;
+            await untilSettled(context.settled);
+            await new Promise((resolve) => setTimeout(resolve, 100));
+            finished = true;
             return { ok: true, value: null };
           },
           limits,
@@ -606,23 +614,45 @@ describe("run a script", () => {
         });
 
         expect(result).toMatchObject({ ok: false, error: { kind: "limit" } });
-        expect(recorded).toBe(true);
+        expect(finished).toBe(started);
       },
       60_000,
     );
+
+    it("returns only after the write in flight finished when the script hits its time limit", async () => {
+      let finished = false;
+      let started = false;
+
+      const result = await runScript({
+        script: `der.ledger.post({}); for (;;) {}`,
+        call: async (_id, _input, context) => {
+          started = true;
+          await untilSettled(context.settled);
+          await new Promise((resolve) => setTimeout(resolve, 100));
+          finished = true;
+          return { ok: true, value: null };
+        },
+        limits: { ...roomyLimits, activeMs: 300 },
+        seed: 1,
+        now: START,
+      });
+
+      expect(result).toMatchObject({ ok: false, error: { kind: "limit" } });
+      expect([started, finished]).toEqual([true, true]);
+    }, 60_000);
 
     it("tells a call in flight that the verdict is set so it begins no further stage", async () => {
       const seenSettled: boolean[] = [];
 
       await runScript({
-        script: `der.ledger.post({}); for (let i = 0; i < 3000000; i++) {} console.log("x".repeat(5000)); return 1;`,
+        script: `der.ledger.post({}); for (;;) {}`,
         call: async (_id, _input, context) => {
           seenSettled.push(context.settled());
-          await new Promise((resolve) => setTimeout(resolve, 300));
+          await untilSettled(context.settled);
           seenSettled.push(context.settled());
           return { ok: true, value: null };
         },
-        limits: { ...roomyLimits, outputBytes: 2_000 },
+        limits: { ...roomyLimits, activeMs: 300 },
         seed: 1,
         now: START,
       });
@@ -632,24 +662,24 @@ describe("run a script", () => {
 
     it("returns without waiting for the call when the signal aborts", async () => {
       const controller = new AbortController();
-      let reached: () => void = () => {};
-      const callReached = new Promise<void>((resolve) => {
-        reached = resolve;
+      let markSettled: () => void = () => {};
+      const verdictSet = new Promise<void>((resolve) => {
+        markSettled = resolve;
       });
 
       const running = runScript({
-        script: `der.ledger.post({}); for (let i = 0; i < 3000000; i++) {} console.log("x".repeat(5000)); return 1;`,
-        call: () => {
-          reached();
+        script: `der.ledger.post({}); for (;;) {}`,
+        call: async (_id, _input, context) => {
+          await untilSettled(context.settled);
+          markSettled();
           return new Promise<ScriptCallReply>(() => {});
         },
-        limits: { ...roomyLimits, outputBytes: 2_000 },
+        limits: { ...roomyLimits, activeMs: 300 },
         seed: 1,
         now: START,
         signal: controller.signal,
       });
-      await callReached;
-      await new Promise((resolve) => setTimeout(resolve, 300));
+      await verdictSet;
       controller.abort();
 
       expect(await running).toMatchObject({ ok: false, error: { kind: "limit" } });

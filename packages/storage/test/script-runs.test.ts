@@ -371,3 +371,58 @@ describe("find a write in doubt", () => {
     expect(store.findWriteInDoubt(run.id)).toBeUndefined();
   });
 });
+
+describe("interrupt script runs left active by a previous process", () => {
+  it("finishes running and waiting script runs as interrupted and leaves finished ones alone", async () => {
+    const { store, scriptRuns, run, bot } = await openFixture();
+    const finished = await scriptRuns.acquire({ runId: run.id, botId: bot.id, source: "a" });
+    await scriptRuns.finish(finished.scriptRun.id, "completed", done);
+    const waiting = await scriptRuns.acquire({ runId: run.id, botId: bot.id, source: "b" });
+    await scriptRuns.setStatus(waiting.scriptRun.id, "waiting_approval");
+    const otherSession = store.createSession({ id: "sess-2", botId: bot.id, title: "Other" });
+    const other = await store.admit({
+      botId: bot.id,
+      sessionId: otherSession.id,
+      origin: "web",
+      idempotencyKey: "req-2",
+      input: { parts: [{ type: "text", text: "again" }] },
+    });
+    const running = await scriptRuns.acquire({ runId: other.run.id, botId: bot.id, source: "c" });
+
+    const changed = await scriptRuns.interruptAbandoned();
+
+    expect(changed).toBe(2);
+    expect(scriptRuns.get(finished.scriptRun.id)?.status).toBe("completed");
+    for (const id of [waiting.scriptRun.id, running.scriptRun.id]) {
+      expect(scriptRuns.get(id)).toMatchObject({
+        status: "interrupted",
+        result: {
+          ok: false,
+          error: { kind: "capability", message: "script was interrupted by a server restart" },
+          logs: [],
+        },
+      });
+    }
+  });
+
+  it("makes a started effect of an interrupted script run a write in doubt", async () => {
+    const { store, scriptRuns, run, bot } = await openFixture();
+    const { scriptRun } = await scriptRuns.acquire({
+      runId: run.id,
+      botId: bot.id,
+      source: "return 1",
+    });
+    const begun = await store.beginEffect({
+      runId: run.id,
+      operationKind: "capability",
+      operationId: "ledger.post",
+      canonicalArguments: { text: "entry" },
+      attemptId: `${scriptRun.id}:1`,
+    });
+    expect(store.findWriteInDoubt(run.id)).toBeUndefined();
+
+    await scriptRuns.interruptAbandoned();
+
+    expect(store.findWriteInDoubt(run.id)?.id).toBe(begun.effect.id);
+  });
+});
