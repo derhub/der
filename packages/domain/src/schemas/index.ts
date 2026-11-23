@@ -125,5 +125,17 @@ export {
   type RunStatus,
   type TerminalRunStatus,
 } from "./run";
+export {
+  executeErrorKind,
+  executeResult,
+  scriptRun,
+  scriptRunStatus,
+  terminalScriptRunStatus,
+  type ExecuteErrorKind,
+  type ExecuteResult,
+  type ScriptRun,
+  type ScriptRunStatus,
+  type TerminalScriptRunStatus,
+} from "./script-run";
 export { createSessionInput, session, type CreateSessionInput, type Session } from "./session";
 export { skill, skillFrontmatter, type Skill, type SkillFrontmatter } from "./skill";

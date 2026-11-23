@@ -10,6 +10,7 @@ import {
   type ApprovalResolutionInput,
   type Bot,
   type BotId,
+  type Catalog,
   type ChannelBinding,
   type ChannelIntakeMetadata,
   type EffectIdentity,
@@ -70,7 +71,9 @@ import {
   type OfficialEngineKind,
 } from "@der/runtime/sandbox";
 import {
+  openSqliteScriptRuns,
   openSqliteStore,
+  type SqliteScriptRuns,
   type SqliteStore,
   type StorageMigration,
   type UpsertChannelBindingInput,
@@ -105,6 +108,13 @@ import {
   type RoutineScheduleClient,
   type RunCoordinator,
 } from "./workflows/index";
+import type { ScriptExecutionDeps } from "./scripts/script-execution";
+import {
+  createDirectScriptRuns,
+  createRestateScriptRuns,
+  createScriptWorkflow,
+  type ScriptRuns,
+} from "./scripts/script-workflow";
 
 export interface SeededFixtureRecords {
   readonly bot: Bot;
@@ -179,6 +189,7 @@ export interface CreateServerOptions {
   readonly now?: () => Date;
   readonly engines?: ReadonlyMap<EngineKind, Engine>;
   readonly tools?: Tools;
+  readonly catalog?: Catalog;
   readonly integrations?: readonly Integration[];
   readonly skills?: SkillCatalog;
   readonly commandRunner?: CommandRunner;
@@ -196,6 +207,8 @@ export interface RunningServer {
   readonly routines: SqliteRoutines;
   readonly skills: SkillCatalog;
   readonly tools: Tools;
+  readonly scriptRunStore: SqliteScriptRuns;
+  readonly scriptRuns?: ScriptRuns;
   readonly engines: ReadonlyMap<EngineKind, Engine>;
   readonly coordinator: RunCoordinator;
   readonly workflow: DurableWorkflow;
@@ -722,6 +735,7 @@ export async function startServer(options: CreateServerOptions = {}): Promise<Ru
 
   let integrationRegistry: IntegrationRegistry | undefined;
   let closeDirectDriver: (() => void) | undefined;
+  let closeDirectScriptRuns: (() => Promise<void>) | undefined;
   let restateServer: ReturnType<typeof Bun.serve> | undefined;
   let httpServer: ReturnType<typeof Bun.serve> | undefined;
   let outbox: ReturnType<typeof createOutboxSender> | undefined;
@@ -830,9 +844,29 @@ export async function startServer(options: CreateServerOptions = {}): Promise<Ru
 
     const engines = new Map<EngineKind, Engine>(options.engines);
     const clockNow = options.now ?? (() => store.database.now());
+    const catalog = options.catalog ?? integrationRegistry?.catalog;
+    const scriptRunStore = openSqliteScriptRuns({ database: store.database });
+    let scriptRuns: ScriptRuns | undefined;
 
     let coordinator: RunCoordinator;
     let routineSchedule: RoutineScheduleClient;
+
+    const scriptExecutionDeps = (scriptCatalog: Catalog): ScriptExecutionDeps => ({
+      store,
+      scriptRuns: scriptRunStore,
+      catalog: scriptCatalog,
+      approvals: coordinator,
+      limits: {
+        memoryBytes: config.scriptMemoryBytes,
+        activeMs: config.scriptActiveMs,
+        maxCalls: config.scriptMaxCalls,
+        outputBytes: config.scriptOutputBytes,
+      },
+      now: clockNow,
+      ...(config.scriptGuestArtifactPath !== undefined
+        ? { guestArtifactPath: config.scriptGuestArtifactPath }
+        : {}),
+    });
 
     if (config.restateMode === "direct") {
       const directDriver = createDirectWorkflowDriver({ now: clockNow });
@@ -847,6 +881,15 @@ export async function startServer(options: CreateServerOptions = {}): Promise<Ru
       });
       directDriver.setRunner((runId) => coordinator.executeRun(runId, directDriver));
       closeDirectDriver = () => directDriver.close();
+      if (catalog !== undefined) {
+        const directScriptRuns = createDirectScriptRuns({
+          ...scriptExecutionDeps(catalog),
+          driver: directDriver,
+          decide: (decision) => coordinator.decide(decision),
+        });
+        scriptRuns = directScriptRuns;
+        closeDirectScriptRuns = () => directScriptRuns.close();
+      }
 
       routineSchedule = createDirectRoutineScheduleClient({
         routines,
@@ -891,10 +934,22 @@ export async function startServer(options: CreateServerOptions = {}): Promise<Ru
         );
       }
 
+      if (catalog !== undefined) {
+        if (!hasRestateServiceNamed(extraServices, "ScriptWorkflow")) {
+          extraServices.push(createScriptWorkflow(scriptExecutionDeps(catalog)));
+        }
+        scriptRuns = createRestateScriptRuns(config.restateIngressUrl, {
+          scriptRuns: scriptRunStore,
+          decide: (decision) => coordinator.decide(decision),
+          now: clockNow,
+        });
+      }
+
       const restateFetchHandler = createRestateFetchHandler(coordinator, extraServices);
       restateServer = Bun.serve({
         hostname: config.restateHost,
         port: config.restateListen,
+        idleTimeout: 0,
         fetch: (request) => restateFetchHandler(request),
       });
     }
@@ -1043,6 +1098,8 @@ export async function startServer(options: CreateServerOptions = {}): Promise<Ru
       routines,
       skills,
       tools,
+      scriptRunStore,
+      ...(scriptRuns !== undefined ? { scriptRuns } : {}),
       engines,
       coordinator,
       workflow: coordinator,
@@ -1063,6 +1120,7 @@ export async function startServer(options: CreateServerOptions = {}): Promise<Ru
         };
 
         await runStep(() => startedOutbox.stop());
+        await runStep(() => closeDirectScriptRuns?.());
         await runStep(() => closeDirectDriver?.());
         await runStep(() => integrationRegistry?.stop());
         await runStep(() => startedHttpServer.stop(true));
@@ -1083,6 +1141,7 @@ export async function startServer(options: CreateServerOptions = {}): Promise<Ru
     };
   } catch (error) {
     await outbox?.stop().catch(() => undefined);
+    await closeDirectScriptRuns?.().catch(() => undefined);
     try {
       closeDirectDriver?.();
     } catch {

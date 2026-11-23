@@ -6,8 +6,18 @@ export {
   CORE_MIGRATION,
   CORE_MIGRATIONS,
   OUTBOX_DESTINATIONS_MIGRATION,
+  SCRIPT_RUNS_MIGRATION,
   type StorageMigration,
 } from "./migrations";
+export {
+  digestScriptSource,
+  isTerminalScriptRunStatus,
+  openSqliteScriptRuns,
+  SqliteScriptRuns,
+  type AcquireScriptRunInput,
+  type AcquireScriptRunOutcome,
+  type SqliteScriptRunsOptions,
+} from "./script-runs";
 export {
   openSqliteStore,
   SqliteStore,

@@ -110,6 +110,7 @@ describe("configure SQLite WAL, foreign keys, busy timeout, and migration seam",
         "002-memory-seam-test",
         "003-outbox-destinations",
         "004-capability-operation-kind",
+        "005-script-runs",
       ]);
     } finally {
       store.close();
@@ -130,6 +131,7 @@ describe("configure SQLite WAL, foreign keys, busy timeout, and migration seam",
         "002-memory-seam-test",
         "003-outbox-destinations",
         "004-capability-operation-kind",
+        "005-script-runs",
       ]);
     } finally {
       reopened.close();
