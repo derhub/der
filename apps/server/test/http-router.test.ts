@@ -69,6 +69,8 @@ function createMinimalDeps(overrides: Partial<HttpRouterDeps> = {}): HttpRouterD
     status: "completed",
     routineId: null,
     checkpoint: null,
+    usage: null,
+    contextMode: null,
     createdAt: FIXED_TS,
     updatedAt: FIXED_TS,
     finishedAt: FIXED_TS,
@@ -157,6 +159,7 @@ function createMinimalDeps(overrides: Partial<HttpRouterDeps> = {}): HttpRouterD
   const runs: RunStore = {
     admit: async () => admission,
     getRun: (id) => (id === run.id ? run : undefined),
+    listSessionRuns: (id) => (id === run.sessionId ? [run] : []),
     markRunRunning: async () => run,
     appendRunEvents: async () => [],
     getRunStreamState: (id) => (id === run.id ? streamState : undefined),

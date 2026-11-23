@@ -26,6 +26,7 @@ import type {
   RunEvent,
   RunRequest,
   RunStatus,
+  RunUsage,
   TerminalRunStatus,
 } from "../schemas/run";
 import type { CreateSessionInput, Session } from "../schemas/session";
@@ -67,6 +68,7 @@ export interface FinishRunInput {
   readonly finalMessageParts?: readonly MessagePart[];
   readonly detail?: string;
   readonly checkpoint?: JsonValue | null;
+  readonly usage?: RunUsage;
 }
 
 export interface FinishRunOutcome {
@@ -85,6 +87,8 @@ export interface RunStreamState {
 export interface RunStore {
   admit(request: RunRequest): Promise<RunAdmission>;
   getRun(runId: RunId): MaybePromise<Run | undefined>;
+  /** Runs of a session, newest first. */
+  listSessionRuns(sessionId: SessionId): MaybePromise<Run[]>;
   markRunRunning(runId: RunId, checkpoint?: JsonValue | null): Promise<Run>;
   appendRunEvents(runId: RunId, events: readonly RunEventInput[]): Promise<RunEvent[]>;
   getRunStreamState(runId: RunId): MaybePromise<RunStreamState | undefined>;

@@ -68,6 +68,12 @@ export interface RunRow {
   readonly routine_id: string | null;
   readonly routine_slot: string | null;
   readonly checkpoint_json: string | null;
+  readonly input_tokens: number | null;
+  readonly cached_input_tokens: number | null;
+  readonly cache_write_tokens: number | null;
+  readonly output_tokens: number | null;
+  readonly reported_cost_usd: number | null;
+  readonly context_mode: string | null;
   readonly created_at: string;
   readonly updated_at: string;
   readonly finished_at: string | null;
@@ -218,6 +224,17 @@ export function mapRunRow(row: RunRow): Run {
     status: row.status,
     routineId: row.routine_id,
     checkpoint: row.checkpoint_json !== null ? (JSON.parse(row.checkpoint_json) as unknown) : null,
+    usage:
+      row.input_tokens !== null && row.output_tokens !== null
+        ? {
+            inputTokens: row.input_tokens,
+            cachedInputTokens: row.cached_input_tokens,
+            cacheWriteTokens: row.cache_write_tokens,
+            outputTokens: row.output_tokens,
+            reportedCostUsd: row.reported_cost_usd,
+          }
+        : null,
+    contextMode: row.context_mode,
     createdAt: row.created_at,
     updatedAt: row.updated_at,
     finishedAt: row.finished_at,

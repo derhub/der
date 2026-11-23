@@ -85,6 +85,7 @@ import {
   finishRun as finishRunCommand,
   getRun as getRunQuery,
   getRunStreamState as getRunStreamStateQuery,
+  listSessionRuns as listSessionRunsQuery,
   markRunRunning as markRunRunningCommand,
   readRunEventsAfter as readRunEventsAfterQuery,
   type FinishRunInput,
@@ -403,6 +404,10 @@ export class SqliteStore
 
   getRun(runId: RunId): Run | undefined {
     return getRunQuery(this.database, runId);
+  }
+
+  listSessionRuns(sessionId: SessionId): Run[] {
+    return listSessionRunsQuery(this.database, sessionId);
   }
 
   markRunRunning(runId: RunId, checkpoint?: JsonValue | null): Promise<Run> {

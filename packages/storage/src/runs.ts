@@ -13,6 +13,8 @@ import {
   type RunId,
   type RunRequest,
   type RunStatus,
+  type RunUsage,
+  type SessionId,
   type TerminalRunStatus,
 } from "@der/domain";
 import { compiledParsers } from "@der/domain/compiled";
@@ -48,6 +50,7 @@ export interface FinishRunInput {
   readonly finalMessageParts?: readonly MessagePart[];
   readonly detail?: string;
   readonly checkpoint?: JsonValue | null;
+  readonly usage?: RunUsage;
 }
 
 export interface FinishRunOutcome {
@@ -289,6 +292,13 @@ export function getRun(database: SqliteDatabase, runId: RunId): Run | undefined 
   return row ? mapRunRow(row) : undefined;
 }
 
+export function listSessionRuns(database: SqliteDatabase, sessionId: SessionId): Run[] {
+  return database.db
+    .query<RunRow, [string]>("SELECT * FROM runs WHERE session_id = ? ORDER BY rowid DESC")
+    .all(sessionId)
+    .map(mapRunRow);
+}
+
 export async function markRunRunning(
   database: SqliteDatabase,
   runId: RunId,
@@ -516,13 +526,23 @@ export async function finishRun(
     const finishedAt = runRow.finished_at ?? now;
     db.query(
       `UPDATE runs
-       SET status = ?, checkpoint_json = COALESCE(?, checkpoint_json), updated_at = ?, finished_at = ?
+       SET status = ?, checkpoint_json = COALESCE(?, checkpoint_json), updated_at = ?, finished_at = ?,
+           input_tokens = COALESCE(?, input_tokens),
+           cached_input_tokens = COALESCE(?, cached_input_tokens),
+           cache_write_tokens = COALESCE(?, cache_write_tokens),
+           output_tokens = COALESCE(?, output_tokens),
+           reported_cost_usd = COALESCE(?, reported_cost_usd)
        WHERE id = ?`,
     ).run(
       input.status,
       input.checkpoint !== undefined ? JSON.stringify(input.checkpoint) : null,
       now,
       finishedAt,
+      input.usage?.inputTokens ?? null,
+      input.usage?.cachedInputTokens ?? null,
+      input.usage?.cacheWriteTokens ?? null,
+      input.usage?.outputTokens ?? null,
+      input.usage?.reportedCostUsd ?? null,
       input.runId,
     );
 

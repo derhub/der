@@ -27,6 +27,8 @@ const scriptRoutinesMigrationPath = resolve(
   "../migrations/006-script-routines.sql",
 );
 
+const runUsageMigrationPath = resolve(import.meta.dirname, "../migrations/007-run-usage.sql");
+
 export const CORE_MIGRATION: StorageMigration = {
   version: "001-core",
   sql: readFileSync(coreMigrationPath, "utf8"),
@@ -55,12 +57,18 @@ export const SCRIPT_ROUTINES_MIGRATION: StorageMigration = {
   disableForeignKeys: true,
 };
 
+export const RUN_USAGE_MIGRATION: StorageMigration = {
+  version: "007-run-usage",
+  sql: readFileSync(runUsageMigrationPath, "utf8"),
+};
+
 export const CORE_MIGRATIONS: readonly StorageMigration[] = [
   CORE_MIGRATION,
   OUTBOX_DESTINATIONS_MIGRATION,
   CAPABILITY_OPERATION_KIND_MIGRATION,
   SCRIPT_RUNS_MIGRATION,
   SCRIPT_ROUTINES_MIGRATION,
+  RUN_USAGE_MIGRATION,
 ];
 
 export function applyMigrations(

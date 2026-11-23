@@ -1,6 +1,7 @@
 import * as z from "zod";
 import { engineKind, jsonValue } from "./common";
 import { messagePart } from "./message";
+import { runUsage } from "./run";
 
 export const engineEvent = z.discriminatedUnion("type", [
   z.object({
@@ -16,6 +17,7 @@ export const engineEvent = z.discriminatedUnion("type", [
         parts: z.array(messagePart),
       })
       .optional(),
+    usage: runUsage.optional(),
   }),
   z.object({
     type: z.literal("failed"),

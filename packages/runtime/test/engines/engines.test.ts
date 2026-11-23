@@ -25,6 +25,8 @@ function makeRun(overrides?: Partial<Run>): Run {
     status: "running",
     routineId: null,
     checkpoint: null,
+    usage: null,
+    contextMode: null,
     createdAt: "2026-11-22T00:00:00Z",
     updatedAt: "2026-11-22T00:00:00Z",
     finishedAt: null,
@@ -478,6 +480,13 @@ describe("adapt Codex, Claude Code, and Antigravity ACP engines in contained san
       type: "completed",
       finalMessage: {
         parts: [{ type: "text", text: "Native codex answer." }],
+      },
+      usage: {
+        inputTokens: 10,
+        cachedInputTokens: null,
+        cacheWriteTokens: null,
+        outputTokens: 5,
+        reportedCostUsd: null,
       },
     });
   });

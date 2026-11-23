@@ -31,6 +31,18 @@ export const channelIntakeMetadata = z.object({
 });
 export type ChannelIntakeMetadata = z.infer<typeof channelIntakeMetadata>;
 
+export const runUsage = z.object({
+  inputTokens: z.number().int().nonnegative(),
+  cachedInputTokens: z.number().int().nonnegative().nullable(),
+  cacheWriteTokens: z.number().int().nonnegative().nullable(),
+  outputTokens: z.number().int().nonnegative(),
+  reportedCostUsd: z.number().nonnegative().nullable(),
+});
+export type RunUsage = z.infer<typeof runUsage>;
+
+export const contextMode = z.enum(["resumed", "rebuilt"]);
+export type ContextMode = z.infer<typeof contextMode>;
+
 export const run = z.object({
   id,
   botId: id,
@@ -40,6 +52,8 @@ export const run = z.object({
   status: runStatus,
   routineId: id.nullable(),
   checkpoint: jsonValue.nullable(),
+  usage: runUsage.nullable().default(null),
+  contextMode: contextMode.nullable().default(null),
   createdAt: utcTimestamp,
   updatedAt: utcTimestamp,
   finishedAt: utcTimestamp.nullable(),
