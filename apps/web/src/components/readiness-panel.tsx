@@ -4,10 +4,129 @@ import { Card } from "@astryxdesign/core/Card";
 import { EmptyState } from "@astryxdesign/core/EmptyState";
 import { Heading } from "@astryxdesign/core/Heading";
 import { Text } from "@astryxdesign/core/Text";
+import {
+  colorVars,
+  fontWeightVars,
+  radiusVars,
+  spacingVars,
+  textSizeVars,
+  typographyVars,
+} from "@astryxdesign/core/theme/tokens.stylex";
+import * as stylex from "@stylexjs/stylex";
 import { CheckCircle2Icon, RefreshCwIcon, ShieldAlertIcon, WrenchIcon } from "lucide-react";
 import type { EngineReadiness, ProblemDetails, ToolDescriptor } from "@der/domain";
 import { ProblemAlert } from "@/components/problem-alert";
 import type { HealthResponse } from "@/lib/schemas";
+
+const styles = stylex.create({
+  root: {
+    display: "flex",
+    flexDirection: "column",
+    gap: spacingVars["--spacing-5"],
+  },
+  header: {
+    display: "flex",
+    flexWrap: "wrap",
+    alignItems: "center",
+    justifyContent: "space-between",
+    gap: spacingVars["--spacing-3"],
+  },
+  titleGroup: {
+    display: "flex",
+    flexDirection: "column",
+    gap: spacingVars["--spacing-0-5"],
+  },
+  healthCard: {
+    display: "flex",
+    flexDirection: "column",
+    gap: spacingVars["--spacing-1-5"],
+  },
+  rowBetween: {
+    display: "flex",
+    alignItems: "center",
+    justifyContent: "space-between",
+    gap: spacingVars["--spacing-2"],
+  },
+  rowBetweenWrap: {
+    display: "flex",
+    flexWrap: "wrap",
+    alignItems: "center",
+    justifyContent: "space-between",
+    gap: spacingVars["--spacing-2"],
+  },
+  section: {
+    display: "flex",
+    flexDirection: "column",
+    gap: spacingVars["--spacing-3"],
+  },
+  cardGrid: {
+    display: "grid",
+    gap: spacingVars["--spacing-3"],
+    gridTemplateColumns: {
+      default: "minmax(0, 1fr)",
+      "@media (min-width: 768px)": "repeat(2, minmax(0, 1fr))",
+    },
+  },
+  engineCard: {
+    display: "flex",
+    flexDirection: "column",
+    gap: spacingVars["--spacing-3"],
+  },
+  toolCard: {
+    display: "flex",
+    flexDirection: "column",
+    gap: spacingVars["--spacing-2"],
+  },
+  badgeRow: {
+    display: "flex",
+    flexWrap: "wrap",
+    alignItems: "center",
+    gap: spacingVars["--spacing-2"],
+  },
+  toolBadges: {
+    display: "flex",
+    alignItems: "center",
+    gap: spacingVars["--spacing-1-5"],
+  },
+  reasonList: {
+    display: "flex",
+    flexDirection: "column",
+    gap: spacingVars["--spacing-1"],
+    fontSize: textSizeVars["--font-size-sm"],
+    color: colorVars["--color-text-secondary"],
+  },
+  reasonItem: {
+    lineHeight: 1.625,
+  },
+  loginGuidance: {
+    borderRadius: radiusVars["--radius-element"],
+    borderWidth: 1,
+    borderStyle: "solid",
+    borderColor: colorVars["--color-border-warning"],
+    backgroundColor: colorVars["--color-warning-muted"],
+    paddingInline: spacingVars["--spacing-3"],
+    paddingBlock: spacingVars["--spacing-2"],
+    fontSize: textSizeVars["--font-size-sm"],
+    color: colorVars["--color-on-warning-muted"],
+  },
+  loginGuidanceTitle: {
+    fontWeight: fontWeightVars["--font-weight-medium"],
+  },
+  loginGuidanceCommand: {
+    marginTop: spacingVars["--spacing-1"],
+    fontFamily: typographyVars["--font-family-code"],
+    fontSize: textSizeVars["--font-size-sm"],
+    wordBreak: "break-all",
+  },
+  iconSm: {
+    width: "0.875rem",
+    height: "0.875rem",
+  },
+  iconLg: {
+    width: "1.5rem",
+    height: "1.5rem",
+  },
+});
 
 export interface ReadinessPanelProps {
   readonly health: HealthResponse | null;
@@ -39,9 +158,9 @@ export function ReadinessPanel({
   onRefresh,
 }: ReadinessPanelProps) {
   return (
-    <div className="flex flex-col gap-5">
-      <div className="flex flex-wrap items-center justify-between gap-3">
-        <div className="flex flex-col gap-0.5">
+    <div {...stylex.props(styles.root)}>
+      <div {...stylex.props(styles.header)}>
+        <div {...stylex.props(styles.titleGroup)}>
           <Heading level={2}>Readiness and host tools</Heading>
           <Text type="supporting" as="p">
             Server process health, rootless sandbox isolation verification, and BYO engine
@@ -52,7 +171,7 @@ export function ReadinessPanel({
           variant="secondary"
           size="sm"
           label={loading ? "Checking..." : "Refresh diagnostics"}
-          icon={<RefreshCwIcon className="size-3.5" aria-hidden="true" />}
+          icon={<RefreshCwIcon {...stylex.props(styles.iconSm)} aria-hidden="true" />}
           isDisabled={loading}
           onClick={onRefresh}
         />
@@ -61,8 +180,8 @@ export function ReadinessPanel({
       {problem ? <ProblemAlert problem={problem} onRetry={onRefresh} /> : null}
 
       <Card>
-        <div className="flex flex-col gap-1.5">
-          <div className="flex items-center justify-between gap-2">
+        <div {...stylex.props(styles.healthCard)}>
+          <div {...stylex.props(styles.rowBetween)}>
             <Heading level={3}>Process health</Heading>
             <Badge
               variant={health?.status === "ok" ? "success" : "error"}
@@ -77,22 +196,22 @@ export function ReadinessPanel({
         </div>
       </Card>
 
-      <section aria-labelledby="engines-heading" className="flex flex-col gap-3">
+      <section aria-labelledby="engines-heading" {...stylex.props(styles.section)}>
         <Heading level={3} id="engines-heading">
           BYO engines ({engines.length})
         </Heading>
         {engines.length === 0 ? (
           <EmptyState
-            icon={<ShieldAlertIcon className="size-6" aria-hidden="true" />}
+            icon={<ShieldAlertIcon {...stylex.props(styles.iconLg)} aria-hidden="true" />}
             title="No engines reported"
             description="Check server configuration for enabled BYO engines or fixture mode."
           />
         ) : (
-          <div className="grid gap-3 md:grid-cols-2">
+          <div {...stylex.props(styles.cardGrid)}>
             {engines.map((entry) => (
               <Card key={entry.engine}>
-                <div className="flex flex-col gap-3">
-                  <div className="flex flex-wrap items-center justify-between gap-2">
+                <div {...stylex.props(styles.engineCard)}>
+                  <div {...stylex.props(styles.rowBetweenWrap)}>
                     <Text type="code" weight="semibold">
                       {entry.engine}
                     </Text>
@@ -100,16 +219,16 @@ export function ReadinessPanel({
                       variant={entry.isolationVerified ? "success" : "error"}
                       icon={
                         entry.isolationVerified ? (
-                          <CheckCircle2Icon className="size-3.5" aria-hidden="true" />
+                          <CheckCircle2Icon {...stylex.props(styles.iconSm)} aria-hidden="true" />
                         ) : (
-                          <ShieldAlertIcon className="size-3.5" aria-hidden="true" />
+                          <ShieldAlertIcon {...stylex.props(styles.iconSm)} aria-hidden="true" />
                         )
                       }
                       label={entry.isolationVerified ? "Isolation verified" : "Isolation blocked"}
                     />
                   </div>
 
-                  <div className="flex flex-wrap items-center gap-2">
+                  <div {...stylex.props(styles.badgeRow)}>
                     <Badge
                       variant={interactiveBadgeVariant(entry.interactive)}
                       label={`Interactive: ${entry.interactive}`}
@@ -121,9 +240,12 @@ export function ReadinessPanel({
                   </div>
 
                   {entry.reasons.length > 0 ? (
-                    <ul className="flex flex-col gap-1 text-xs text-secondary">
+                    <ul {...stylex.props(styles.reasonList)}>
                       {entry.reasons.map((reason, idx) => (
-                        <li key={`${entry.engine}-reason-${idx}`} className="leading-relaxed">
+                        <li
+                          key={`${entry.engine}-reason-${idx}`}
+                          {...stylex.props(styles.reasonItem)}
+                        >
                           {reason}
                         </li>
                       ))}
@@ -135,9 +257,9 @@ export function ReadinessPanel({
                   )}
 
                   {entry.loginGuidance ? (
-                    <div className="rounded-md border border-warning bg-warning-muted px-3 py-2 text-xs text-on-warning-muted">
-                      <p className="font-medium">Login guidance</p>
-                      <p className="mt-1 font-mono text-xs break-all">{entry.loginGuidance}</p>
+                    <div {...stylex.props(styles.loginGuidance)}>
+                      <p {...stylex.props(styles.loginGuidanceTitle)}>Login guidance</p>
+                      <p {...stylex.props(styles.loginGuidanceCommand)}>{entry.loginGuidance}</p>
                     </div>
                   ) : null}
                 </div>
@@ -147,24 +269,24 @@ export function ReadinessPanel({
         )}
       </section>
 
-      <section aria-labelledby="tools-heading" className="flex flex-col gap-3">
+      <section aria-labelledby="tools-heading" {...stylex.props(styles.section)}>
         <Heading level={3} id="tools-heading">
           Registered host tools ({tools.length})
         </Heading>
         {tools.length === 0 ? (
           <EmptyState
-            icon={<WrenchIcon className="size-6" aria-hidden="true" />}
+            icon={<WrenchIcon {...stylex.props(styles.iconLg)} aria-hidden="true" />}
             title="No host tools registered"
             description="Configure MCP servers, Docker, or Wasmer tools on the server."
           />
         ) : (
-          <div className="grid gap-3 md:grid-cols-2">
+          <div {...stylex.props(styles.cardGrid)}>
             {tools.map((tool) => (
               <Card key={`${tool.kind}:${tool.id}`}>
-                <div className="flex flex-col gap-2">
-                  <div className="flex flex-wrap items-center justify-between gap-2">
+                <div {...stylex.props(styles.toolCard)}>
+                  <div {...stylex.props(styles.rowBetweenWrap)}>
                     <Heading level={4}>{tool.name}</Heading>
-                    <div className="flex items-center gap-1.5">
+                    <div {...stylex.props(styles.toolBadges)}>
                       <Badge variant="neutral" label={tool.kind} />
                       <Badge
                         variant={tool.requiresApproval ? "warning" : "success"}

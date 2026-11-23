@@ -6,12 +6,82 @@ import { Heading } from "@astryxdesign/core/Heading";
 import { Selector } from "@astryxdesign/core/Selector";
 import { Text } from "@astryxdesign/core/Text";
 import { TextArea } from "@astryxdesign/core/TextArea";
+import { spacingVars, textSizeVars, typographyVars } from "@astryxdesign/core/theme/tokens.stylex";
+import * as stylex from "@stylexjs/stylex";
 import { BrainIcon, RefreshCwIcon, SaveIcon } from "lucide-react";
 import { useCallback, useEffect, useState, type FormEvent } from "react";
 import type { Bot, ProblemDetails } from "@der/domain";
 import { ProblemAlert } from "@/components/problem-alert";
 import type { OperatorApi } from "@/lib/operator-api";
 import { toOperatorProblem, type BotMemoryResponse } from "@/lib/schemas";
+
+const styles = stylex.create({
+  root: {
+    display: "flex",
+    flexDirection: "column",
+    gap: spacingVars["--spacing-4"],
+  },
+  header: {
+    display: "flex",
+    flexWrap: "wrap",
+    alignItems: "center",
+    justifyContent: "space-between",
+    gap: spacingVars["--spacing-3"],
+  },
+  titleGroup: {
+    display: "flex",
+    flexDirection: "column",
+    gap: spacingVars["--spacing-0-5"],
+  },
+  actions: {
+    display: "flex",
+    alignItems: "center",
+    gap: spacingVars["--spacing-2"],
+  },
+  form: {
+    display: "flex",
+    flexDirection: "column",
+    gap: spacingVars["--spacing-4"],
+  },
+  cardHeader: {
+    display: "flex",
+    flexDirection: "column",
+    gap: spacingVars["--spacing-1"],
+  },
+  cardHeaderRow: {
+    display: "flex",
+    flexWrap: "wrap",
+    alignItems: "center",
+    justifyContent: "space-between",
+    gap: spacingVars["--spacing-2"],
+  },
+  badgeRow: {
+    display: "flex",
+    alignItems: "center",
+    gap: spacingVars["--spacing-2"],
+  },
+  editorControl: {
+    fontFamily: typographyVars["--font-family-code"],
+    fontSize: textSizeVars["--font-size-sm"],
+    lineHeight: 1.625,
+  },
+  submitRow: {
+    display: "flex",
+    justifyContent: "flex-end",
+  },
+  iconSm: {
+    width: "0.875rem",
+    height: "0.875rem",
+  },
+  iconMd: {
+    width: "1rem",
+    height: "1rem",
+  },
+  iconLg: {
+    width: "1.5rem",
+    height: "1.5rem",
+  },
+});
 
 export interface MemoryPanelProps {
   readonly api: OperatorApi;
@@ -85,7 +155,7 @@ export function MemoryPanel({ api, bot, onAnnounce }: MemoryPanelProps) {
   if (!bot) {
     return (
       <EmptyState
-        icon={<BrainIcon className="size-6" aria-hidden="true" />}
+        icon={<BrainIcon {...stylex.props(styles.iconLg)} aria-hidden="true" />}
         title="No bot selected"
         description="Select a bot from the sidebar to view or edit its Memory."
       />
@@ -109,16 +179,16 @@ export function MemoryPanel({ api, bot, onAnnounce }: MemoryPanelProps) {
   ];
 
   return (
-    <div className="flex flex-col gap-4">
-      <div className="flex flex-wrap items-center justify-between gap-3">
-        <div className="flex flex-col gap-0.5">
+    <div {...stylex.props(styles.root)}>
+      <div {...stylex.props(styles.header)}>
+        <div {...stylex.props(styles.titleGroup)}>
           <Heading level={2}>Memory for {bot.name}</Heading>
           <Text type="supporting" as="p">
             Authoritative bot-scoped Markdown in SQLite, atomically projected to disk.
           </Text>
         </div>
 
-        <div className="flex items-center gap-2">
+        <div {...stylex.props(styles.actions)}>
           <Selector
             label="Memory version"
             isLabelHidden
@@ -134,7 +204,7 @@ export function MemoryPanel({ api, bot, onAnnounce }: MemoryPanelProps) {
             variant="secondary"
             size="sm"
             label="Refresh"
-            icon={<RefreshCwIcon className="size-3.5" aria-hidden="true" />}
+            icon={<RefreshCwIcon {...stylex.props(styles.iconSm)} aria-hidden="true" />}
             isDisabled={loading}
             onClick={() =>
               void loadMemory(
@@ -149,11 +219,11 @@ export function MemoryPanel({ api, bot, onAnnounce }: MemoryPanelProps) {
       {problem ? <ProblemAlert problem={problem} onDismiss={() => setProblem(null)} /> : null}
 
       <Card>
-        <form onSubmit={handleSave} className="flex flex-col gap-4">
-          <div className="flex flex-col gap-1">
-            <div className="flex flex-wrap items-center justify-between gap-2">
+        <form onSubmit={handleSave} {...stylex.props(styles.form)}>
+          <div {...stylex.props(styles.cardHeader)}>
+            <div {...stylex.props(styles.cardHeaderRow)}>
               <Heading level={3}>Markdown source</Heading>
-              <div className="flex items-center gap-2">
+              <div {...stylex.props(styles.badgeRow)}>
                 {activeVersion !== undefined ? (
                   <Badge variant="neutral" label={`v${activeVersion}`} />
                 ) : (
@@ -180,15 +250,15 @@ export function MemoryPanel({ api, bot, onAnnounce }: MemoryPanelProps) {
             rows={14}
             placeholder={"# Preferences\n- Keep answers concise."}
             width="100%"
-            controlClassName="font-mono text-xs leading-relaxed"
+            controlXstyle={styles.editorControl}
           />
 
-          <div className="flex justify-end">
+          <div {...stylex.props(styles.submitRow)}>
             <Button
               type="submit"
               variant="primary"
               label={saving ? "Saving..." : "Save memory"}
-              icon={<SaveIcon className="size-4" aria-hidden="true" />}
+              icon={<SaveIcon {...stylex.props(styles.iconMd)} aria-hidden="true" />}
               isDisabled={saving || loading}
             />
           </div>

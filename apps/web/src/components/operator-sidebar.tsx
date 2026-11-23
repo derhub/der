@@ -10,13 +10,263 @@ import { Selector } from "@astryxdesign/core/Selector";
 import { Text } from "@astryxdesign/core/Text";
 import { TextArea } from "@astryxdesign/core/TextArea";
 import { TextInput } from "@astryxdesign/core/TextInput";
+import {
+  colorVars,
+  durationVars,
+  easeVars,
+  focusVars,
+  fontWeightVars,
+  radiusVars,
+  shadowVars,
+  spacingVars,
+  textSizeVars,
+  typographyVars,
+} from "@astryxdesign/core/theme/tokens.stylex";
+import * as stylex from "@stylexjs/stylex";
 import { BotIcon, MessageSquareIcon, PencilIcon, PlusIcon } from "lucide-react";
 import { useState, type FormEvent } from "react";
 import type { Bot, EngineKind, ProblemDetails, Session } from "@der/domain";
 import { ProblemAlert } from "@/components/problem-alert";
 import type { OperatorApi } from "@/lib/operator-api";
 import { toOperatorProblem } from "@/lib/schemas";
-import { cn } from "@/lib/utils";
+
+const styles = stylex.create({
+  sidebar: {
+    display: "flex",
+    height: "100%",
+    width: {
+      default: "100%",
+      "@media (min-width: 768px)": "18rem",
+    },
+    flexShrink: {
+      default: null,
+      "@media (min-width: 768px)": 0,
+    },
+    flexDirection: "column",
+    borderRightWidth: 1,
+    borderRightStyle: "solid",
+    borderRightColor: colorVars["--color-border"],
+    backgroundColor: colorVars["--color-background-surface"],
+    color: colorVars["--color-text-primary"],
+  },
+  brandHeader: {
+    display: "flex",
+    alignItems: "center",
+    justifyContent: "space-between",
+    gap: spacingVars["--spacing-2"],
+    paddingInline: spacingVars["--spacing-4"],
+    paddingBlock: "0.875rem",
+  },
+  brandIdentity: {
+    display: "flex",
+    alignItems: "center",
+    gap: "0.625rem",
+  },
+  brandMark: {
+    width: spacingVars["--spacing-7"],
+    height: spacingVars["--spacing-7"],
+    borderRadius: radiusVars["--radius-element"],
+  },
+  brandText: {
+    display: "flex",
+    flexDirection: "column",
+  },
+  brandTitle: {
+    fontSize: textSizeVars["--font-size-base"],
+    fontWeight: fontWeightVars["--font-weight-semibold"],
+    letterSpacing: "-0.025em",
+    lineHeight: 1,
+  },
+  scrollArea: {
+    display: "flex",
+    flexGrow: 1,
+    flexShrink: 1,
+    flexBasis: "0%",
+    flexDirection: "column",
+    gap: spacingVars["--spacing-5"],
+    overflowY: "auto",
+    paddingInline: spacingVars["--spacing-3"],
+    paddingBlock: spacingVars["--spacing-4"],
+  },
+  section: {
+    display: "flex",
+    flexDirection: "column",
+    gap: spacingVars["--spacing-2"],
+  },
+  sectionHeader: {
+    display: "flex",
+    alignItems: "center",
+    justifyContent: "space-between",
+    paddingInline: spacingVars["--spacing-1"],
+  },
+  emptyHint: {
+    paddingInline: spacingVars["--spacing-2"],
+    paddingBlock: spacingVars["--spacing-2"],
+  },
+  list: {
+    display: "flex",
+    flexDirection: "column",
+    gap: spacingVars["--spacing-1"],
+  },
+  botListItem: {
+    display: "flex",
+    alignItems: "center",
+    gap: spacingVars["--spacing-1"],
+  },
+  botButton: {
+    display: "flex",
+    minWidth: 0,
+    flexGrow: 1,
+    flexShrink: 1,
+    flexBasis: "0%",
+    alignItems: "center",
+    justifyContent: "space-between",
+    gap: spacingVars["--spacing-2"],
+    borderRadius: radiusVars["--radius-element"],
+    paddingInline: "0.625rem",
+    paddingBlock: spacingVars["--spacing-2"],
+    textAlign: "left",
+    fontSize: textSizeVars["--font-size-base"],
+    color: {
+      default: colorVars["--color-text-secondary"],
+      ":hover": colorVars["--color-text-primary"],
+    },
+    backgroundColor: {
+      default: "transparent",
+      ":hover": colorVars["--color-overlay-hover"],
+    },
+    transitionProperty: "color, background-color, box-shadow",
+    transitionDuration: durationVars["--duration-fast"],
+    transitionTimingFunction: easeVars["--ease-standard"],
+    outlineStyle: {
+      default: null,
+      ":focus-visible": "solid",
+    },
+    outlineWidth: {
+      default: null,
+      ":focus-visible": focusVars["--focus-outline-width"],
+    },
+    outlineColor: {
+      default: null,
+      ":focus-visible": colorVars["--color-info"],
+    },
+  },
+  botButtonSelected: {
+    backgroundColor: {
+      default: colorVars["--color-background-card"],
+      ":hover": colorVars["--color-background-card"],
+    },
+    fontWeight: fontWeightVars["--font-weight-medium"],
+    color: colorVars["--color-text-primary"],
+    boxShadow: shadowVars["--shadow-low"],
+    borderWidth: 1,
+    borderStyle: "solid",
+    borderColor: colorVars["--color-border"],
+  },
+  sessionButton: {
+    display: "flex",
+    width: "100%",
+    alignItems: "center",
+    justifyContent: "space-between",
+    gap: spacingVars["--spacing-2"],
+    borderRadius: radiusVars["--radius-element"],
+    paddingInline: "0.625rem",
+    paddingBlock: spacingVars["--spacing-2"],
+    textAlign: "left",
+    fontSize: textSizeVars["--font-size-base"],
+    color: {
+      default: colorVars["--color-text-secondary"],
+      ":hover": colorVars["--color-text-primary"],
+    },
+    backgroundColor: {
+      default: "transparent",
+      ":hover": colorVars["--color-overlay-hover"],
+    },
+    transitionProperty: "color, background-color",
+    transitionDuration: durationVars["--duration-fast"],
+    transitionTimingFunction: easeVars["--ease-standard"],
+    outlineStyle: {
+      default: null,
+      ":focus-visible": "solid",
+    },
+    outlineWidth: {
+      default: null,
+      ":focus-visible": focusVars["--focus-outline-width"],
+    },
+    outlineColor: {
+      default: null,
+      ":focus-visible": colorVars["--color-info"],
+    },
+  },
+  sessionButtonSelected: {
+    backgroundColor: {
+      default: colorVars["--color-accent-muted"],
+      ":hover": colorVars["--color-accent-muted"],
+    },
+    fontWeight: fontWeightVars["--font-weight-medium"],
+    color: colorVars["--color-text-primary"],
+  },
+  itemLabelGroup: {
+    display: "flex",
+    minWidth: 0,
+    alignItems: "center",
+    gap: spacingVars["--spacing-2"],
+  },
+  botIcon: {
+    width: "1rem",
+    height: "1rem",
+    flexShrink: 0,
+    color: colorVars["--color-icon-accent"],
+  },
+  sessionIcon: {
+    width: "0.875rem",
+    height: "0.875rem",
+    flexShrink: 0,
+  },
+  truncate: {
+    overflow: "hidden",
+    textOverflow: "ellipsis",
+    whiteSpace: "nowrap",
+  },
+  engineTag: {
+    fontFamily: typographyVars["--font-family-code"],
+    fontSize: textSizeVars["--font-size-sm"],
+    color: colorVars["--color-text-secondary"],
+  },
+  dialogFields: {
+    display: "flex",
+    flexDirection: "column",
+    gap: spacingVars["--spacing-4"],
+  },
+  fieldset: {
+    display: "flex",
+    flexDirection: "column",
+    gap: spacingVars["--spacing-2"],
+  },
+  legend: {
+    fontSize: textSizeVars["--font-size-base"],
+    fontWeight: fontWeightVars["--font-weight-medium"],
+    color: colorVars["--color-text-primary"],
+  },
+  checkboxRow: {
+    display: "flex",
+    flexWrap: "wrap",
+    gap: spacingVars["--spacing-3"],
+  },
+  monoControl: {
+    fontFamily: typographyVars["--font-family-code"],
+    fontSize: textSizeVars["--font-size-sm"],
+  },
+  dialogFooterActions: {
+    display: "flex",
+    justifyContent: "flex-end",
+    gap: spacingVars["--spacing-2"],
+  },
+  iconSm: {
+    width: "0.875rem",
+    height: "0.875rem",
+  },
+});
 
 const ALL_ENGINES: readonly EngineKind[] = ["codex", "claude-code", "antigravity", "fixture"];
 
@@ -179,15 +429,12 @@ export function OperatorSidebar({
   ];
 
   return (
-    <aside
-      aria-label="Bots and sessions"
-      className="flex h-full w-full flex-col border-r border-border bg-surface text-primary md:w-72 md:shrink-0"
-    >
-      <div className="flex items-center justify-between gap-2 px-4 py-3.5">
-        <div className="flex items-center gap-2.5">
-          <img src="/der-mark.svg" alt="" className="size-7 rounded-md" />
-          <div className="flex flex-col">
-            <span className="text-sm font-semibold tracking-tight leading-none">der</span>
+    <aside aria-label="Bots and sessions" {...stylex.props(styles.sidebar)}>
+      <div {...stylex.props(styles.brandHeader)}>
+        <div {...stylex.props(styles.brandIdentity)}>
+          <img src="/der-mark.svg" alt="" {...stylex.props(styles.brandMark)} />
+          <div {...stylex.props(styles.brandText)}>
+            <span {...stylex.props(styles.brandTitle)}>der</span>
             <Text type="supporting">Operator console</Text>
           </div>
         </div>
@@ -195,45 +442,40 @@ export function OperatorSidebar({
           size="sm"
           variant="secondary"
           label="New bot"
-          icon={<PlusIcon className="size-3.5" aria-hidden="true" />}
+          icon={<PlusIcon {...stylex.props(styles.iconSm)} aria-hidden="true" />}
           onClick={openCreateBot}
         />
       </div>
 
       <Divider />
 
-      <div className="flex flex-1 flex-col gap-5 overflow-y-auto px-3 py-4">
-        <section aria-labelledby="sidebar-bots-heading" className="flex flex-col gap-2">
-          <div className="flex items-center justify-between px-1">
+      <div {...stylex.props(styles.scrollArea)}>
+        <section aria-labelledby="sidebar-bots-heading" {...stylex.props(styles.section)}>
+          <div {...stylex.props(styles.sectionHeader)}>
             <Heading level={2} id="sidebar-bots-heading" color="secondary">
               Bots ({bots.length})
             </Heading>
           </div>
 
           {bots.length === 0 ? (
-            <Text type="supporting" as="p" className="px-2 py-2">
+            <Text type="supporting" as="p" xstyle={styles.emptyHint}>
               No bots yet. Create one to start a scoped session.
             </Text>
           ) : (
-            <ul className="flex flex-col gap-1">
+            <ul {...stylex.props(styles.list)}>
               {bots.map((entry) => {
                 const isSelected = entry.id === selectedBotId;
                 return (
-                  <li key={entry.id} className="flex items-center gap-1">
+                  <li key={entry.id} {...stylex.props(styles.botListItem)}>
                     <button
                       type="button"
                       onClick={() => onSelectBot(entry.id)}
                       aria-current={isSelected ? "true" : undefined}
-                      className={cn(
-                        "flex min-w-0 flex-1 items-center justify-between gap-2 rounded-md px-2.5 py-2 text-left text-sm transition-colors focus-visible:outline-2 focus-visible:outline-info",
-                        isSelected
-                          ? "bg-card font-medium text-primary shadow-sm ring-1 ring-border"
-                          : "text-secondary hover:bg-card/60 hover:text-primary",
-                      )}
+                      {...stylex.props(styles.botButton, isSelected && styles.botButtonSelected)}
                     >
-                      <span className="flex min-w-0 items-center gap-2">
-                        <BotIcon className="size-4 shrink-0 text-accent" aria-hidden="true" />
-                        <span className="truncate">{entry.name}</span>
+                      <span {...stylex.props(styles.itemLabelGroup)}>
+                        <BotIcon {...stylex.props(styles.botIcon)} aria-hidden="true" />
+                        <span {...stylex.props(styles.truncate)}>{entry.name}</span>
                       </span>
                       <Badge variant="neutral" label={entry.defaultEngine} />
                     </button>
@@ -241,7 +483,7 @@ export function OperatorSidebar({
                       size="sm"
                       variant="ghost"
                       label={`Edit bot ${entry.name}`}
-                      icon={<PencilIcon className="size-3.5" aria-hidden="true" />}
+                      icon={<PencilIcon {...stylex.props(styles.iconSm)} aria-hidden="true" />}
                       onClick={() => openEditBot(entry)}
                     />
                   </li>
@@ -253,8 +495,8 @@ export function OperatorSidebar({
 
         <Divider />
 
-        <section aria-labelledby="sidebar-sessions-heading" className="flex flex-col gap-2">
-          <div className="flex items-center justify-between px-1">
+        <section aria-labelledby="sidebar-sessions-heading" {...stylex.props(styles.section)}>
+          <div {...stylex.props(styles.sectionHeader)}>
             <Heading level={2} id="sidebar-sessions-heading" color="secondary">
               Sessions ({sessions.length})
             </Heading>
@@ -262,22 +504,22 @@ export function OperatorSidebar({
               size="sm"
               variant="ghost"
               label="New session"
-              icon={<PlusIcon className="size-3.5" aria-hidden="true" />}
+              icon={<PlusIcon {...stylex.props(styles.iconSm)} aria-hidden="true" />}
               isDisabled={!selectedBot}
               onClick={openCreateSession}
             />
           </div>
 
           {!selectedBot ? (
-            <Text type="supporting" as="p" className="px-2 py-2">
+            <Text type="supporting" as="p" xstyle={styles.emptyHint}>
               Select a bot to inspect its sessions.
             </Text>
           ) : sessions.length === 0 ? (
-            <Text type="supporting" as="p" className="px-2 py-2">
+            <Text type="supporting" as="p" xstyle={styles.emptyHint}>
               No sessions in {selectedBot.name}.
             </Text>
           ) : (
-            <ul className="flex flex-col gap-1">
+            <ul {...stylex.props(styles.list)}>
               {sessions.map((entry) => {
                 const isSelected = entry.id === selectedSessionId;
                 return (
@@ -286,19 +528,20 @@ export function OperatorSidebar({
                       type="button"
                       onClick={() => onSelectSession(entry.id)}
                       aria-current={isSelected ? "true" : undefined}
-                      className={cn(
-                        "flex w-full items-center justify-between gap-2 rounded-md px-2.5 py-2 text-left text-sm transition-colors focus-visible:outline-2 focus-visible:outline-info",
-                        isSelected
-                          ? "bg-accent-muted font-medium text-primary"
-                          : "text-secondary hover:bg-card/60 hover:text-primary",
+                      {...stylex.props(
+                        styles.sessionButton,
+                        isSelected && styles.sessionButtonSelected,
                       )}
                     >
-                      <span className="flex min-w-0 items-center gap-2">
-                        <MessageSquareIcon className="size-3.5 shrink-0" aria-hidden="true" />
-                        <span className="truncate">{entry.title}</span>
+                      <span {...stylex.props(styles.itemLabelGroup)}>
+                        <MessageSquareIcon
+                          {...stylex.props(styles.sessionIcon)}
+                          aria-hidden="true"
+                        />
+                        <span {...stylex.props(styles.truncate)}>{entry.title}</span>
                       </span>
                       {entry.engine ? (
-                        <span className="font-mono text-xs text-secondary">{entry.engine}</span>
+                        <span {...stylex.props(styles.engineTag)}>{entry.engine}</span>
                       ) : null}
                     </button>
                   </li>
@@ -323,7 +566,7 @@ export function OperatorSidebar({
             }
             content={
               <LayoutContent isScrollable={false}>
-                <div className="flex flex-col gap-4">
+                <div {...stylex.props(styles.dialogFields)}>
                   {botProblem ? (
                     <ProblemAlert problem={botProblem} onDismiss={() => setBotProblem(null)} />
                   ) : null}
@@ -363,12 +606,12 @@ export function OperatorSidebar({
                     width="100%"
                   />
 
-                  <fieldset className="flex flex-col gap-2">
-                    <legend className="text-sm font-medium text-primary">Allowed engines</legend>
+                  <fieldset {...stylex.props(styles.fieldset)}>
+                    <legend {...stylex.props(styles.legend)}>Allowed engines</legend>
                     <Text type="supporting" as="p">
                       Sessions and runs for this bot can only use checked engines.
                     </Text>
-                    <div className="flex flex-wrap gap-3">
+                    <div {...stylex.props(styles.checkboxRow)}>
                       {ALL_ENGINES.map((kind) => (
                         <CheckboxInput
                           key={kind}
@@ -388,14 +631,14 @@ export function OperatorSidebar({
                     onChange={setBotWorkspacePath}
                     placeholder="/data/workspaces/home-ops"
                     width="100%"
-                    controlClassName="font-mono text-xs"
+                    controlXstyle={styles.monoControl}
                   />
                 </div>
               </LayoutContent>
             }
             footer={
               <LayoutFooter hasDivider>
-                <div className="flex justify-end gap-2">
+                <div {...stylex.props(styles.dialogFooterActions)}>
                   <Button
                     variant="secondary"
                     label="Cancel"
@@ -433,7 +676,7 @@ export function OperatorSidebar({
             }
             content={
               <LayoutContent isScrollable={false}>
-                <div className="flex flex-col gap-4">
+                <div {...stylex.props(styles.dialogFields)}>
                   {sessionProblem ? (
                     <ProblemAlert
                       problem={sessionProblem}
@@ -465,7 +708,7 @@ export function OperatorSidebar({
             }
             footer={
               <LayoutFooter hasDivider>
-                <div className="flex justify-end gap-2">
+                <div {...stylex.props(styles.dialogFooterActions)}>
                   <Button
                     variant="secondary"
                     label="Cancel"

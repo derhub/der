@@ -5,7 +5,14 @@ import { Heading } from "@astryxdesign/core/Heading";
 import { Tab, TabList } from "@astryxdesign/core/TabList";
 import { TextInput } from "@astryxdesign/core/TextInput";
 import { Theme } from "@astryxdesign/core/theme";
+import {
+  colorVars,
+  spacingVars,
+  textSizeVars,
+  typographyVars,
+} from "@astryxdesign/core/theme/tokens.stylex";
 import { neutralTheme } from "@astryxdesign/theme-neutral/built";
+import * as stylex from "@stylexjs/stylex";
 import {
   ActivityIcon,
   BookOpenIcon,
@@ -25,6 +32,90 @@ import { RoutinesPanel } from "@/components/routines-panel";
 import { SkillsPanel } from "@/components/skills-panel";
 import { createOperatorApi, type OperatorApi } from "@/lib/operator-api";
 import { toOperatorProblem, type HealthResponse } from "@/lib/schemas";
+
+const styles = stylex.create({
+  shell: {
+    display: "flex",
+    minHeight: "100vh",
+    flexDirection: {
+      default: "column",
+      "@media (min-width: 768px)": "row",
+    },
+    backgroundColor: colorVars["--color-background-body"],
+    color: colorVars["--color-text-primary"],
+  },
+  contentColumn: {
+    display: "flex",
+    minWidth: 0,
+    flexGrow: 1,
+    flexShrink: 1,
+    flexBasis: "0%",
+    flexDirection: "column",
+  },
+  header: {
+    display: "flex",
+    flexWrap: "wrap",
+    alignItems: "center",
+    justifyContent: "space-between",
+    gap: spacingVars["--spacing-3"],
+    borderBottomWidth: 1,
+    borderBottomStyle: "solid",
+    borderBottomColor: colorVars["--color-border"],
+    backgroundColor: colorVars["--color-background-card"],
+    paddingInline: spacingVars["--spacing-5"],
+    paddingBlock: spacingVars["--spacing-3"],
+  },
+  headerGroup: {
+    display: "flex",
+    flexWrap: "wrap",
+    alignItems: "center",
+    gap: spacingVars["--spacing-2"],
+  },
+  actorLabel: {
+    fontSize: textSizeVars["--font-size-sm"],
+    color: colorVars["--color-text-secondary"],
+  },
+  actorControl: {
+    fontFamily: typographyVars["--font-family-code"],
+    fontSize: textSizeVars["--font-size-sm"],
+  },
+  statusBar: {
+    minHeight: spacingVars["--spacing-6"],
+    borderBottomWidth: 1,
+    borderBottomStyle: "solid",
+    borderBottomColor: colorVars["--color-border"],
+    backgroundColor: colorVars["--color-background-muted"],
+    paddingInline: spacingVars["--spacing-5"],
+    paddingBlock: spacingVars["--spacing-1"],
+    fontSize: textSizeVars["--font-size-sm"],
+    color: colorVars["--color-text-secondary"],
+  },
+  main: {
+    marginInline: "auto",
+    display: "flex",
+    width: "100%",
+    maxWidth: "72rem",
+    flexGrow: 1,
+    flexShrink: 1,
+    flexBasis: "0%",
+    flexDirection: "column",
+    gap: spacingVars["--spacing-4"],
+    paddingInline: spacingVars["--spacing-5"],
+    paddingBlock: spacingVars["--spacing-5"],
+  },
+  iconSm: {
+    width: "0.875rem",
+    height: "0.875rem",
+  },
+  iconMd: {
+    width: "1rem",
+    height: "1rem",
+  },
+  iconLg: {
+    width: "1.5rem",
+    height: "1.5rem",
+  },
+});
 
 export interface AppProps {
   readonly api?: OperatorApi;
@@ -155,7 +246,7 @@ export function App({ api: providedApi, fetcher }: AppProps) {
 
   return (
     <Theme theme={neutralTheme}>
-      <div className="flex min-h-screen flex-col bg-body text-primary md:flex-row">
+      <div {...stylex.props(styles.shell)}>
         <OperatorSidebar
           api={api}
           bots={bots}
@@ -169,9 +260,9 @@ export function App({ api: providedApi, fetcher }: AppProps) {
           onAnnounce={announce}
         />
 
-        <div className="flex min-w-0 flex-1 flex-col">
-          <header className="flex flex-wrap items-center justify-between gap-3 border-b border-border bg-card px-5 py-3">
-            <div className="flex flex-wrap items-center gap-2">
+        <div {...stylex.props(styles.contentColumn)}>
+          <header {...stylex.props(styles.header)}>
+            <div {...stylex.props(styles.headerGroup)}>
               <Heading level={1}>{selectedBot ? selectedBot.name : "der control plane"}</Heading>
               <Badge
                 variant={health?.status === "ok" ? "success" : "error"}
@@ -183,8 +274,8 @@ export function App({ api: providedApi, fetcher }: AppProps) {
               />
             </div>
 
-            <div className="flex flex-wrap items-center gap-2">
-              <label htmlFor="operator-actor-input" className="text-xs text-secondary">
+            <div {...stylex.props(styles.headerGroup)}>
+              <label htmlFor="operator-actor-input" {...stylex.props(styles.actorLabel)}>
                 Actor
               </label>
               <TextInput
@@ -195,13 +286,13 @@ export function App({ api: providedApi, fetcher }: AppProps) {
                 width={128}
                 value={actor}
                 onChange={handleActorChange}
-                controlClassName="font-mono text-xs"
+                controlXstyle={styles.actorControl}
               />
               <Button
                 size="sm"
                 variant="secondary"
                 label="Refresh"
-                icon={<RefreshCwIcon className="size-3.5" aria-hidden="true" />}
+                icon={<RefreshCwIcon {...stylex.props(styles.iconSm)} aria-hidden="true" />}
                 isDisabled={loadingBootstrap}
                 onClick={() => void loadBootstrap()}
               />
@@ -212,12 +303,12 @@ export function App({ api: providedApi, fetcher }: AppProps) {
             role="status"
             aria-label="Operator status"
             aria-live="polite"
-            className="min-h-6 border-b border-border bg-muted px-5 py-1 text-xs text-secondary"
+            {...stylex.props(styles.statusBar)}
           >
             {statusMessage || "Connected to same-origin der operator API."}
           </div>
 
-          <main className="mx-auto flex w-full max-w-6xl flex-1 flex-col gap-4 px-5 py-5">
+          <main {...stylex.props(styles.main)}>
             {bootstrapProblem ? (
               <ProblemAlert
                 problem={bootstrapProblem}
@@ -237,31 +328,31 @@ export function App({ api: providedApi, fetcher }: AppProps) {
                 value="chat"
                 label="Chat & Runs"
                 panelId="panel-chat"
-                icon={<MessageSquareIcon className="size-4" aria-hidden="true" />}
+                icon={<MessageSquareIcon {...stylex.props(styles.iconMd)} aria-hidden="true" />}
               />
               <Tab
                 value="memory"
                 label="Memory"
                 panelId="panel-memory"
-                icon={<BrainIcon className="size-4" aria-hidden="true" />}
+                icon={<BrainIcon {...stylex.props(styles.iconMd)} aria-hidden="true" />}
               />
               <Tab
                 value="routines"
                 label="Routines"
                 panelId="panel-routines"
-                icon={<CalendarClockIcon className="size-4" aria-hidden="true" />}
+                icon={<CalendarClockIcon {...stylex.props(styles.iconMd)} aria-hidden="true" />}
               />
               <Tab
                 value="readiness"
                 label="Readiness"
                 panelId="panel-readiness"
-                icon={<ActivityIcon className="size-4" aria-hidden="true" />}
+                icon={<ActivityIcon {...stylex.props(styles.iconMd)} aria-hidden="true" />}
               />
               <Tab
                 value="skills"
                 label="Skills"
                 panelId="panel-skills"
-                icon={<BookOpenIcon className="size-4" aria-hidden="true" />}
+                icon={<BookOpenIcon {...stylex.props(styles.iconMd)} aria-hidden="true" />}
               />
             </TabList>
 
@@ -279,7 +370,7 @@ export function App({ api: providedApi, fetcher }: AppProps) {
                   />
                 ) : (
                   <EmptyState
-                    icon={<MessageSquareIcon className="size-6" aria-hidden="true" />}
+                    icon={<MessageSquareIcon {...stylex.props(styles.iconLg)} aria-hidden="true" />}
                     title="Select a bot and session"
                     description="Create or choose a bot and session in the sidebar to inspect scoped history and run live prompts."
                   />

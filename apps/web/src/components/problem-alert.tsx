@@ -2,7 +2,35 @@ import { Badge } from "@astryxdesign/core/Badge";
 import { Banner } from "@astryxdesign/core/Banner";
 import { Button } from "@astryxdesign/core/Button";
 import { Text } from "@astryxdesign/core/Text";
+import { spacingVars, textSizeVars, typographyVars } from "@astryxdesign/core/theme/tokens.stylex";
+import * as stylex from "@stylexjs/stylex";
 import type { ProblemDetails } from "@der/domain";
+
+const styles = stylex.create({
+  titleRow: {
+    display: "inline-flex",
+    flexWrap: "wrap",
+    alignItems: "center",
+    gap: spacingVars["--spacing-2"],
+  },
+  descriptionColumn: {
+    display: "flex",
+    flexDirection: "column",
+    gap: spacingVars["--spacing-1"],
+  },
+  detailText: {
+    overflowWrap: "break-word",
+  },
+  metaRow: {
+    display: "flex",
+    flexWrap: "wrap",
+    alignItems: "center",
+    gap: spacingVars["--spacing-3"],
+    fontFamily: typographyVars["--font-family-code"],
+    fontSize: textSizeVars["--font-size-sm"],
+    opacity: 0.8,
+  },
+});
 
 export interface ProblemAlertProps {
   readonly problem: ProblemDetails;
@@ -26,18 +54,18 @@ export function ProblemAlert({
         {...(onDismiss ? { onDismiss } : {})}
         dismissLabel="Dismiss error"
         title={
-          <span className="inline-flex flex-wrap items-center gap-2">
+          <span {...stylex.props(styles.titleRow)}>
             <span>{problem.title}</span>
             <Badge variant="error" label={String(problem.status)} />
             <Badge variant="neutral" label={problem.code} />
           </span>
         }
         description={
-          <div className="flex flex-col gap-1">
-            <Text type="body" as="p" className="break-words">
+          <div {...stylex.props(styles.descriptionColumn)}>
+            <Text type="body" as="p" xstyle={styles.detailText}>
               {problem.detail}
             </Text>
-            <div className="flex flex-wrap items-center gap-3 font-mono text-xs opacity-80">
+            <div {...stylex.props(styles.metaRow)}>
               <span>instance: {problem.instance}</span>
               <span>type: {problem.type}</span>
             </div>

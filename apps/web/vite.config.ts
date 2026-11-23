@@ -1,5 +1,5 @@
 import path from "node:path";
-import tailwindcss from "@tailwindcss/vite";
+import stylex from "@stylexjs/unplugin";
 import react from "@vitejs/plugin-react";
 import { defineConfig } from "vite-plus";
 
@@ -9,7 +9,14 @@ export default defineConfig(() => {
   const apiProxyTarget = process.env["DER_API_PROXY_TARGET"] ?? "http://127.0.0.1:3000";
 
   return {
-    plugins: [react(), tailwindcss()],
+    plugins: [
+      stylex.vite({
+        useCSSLayers: true,
+        dev: process.env.NODE_ENV === "development",
+        runtimeInjection: false,
+      }),
+      react(),
+    ],
     resolve: {
       alias: {
         "@": path.resolve(webRoot, "src"),
