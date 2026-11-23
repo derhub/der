@@ -9,14 +9,19 @@ import {
   checkRunReadinessGate,
   extractCheckpointSessionId,
   linkAbortSignal,
-  isBroadResumeFailureMessage,
   type EngineResumeTraits,
   type LoadEngineRunInput,
 } from "./stream-bridge";
 
+const UNKNOWN_TRAJECTORY_MESSAGE = /trajectory not found/i;
+
+/**
+ * `agy acp` answers `session/load` for an unknown id with that same id, then fails the first
+ * prompt with "not_found: trajectory not found: <id>".
+ */
 export const antigravityResume: EngineResumeTraits = {
-  resumable: false,
-  isResumeFailure: isBroadResumeFailureMessage,
+  resumable: true,
+  isResumeFailure: (message) => UNKNOWN_TRAJECTORY_MESSAGE.test(message),
 };
 
 export interface AntigravityEngineConfig {
@@ -107,7 +112,7 @@ export function createAntigravityEngine(config: AntigravityEngineConfig): Engine
         const stream = chat({
           adapter: antigravity(config.model),
           messages: input.messages,
-          systemPrompts: input.systemPrompts ?? [],
+          systemPrompts: resumeSessionId !== undefined ? [] : (input.systemPrompts ?? []),
           tools: input.tools ?? [],
           modelOptions: resumeSessionId !== undefined ? { sessionId: resumeSessionId } : {},
           threadId: run.sessionId,
@@ -116,7 +121,7 @@ export function createAntigravityEngine(config: AntigravityEngineConfig): Engine
           middleware: [withSandbox(sandbox)],
         });
 
-        yield* bridgeAdapterStream({
+        const events = bridgeAdapterStream({
           run,
           stream,
           ...(input.signal !== undefined ? { signal: input.signal } : {}),
@@ -127,6 +132,19 @@ export function createAntigravityEngine(config: AntigravityEngineConfig): Engine
           ...(resumeSessionId !== undefined ? { expectedResumeSessionId: resumeSessionId } : {}),
           ...(input.requireResume !== undefined ? { requireResume: input.requireResume } : {}),
         });
+        for await (const event of events) {
+          yield input.requireResume === true &&
+          resumeSessionId !== undefined &&
+          event.type === "failed" &&
+          event.code !== "engine.resume_unavailable" &&
+          antigravityResume.isResumeFailure(event.detail)
+            ? {
+                type: "failed",
+                code: "engine.resume_unavailable",
+                detail: `Unable to resume session "${resumeSessionId}": ${event.detail}`,
+              }
+            : event;
+        }
       } finally {
         release();
       }
