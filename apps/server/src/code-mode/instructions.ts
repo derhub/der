@@ -32,7 +32,7 @@ export function codeModeInstructions(catalog: Catalog): string {
     ...(hasCatalogSearch
       ? ["- `der.catalog.search(query)` searches the capabilities from inside a Script."]
       : []),
-    "- Any `import` is rejected before the Script starts, including the text `import(` and a method named `.import(`. `eval` and `Function` are unavailable. There are no timers.",
+    "- Modules and `import` are not available. `eval` and `Function` are unavailable. There are no timers.",
     "- `Date`, `Math.random` and `performance.now` return recorded values, so a Script replays the same way every time. Do not branch on them.",
     "- A write can need operator approval. `execute` then waits for the decision. A denied or expired approval comes back as `ok: false` with kind `denied` or `expired`.",
     "- If your `execute` call is cut off, call it again with the identical Script to pick the same run back up. After a result has been returned, the same Script runs again.",

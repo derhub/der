@@ -402,7 +402,9 @@ describe("describe the tools to the model", () => {
 
     expect(text).toContain("- notes: append, publish, read");
     expect(text).toContain("`await` every call");
-    expect(text).toContain("including the text `import(` and a method named `.import(`");
+    expect(text).toContain(
+      "- Modules and `import` are not available. `eval` and `Function` are unavailable. There are no timers.",
+    );
     expect(text).toContain("`Date`, `Math.random` and `performance.now` return recorded values");
   }, 60_000);
 });
