@@ -114,7 +114,7 @@ export async function admitRun(
   const bot = mapBotRow(botRow);
   const session = mapSessionRow(sessionRow);
   const resolvedEngine = valid.engine ?? session.engine ?? bot.defaultEngine;
-  if (!bot.allowedEngines.includes(resolvedEngine)) {
+  if (resolvedEngine !== "script" && !bot.allowedEngines.includes(resolvedEngine)) {
     throw validationError(
       "run.engine_not_allowed",
       "Engine is not allowed",
@@ -186,6 +186,14 @@ export async function admitRun(
           "routine.scope_mismatch",
           "Routine scope mismatch",
           `Routine ${valid.routineId} does not belong to bot ${valid.botId} and session ${valid.sessionId}.`,
+          instance,
+        );
+      }
+      if (resolvedEngine === "script" && routineRow.engine !== "script") {
+        throw conflictError(
+          "routine.scope_mismatch",
+          "Routine scope mismatch",
+          `Routine ${valid.routineId} does not carry a script.`,
           instance,
         );
       }

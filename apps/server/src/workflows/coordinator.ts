@@ -23,6 +23,7 @@ import {
   type DurableWorkflow,
   type WorkflowDeps,
 } from "./run-steps";
+import { executeScriptRoutineStage } from "./script-routine-stage";
 
 export interface AwakeableHandle {
   readonly id: string;
@@ -161,9 +162,12 @@ export function createRunCoordinator(options: RunCoordinatorOptions): RunCoordin
     }
 
     const run = started.run;
-    const stage = await driver.runStep("engine-pre-approval", () =>
-      executeEnginePreApprovalStage(options, run),
-    );
+    const stage =
+      run.engine === "script"
+        ? await driver.runStep("run-routine-script", () => executeScriptRoutineStage(options, run))
+        : await driver.runStep("engine-pre-approval", () =>
+            executeEnginePreApprovalStage(options, run),
+          );
 
     await driver.runStep("finish-direct-run", () =>
       finalizeDirectRunStep(options, { run, outcome: stage }),

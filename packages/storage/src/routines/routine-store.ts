@@ -6,6 +6,7 @@ import {
   type RoutineId,
   type RoutineSlot,
   type RoutineSlotDisposition,
+  type RoutineTarget,
   type RunId,
   type SessionId,
   type UtcTimestamp,
@@ -36,7 +37,7 @@ function mapRoutineSlotRow(row: RoutineSlotRow): RoutineSlot {
   });
 }
 
-export interface CreateRoutineRecordInput {
+export type CreateRoutineRecordInput = {
   readonly id?: RoutineId;
   readonly botId: BotId;
   readonly sessionId: SessionId;
@@ -44,9 +45,7 @@ export interface CreateRoutineRecordInput {
   readonly cron: string;
   readonly enabled: boolean;
   readonly revision?: number;
-  readonly engine: EngineKind;
-  readonly prompt: string;
-}
+} & RoutineTarget;
 
 export interface UpdateRoutineRecordInput {
   readonly name?: string;
@@ -54,7 +53,47 @@ export interface UpdateRoutineRecordInput {
   readonly enabled?: boolean;
   readonly engine?: EngineKind;
   readonly prompt?: string;
+  readonly script?: string;
   readonly expectedRevision?: number;
+}
+
+export function routineTargetColumns(target: RoutineTarget): {
+  readonly prompt: string | null;
+  readonly script: string | null;
+} {
+  return target.engine === "script"
+    ? { prompt: null, script: target.script }
+    : { prompt: target.prompt, script: null };
+}
+
+function routineText(target: RoutineTarget): string {
+  return target.engine === "script" ? target.script : target.prompt;
+}
+
+function targetKindConflict(existing: Routine, instance: string) {
+  return validationError(
+    "routine.target_conflict",
+    "Routine target cannot change kind",
+    `Routine ${existing.id} runs a ${existing.engine === "script" ? "script" : "prompt"}; create a new routine to change it.`,
+    instance,
+  );
+}
+
+function patchedTarget(
+  existing: Routine,
+  patch: UpdateRoutineRecordInput,
+  instance: string,
+): RoutineTarget {
+  if (existing.engine === "script") {
+    if (patch.prompt !== undefined || patch.engine !== undefined) {
+      throw targetKindConflict(existing, instance);
+    }
+    return { engine: "script", script: patch.script ?? existing.script };
+  }
+  if (patch.script !== undefined) {
+    throw targetKindConflict(existing, instance);
+  }
+  return { engine: patch.engine ?? existing.engine, prompt: patch.prompt ?? existing.prompt };
 }
 
 export interface RecordRoutineSlotInput {
@@ -91,12 +130,12 @@ export class SqliteRoutines {
     if (
       input.name.trim().length === 0 ||
       input.cron.trim().length === 0 ||
-      input.prompt.trim().length === 0
+      routineText(input).trim().length === 0
     ) {
       throw validationError(
         "routine.invalid_input",
         "Invalid routine input",
-        "Routine name, cron, and prompt must be non-empty strings.",
+        "Routine name, cron, and prompt or script must be non-empty strings.",
         instance,
       );
     }
@@ -112,7 +151,7 @@ export class SqliteRoutines {
         );
       }
       const bot = mapBotRow(botRow);
-      if (!bot.allowedEngines.includes(input.engine)) {
+      if (input.engine !== "script" && !bot.allowedEngines.includes(input.engine)) {
         throw validationError(
           "routine.engine_not_allowed",
           "Engine is not allowed for bot",
@@ -133,9 +172,10 @@ export class SqliteRoutines {
         );
       }
 
+      const { prompt, script } = routineTargetColumns(input);
       db.query(
-        `INSERT INTO routines (id, bot_id, session_id, name, cron, enabled, revision, engine, prompt, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        `INSERT INTO routines (id, bot_id, session_id, name, cron, enabled, revision, engine, prompt, script, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       ).run(
         routineId,
         input.botId,
@@ -145,7 +185,8 @@ export class SqliteRoutines {
         input.enabled ? 1 : 0,
         revision,
         input.engine,
-        input.prompt,
+        prompt,
+        script,
         now,
         now,
       );
@@ -212,18 +253,17 @@ export class SqliteRoutines {
       const nextName = patch.name ?? existing.name;
       const nextCron = patch.cron ?? existing.cron;
       const nextEnabled = patch.enabled ?? existing.enabled;
-      const nextEngine = patch.engine ?? existing.engine;
-      const nextPrompt = patch.prompt ?? existing.prompt;
+      const nextTarget = patchedTarget(existing, patch, instance);
 
       if (
         nextName.trim().length === 0 ||
         nextCron.trim().length === 0 ||
-        nextPrompt.trim().length === 0
+        routineText(nextTarget).trim().length === 0
       ) {
         throw validationError(
           "routine.invalid_input",
           "Invalid routine update",
-          "Routine name, cron, and prompt must be non-empty strings.",
+          "Routine name, cron, and prompt or script must be non-empty strings.",
           instance,
         );
       }
@@ -240,27 +280,29 @@ export class SqliteRoutines {
         );
       }
       const bot = mapBotRow(botRow);
-      if (!bot.allowedEngines.includes(nextEngine)) {
+      if (nextTarget.engine !== "script" && !bot.allowedEngines.includes(nextTarget.engine)) {
         throw validationError(
           "routine.engine_not_allowed",
           "Engine is not allowed for bot",
-          `Engine "${nextEngine}" is not allowed on bot ${bot.id}.`,
+          `Engine "${nextTarget.engine}" is not allowed on bot ${bot.id}.`,
           instance,
         );
       }
 
       const nextRevision = existing.revision + 1;
+      const nextColumns = routineTargetColumns(nextTarget);
       db.query(
         `UPDATE routines
-         SET name = ?, cron = ?, enabled = ?, revision = ?, engine = ?, prompt = ?, updated_at = ?
+         SET name = ?, cron = ?, enabled = ?, revision = ?, engine = ?, prompt = ?, script = ?, updated_at = ?
          WHERE id = ?`,
       ).run(
         nextName,
         nextCron,
         nextEnabled ? 1 : 0,
         nextRevision,
-        nextEngine,
-        nextPrompt,
+        nextTarget.engine,
+        nextColumns.prompt,
+        nextColumns.script,
         now,
         routineId,
       );

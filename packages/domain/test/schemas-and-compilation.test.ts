@@ -125,6 +125,7 @@ const fixtures = {
     revision: 1,
     engine: "codex" as const,
     prompt: "Summarize overnight alerts.",
+    script: null,
     createdAt: "2026-11-22T15:00:00Z",
     updatedAt: "2026-11-22T15:00:00Z",
   },
@@ -674,6 +675,45 @@ describe("register integrations through IntegrationRegistry", () => {
       ),
     ).resolves.toBeUndefined();
   });
+
+  it.each([
+    { name: "a prompt routine", patch: {}, valid: true },
+    {
+      name: "a script routine",
+      patch: { engine: "script", prompt: null, script: "return 1" },
+      valid: true,
+    },
+    { name: "both prompt and script", patch: { script: "return 1" }, valid: false },
+    { name: "neither prompt nor script", patch: { prompt: null }, valid: false },
+    {
+      name: "a script with a chat engine",
+      patch: { prompt: null, script: "return 1" },
+      valid: false,
+    },
+    { name: "a prompt with engine script", patch: { engine: "script" }, valid: false },
+  ])("routine target accepts exactly one of prompt or script: $name", ({ patch, valid }) => {
+    const candidate = { ...fixtures.routine, ...patch };
+    expect(routine.safeParse(candidate).success).toBe(valid);
+    expect(compiledParsers.routine.safeParse(candidate).success).toBe(valid);
+  });
+
+  it.each([
+    { origin: "routine", routineId: "rt-1", valid: true },
+    { origin: "routine", routineId: undefined, valid: false },
+    { origin: "http", routineId: "rt-1", valid: false },
+    { origin: "web", routineId: undefined, valid: false },
+  ])(
+    "runRequest admits engine script only for a routine firing: $origin $routineId",
+    ({ origin, routineId, valid }) => {
+      const request = {
+        ...fixtures.runRequest,
+        origin,
+        engine: "script",
+        ...(routineId === undefined ? {} : { routineId }),
+      };
+      expect(runRequest.safeParse(request).success).toBe(valid);
+    },
+  );
 
   it("allows http, web, and routine on active runRequest while rejecting telegram and channelIntake", () => {
     expect(runRequest.safeParse({ ...fixtures.runRequest, origin: "http" }).success).toBe(true);

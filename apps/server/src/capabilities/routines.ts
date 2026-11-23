@@ -6,6 +6,7 @@ import {
   routine,
   utcTimestamp,
   type BotStore,
+  type RoutineTarget,
   type SessionStore,
 } from "@der/domain";
 import type { HttpRoutinePort } from "../http/index";
@@ -20,6 +21,14 @@ export interface RoutineCapabilityDeps {
 }
 
 const configured = z.object({ routine, nextSlot: utcTimestamp.nullable() });
+
+const routineFields = {
+  id: id.optional(),
+  sessionId: id,
+  name: z.string().min(1),
+  cron: z.string().min(1),
+  enabled: z.boolean().default(true),
+};
 
 export function routineCapabilities(deps: RoutineCapabilityDeps) {
   return [
@@ -39,21 +48,20 @@ export function routineCapabilities(deps: RoutineCapabilityDeps) {
     defineCapability({
       id: "routines.create",
       description:
-        "Create a scheduled routine for one of this bot's sessions. The cron is evaluated in UTC.",
-      input: z.strictObject({
-        id: id.optional(),
-        sessionId: id,
-        name: z.string().min(1),
-        cron: z.string().min(1),
-        enabled: z.boolean().default(true),
-        engine: engineKind.optional(),
-        prompt: z.string().min(1),
-      }),
+        "Create a scheduled routine for one of this bot's sessions. The cron is evaluated in UTC. Pass `prompt` to run a model turn, or `script` to run a Script with no model; a script routine asks for Approval on every gated write on every firing.",
+      input: z.union([
+        z.strictObject({
+          ...routineFields,
+          engine: engineKind.optional(),
+          prompt: z.string().min(1),
+        }),
+        z.strictObject({ ...routineFields, script: z.string().min(1) }),
+      ]),
       output: configured,
       effect: "write",
       approval: "always",
       example:
-        'await der.routines.create({ sessionId: "sess-1", name: "Daily", cron: "0 9 * * *", prompt: "Check status" })',
+        'await der.routines.create({ sessionId: "sess-1", name: "Daily", cron: "0 9 * * *", script: "return await der.routines.list({})" })',
       async execute(input, ctx) {
         const botId = callerBotId(ctx, "routines.create");
         const bot = await deps.bots.getBot(botId);
@@ -69,6 +77,13 @@ export function routineCapabilities(deps: RoutineCapabilityDeps) {
             "routines.create",
           );
         }
+        const target: RoutineTarget =
+          "script" in input
+            ? { engine: "script", script: input.script }
+            : {
+                engine: input.engine ?? session.engine ?? bot.defaultEngine,
+                prompt: input.prompt,
+              };
         return deps.routineSchedule.configure(input.id ?? `rt_${crypto.randomUUID()}`, {
           kind: "create",
           botId,
@@ -76,8 +91,7 @@ export function routineCapabilities(deps: RoutineCapabilityDeps) {
           name: input.name,
           cron: input.cron,
           enabled: input.enabled,
-          engine: input.engine ?? session.engine ?? bot.defaultEngine,
-          prompt: input.prompt,
+          ...target,
         });
       },
     }),
@@ -92,6 +106,7 @@ export function routineCapabilities(deps: RoutineCapabilityDeps) {
         enabled: z.boolean().optional(),
         engine: engineKind.optional(),
         prompt: z.string().min(1).optional(),
+        script: z.string().min(1).optional(),
         expectedRevision: z.number().int().positive().optional(),
       }),
       output: configured,
@@ -117,6 +132,7 @@ export function routineCapabilities(deps: RoutineCapabilityDeps) {
           ...(input.enabled !== undefined ? { enabled: input.enabled } : {}),
           ...(input.engine !== undefined ? { engine: input.engine } : {}),
           ...(input.prompt !== undefined ? { prompt: input.prompt } : {}),
+          ...(input.script !== undefined ? { script: input.script } : {}),
           ...(input.expectedRevision !== undefined
             ? { expectedRevision: input.expectedRevision }
             : {}),

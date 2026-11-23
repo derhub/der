@@ -30,7 +30,10 @@ function createSseResponse(frames: readonly string[]): Response {
   });
 }
 
-function createFakeServerFetch() {
+function createFakeServerFetch(options: { readonly scriptRoutine?: boolean } = {}) {
+  const routineTarget = options.scriptRoutine
+    ? { engine: "script", prompt: null, script: "return await der.notes.read({ key: 'a' });" }
+    : { engine: "fixture", prompt: "direct: hourly ok", script: null };
   const admittedKeys: string[] = [];
   const approvalDecisions: Array<{ approvalId: string; body: Record<string, unknown> }> = [];
   const memoryWrites: Array<Record<string, unknown>> = [];
@@ -399,8 +402,7 @@ function createFakeServerFetch() {
             cron: "0 * * * *",
             enabled: routineEnabled,
             revision: routineRevision,
-            engine: "fixture",
-            prompt: "direct: hourly ok",
+            ...routineTarget,
             createdAt: "2026-01-01T00:00:00.000Z",
             updatedAt: "2026-01-01T00:00:00.000Z",
           },
@@ -418,8 +420,7 @@ function createFakeServerFetch() {
           cron: "0 * * * *",
           enabled: routineEnabled,
           revision: routineRevision,
-          engine: "fixture",
-          prompt: "direct: hourly ok",
+          ...routineTarget,
           createdAt: "2026-01-01T00:00:00.000Z",
           updatedAt: "2026-01-01T00:00:00.000Z",
         },
@@ -450,8 +451,7 @@ function createFakeServerFetch() {
           cron: "0 * * * *",
           enabled: routineEnabled,
           revision: routineRevision,
-          engine: "fixture",
-          prompt: "direct: hourly ok",
+          ...routineTarget,
           createdAt: "2026-01-01T00:00:00.000Z",
           updatedAt: "2026-01-01T00:02:00.000Z",
         },
@@ -516,6 +516,18 @@ describe("operate der through the Web operator console", () => {
     expect(screen.getByRole("status", { name: "Operator status" }).textContent).toContain(
       "Recorded approved decision",
     );
+  });
+
+  it("shows the Script of a script routine where a prompt routine shows its prompt", async () => {
+    const user = userEvent.setup();
+    const server = createFakeServerFetch({ scriptRoutine: true });
+    render(<App fetcher={server.fetcher} />);
+
+    await screen.findByText("Fixture session ready.");
+    await user.click(screen.getByRole("tab", { name: "Routines" }));
+
+    await screen.findByText("return await der.notes.read({ key: 'a' });");
+    expect(screen.getByText("Script")).toBeTruthy();
   });
 
   it("manages bot Memory, inspects Skills, toggles Routines, and shows engine Readiness diagnostics", async () => {

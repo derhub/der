@@ -22,6 +22,11 @@ const capabilityOperationKindMigrationPath = resolve(
 
 const scriptRunsMigrationPath = resolve(import.meta.dirname, "../migrations/005-script-runs.sql");
 
+const scriptRoutinesMigrationPath = resolve(
+  import.meta.dirname,
+  "../migrations/006-script-routines.sql",
+);
+
 export const CORE_MIGRATION: StorageMigration = {
   version: "001-core",
   sql: readFileSync(coreMigrationPath, "utf8"),
@@ -44,11 +49,18 @@ export const SCRIPT_RUNS_MIGRATION: StorageMigration = {
   sql: readFileSync(scriptRunsMigrationPath, "utf8"),
 };
 
+export const SCRIPT_ROUTINES_MIGRATION: StorageMigration = {
+  version: "006-script-routines",
+  sql: readFileSync(scriptRoutinesMigrationPath, "utf8"),
+  disableForeignKeys: true,
+};
+
 export const CORE_MIGRATIONS: readonly StorageMigration[] = [
   CORE_MIGRATION,
   OUTBOX_DESTINATIONS_MIGRATION,
   CAPABILITY_OPERATION_KIND_MIGRATION,
   SCRIPT_RUNS_MIGRATION,
+  SCRIPT_ROUTINES_MIGRATION,
 ];
 
 export function applyMigrations(

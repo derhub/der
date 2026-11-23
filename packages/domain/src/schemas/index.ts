@@ -54,6 +54,7 @@ export {
   engineKind,
   id,
   jsonValue,
+  runEngineKind,
   type ApprovalId,
   type BotId,
   type ChannelBindingId,
@@ -64,6 +65,7 @@ export {
   type MessageId,
   type OutboxEventId,
   type RoutineId,
+  type RunEngineKind,
   type RunId,
   type SessionId,
   type SkillId,
@@ -98,6 +100,7 @@ export {
   type Routine,
   type RoutineSlot,
   type RoutineSlotDisposition,
+  type RoutineTarget,
 } from "./routine";
 export {
   channelIntakeMetadata,

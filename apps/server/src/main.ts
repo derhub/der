@@ -84,6 +84,7 @@ import {
   type DurableWorkflow,
   type RoutineScheduleClient,
   type RunCoordinator,
+  type ScriptRoutineDeps,
 } from "./workflows/index";
 import { createHostCapabilities } from "./capabilities/index";
 import { createFixtureCapabilities } from "./capabilities/fixture";
@@ -674,6 +675,8 @@ export async function startServer(options: CreateServerOptions = {}): Promise<Ru
       }
     };
 
+    const scriptRoutines = (): ScriptRoutineDeps => ({ routines, scriptRunStore, scriptRuns });
+
     const scriptExecutionDeps = (): ScriptExecutionDeps => ({
       store,
       scriptRuns: scriptRunStore,
@@ -697,6 +700,7 @@ export async function startServer(options: CreateServerOptions = {}): Promise<Ru
         approvalTimeoutMs: config.approvalTimeoutMs,
         now: clockNow,
         onRunFinished: cancelUnfinishedScriptRuns,
+        scriptRoutines,
       });
       directDriver.setRunner((runId) => coordinator.executeRun(runId, directDriver));
       closeDirectDriver = () => directDriver.close();
@@ -719,7 +723,7 @@ export async function startServer(options: CreateServerOptions = {}): Promise<Ru
             origin: "routine",
             idempotencyKey: `routine:${input.routineId}:${input.routineSlot}`,
             engine: input.engine,
-            input: { parts: [{ type: "text", text: input.prompt }] },
+            input: { parts: [{ type: "text", text: input.text }] },
             routineId: input.routineId,
             routineSlot: input.routineSlot,
           });
@@ -735,6 +739,7 @@ export async function startServer(options: CreateServerOptions = {}): Promise<Ru
         approvalTimeoutMs: config.approvalTimeoutMs,
         now: clockNow,
         onRunFinished: cancelUnfinishedScriptRuns,
+        scriptRoutines,
       });
       routineSchedule = createRoutineScheduleClient(config.restateIngressUrl);
 

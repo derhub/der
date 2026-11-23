@@ -19,3 +19,6 @@ export type JsonValue = z.infer<typeof jsonValue>;
 
 export const engineKind = z.enum(["codex", "claude-code", "antigravity", "fixture"]);
 export type EngineKind = z.infer<typeof engineKind>;
+
+export const runEngineKind = z.enum([...engineKind.options, "script"]);
+export type RunEngineKind = z.infer<typeof runEngineKind>;

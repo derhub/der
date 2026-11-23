@@ -12,12 +12,12 @@ import {
   type ChannelIntakeMetadata,
   type ChannelIntegration,
   type CreateBotInput,
+  type CreateRoutineInput,
   type CreateSessionInput,
   type DeliveryResult,
   type EffectId,
   type EffectIdentity,
   type EffectRecord,
-  type EngineKind,
   type JsonValue,
   type Message,
   type OutboxDeliveryState,
@@ -55,6 +55,7 @@ import {
   type RequestApprovalInput,
   type RequestApprovalOutcome,
 } from "./approvals-effects";
+import { routineTargetColumns } from "./routines/routine-store";
 import {
   listChannelBindings as listChannelBindingsQuery,
   listDueOutboxEvents as listDueOutboxEventsQuery,
@@ -95,24 +96,13 @@ export type {
   RequestApprovalInput,
   RequestApprovalOutcome,
 } from "./approvals-effects";
+export type { CreateRoutineInput };
 export type { UpsertChannelBindingInput } from "./channel-outbox";
 export type { FinishRunInput, FinishRunOutcome, RunEventInput, RunStreamState } from "./runs";
 
 export interface SqliteStoreOptions extends SqliteDatabaseOptions {
   readonly maxEventBatchSize?: number;
   readonly replayPageSize?: number;
-}
-
-export interface CreateRoutineInput {
-  readonly id?: RoutineId;
-  readonly botId: BotId;
-  readonly sessionId: SessionId;
-  readonly name: string;
-  readonly cron: string;
-  readonly enabled: boolean;
-  readonly revision?: number;
-  readonly engine: EngineKind;
-  readonly prompt: string;
 }
 
 const DEFAULT_MAX_EVENT_BATCH_SIZE = 16;
@@ -349,9 +339,10 @@ export class SqliteStore
         );
       }
 
+      const { prompt, script } = routineTargetColumns(input);
       db.query(
-        `INSERT INTO routines (id, bot_id, session_id, name, cron, enabled, revision, engine, prompt, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        `INSERT INTO routines (id, bot_id, session_id, name, cron, enabled, revision, engine, prompt, script, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       ).run(
         routineId,
         input.botId,
@@ -361,7 +352,8 @@ export class SqliteStore
         input.enabled ? 1 : 0,
         revision,
         input.engine,
-        input.prompt,
+        prompt,
+        script,
         now,
         now,
       );

@@ -22,6 +22,7 @@ import {
   type UtcTimestamp,
   type Workflow,
 } from "@der/domain";
+import type { ScriptRoutineDeps } from "./script-routine-stage";
 
 export interface AwaitApprovalInput {
   readonly run: Run;
@@ -53,6 +54,7 @@ export interface WorkflowDeps {
   readonly eventBatchSize?: number;
   readonly now?: () => Date;
   readonly onRunFinished?: (run: Run) => Promise<void>;
+  readonly scriptRoutines?: () => ScriptRoutineDeps;
 }
 
 async function finishRunAndNotify(
@@ -131,7 +133,7 @@ export async function executeEnginePreApprovalStage(
   deps: WorkflowDeps,
   run: Run,
 ): Promise<PreApprovalStageResult> {
-  const engine = deps.engines.get(run.engine);
+  const engine = run.engine === "script" ? undefined : deps.engines.get(run.engine);
   if (!engine) {
     return {
       kind: "failed",

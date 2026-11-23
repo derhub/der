@@ -59,3 +59,4 @@ export {
   type WorkflowDeps,
   type WorkflowStore,
 } from "./run-steps";
+export { executeScriptRoutineStage, type ScriptRoutineDeps } from "./script-routine-stage";

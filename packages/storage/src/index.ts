@@ -6,6 +6,7 @@ export {
   CORE_MIGRATION,
   CORE_MIGRATIONS,
   OUTBOX_DESTINATIONS_MIGRATION,
+  SCRIPT_ROUTINES_MIGRATION,
   SCRIPT_RUNS_MIGRATION,
   type StorageMigration,
 } from "./migrations";

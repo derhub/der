@@ -11,7 +11,6 @@ import type {
   BotId,
   ChannelBindingId,
   EffectId,
-  EngineKind,
   JsonValue,
   OutboxEventId,
   RoutineId,
@@ -19,7 +18,7 @@ import type {
   SessionId,
 } from "../schemas/common";
 import type { Message, MessagePart } from "../schemas/message";
-import type { Routine } from "../schemas/routine";
+import type { Routine, RoutineTarget } from "../schemas/routine";
 import type {
   ChannelIntakeMetadata,
   Run,
@@ -143,7 +142,7 @@ export interface OutboxStore {
   recordOutboxDelivery(outboxId: OutboxEventId, result: DeliveryResult): Promise<OutboxEvent>;
 }
 
-export interface CreateRoutineInput {
+export type CreateRoutineInput = {
   readonly id?: RoutineId;
   readonly botId: BotId;
   readonly sessionId: SessionId;
@@ -151,9 +150,7 @@ export interface CreateRoutineInput {
   readonly cron: string;
   readonly enabled: boolean;
   readonly revision?: number;
-  readonly engine: EngineKind;
-  readonly prompt: string;
-}
+} & RoutineTarget;
 
 export interface RoutineStore {
   createRoutine(input: CreateRoutineInput): MaybePromise<Routine>;

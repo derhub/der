@@ -52,7 +52,8 @@ export interface RoutineRow {
   readonly enabled: number;
   readonly revision: number;
   readonly engine: string;
-  readonly prompt: string;
+  readonly prompt: string | null;
+  readonly script: string | null;
   readonly created_at: string;
   readonly updated_at: string;
 }
@@ -201,6 +202,7 @@ export function mapRoutineRow(row: RoutineRow): Routine {
     revision: row.revision,
     engine: row.engine,
     prompt: row.prompt,
+    script: row.script,
     createdAt: row.created_at,
     updatedAt: row.updated_at,
   });

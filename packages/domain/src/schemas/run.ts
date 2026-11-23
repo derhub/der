@@ -1,6 +1,6 @@
 import * as z from "zod";
 import { utcTimestamp } from "../protocol/timestamp";
-import { engineKind, id, jsonValue } from "./common";
+import { id, jsonValue, runEngineKind } from "./common";
 import { message, messagePart } from "./message";
 
 export const runOrigin = z.enum(["http", "web", "routine"]);
@@ -36,7 +36,7 @@ export const run = z.object({
   botId: id,
   sessionId: id,
   origin: persistedRunOrigin,
-  engine: engineKind,
+  engine: runEngineKind,
   status: runStatus,
   routineId: id.nullable(),
   checkpoint: jsonValue.nullable(),
@@ -46,18 +46,25 @@ export const run = z.object({
 });
 export type Run = z.infer<typeof run>;
 
-export const runRequest = z.strictObject({
-  botId: id,
-  sessionId: id,
-  origin: runOrigin,
-  idempotencyKey: z.string().min(1),
-  engine: engineKind.optional(),
-  input: z.object({
-    parts: z.array(messagePart).min(1),
-  }),
-  routineId: id.optional(),
-  routineSlot: utcTimestamp.optional(),
-});
+export const runRequest = z
+  .strictObject({
+    botId: id,
+    sessionId: id,
+    origin: runOrigin,
+    idempotencyKey: z.string().min(1),
+    engine: runEngineKind.optional(),
+    input: z.object({
+      parts: z.array(messagePart).min(1),
+    }),
+    routineId: id.optional(),
+    routineSlot: utcTimestamp.optional(),
+  })
+  .refine(
+    (request) =>
+      request.engine !== "script" ||
+      (request.origin === "routine" && request.routineId !== undefined),
+    { message: 'engine "script" is only admitted for a routine firing', path: ["engine"] },
+  );
 export type RunRequest = z.infer<typeof runRequest>;
 
 export const runAdmission = z.object({

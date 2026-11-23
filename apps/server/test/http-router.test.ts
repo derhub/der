@@ -224,6 +224,7 @@ function createMinimalDeps(overrides: Partial<HttpRouterDeps> = {}): HttpRouterD
     revision: 1,
     engine: "fixture",
     prompt: "Check status",
+    script: null,
     createdAt: FIXED_TS,
     updatedAt: FIXED_TS,
   };

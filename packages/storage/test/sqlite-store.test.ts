@@ -7,10 +7,12 @@ import { DomainError, type RunEvent } from "@der/domain";
 import {
   applyMigrations,
   canonicalizeJson,
+  CAPABILITY_OPERATION_KIND_MIGRATION,
   CORE_MIGRATION,
   fingerprintJson,
   openSqliteStore,
   OUTBOX_DESTINATIONS_MIGRATION,
+  SCRIPT_RUNS_MIGRATION,
   type SqliteStore,
   type StorageMigration,
 } from "@der/storage";
@@ -111,6 +113,7 @@ describe("configure SQLite WAL, foreign keys, busy timeout, and migration seam",
         "003-outbox-destinations",
         "004-capability-operation-kind",
         "005-script-runs",
+        "006-script-routines",
       ]);
     } finally {
       store.close();
@@ -132,6 +135,7 @@ describe("configure SQLite WAL, foreign keys, busy timeout, and migration seam",
         "003-outbox-destinations",
         "004-capability-operation-kind",
         "005-script-runs",
+        "006-script-routines",
       ]);
     } finally {
       reopened.close();
@@ -250,6 +254,219 @@ describe("capability operation kind", () => {
           )
           .run(ts, ts),
       ).toThrow(/CHECK constraint failed/);
+    } finally {
+      store.close();
+    }
+  });
+});
+
+describe("script routines migration", () => {
+  const ts = "2026-11-22T15:00:00.000Z";
+
+  function createDatabaseAt005(dbPath: string): Database {
+    const legacyDb = new Database(dbPath, { create: true, strict: true });
+    legacyDb.exec("PRAGMA foreign_keys = ON;");
+    applyMigrations(legacyDb, [
+      CORE_MIGRATION,
+      OUTBOX_DESTINATIONS_MIGRATION,
+      CAPABILITY_OPERATION_KIND_MIGRATION,
+      SCRIPT_RUNS_MIGRATION,
+    ]);
+    legacyDb
+      .query(
+        `INSERT INTO bots (id, name, persona, default_engine, allowed_engines_json, workspace_path, created_at, updated_at)
+         VALUES ('bot-old', 'Old Bot', 'Concise', 'fixture', '["fixture"]', NULL, ?, ?)`,
+      )
+      .run(ts, ts);
+    legacyDb
+      .query(
+        `INSERT INTO sessions (id, bot_id, title, engine, created_at, updated_at)
+         VALUES ('sess-old', 'bot-old', 'Old Session', 'fixture', ?, ?)`,
+      )
+      .run(ts, ts);
+    legacyDb
+      .query(
+        `INSERT INTO routines (id, bot_id, session_id, name, cron, enabled, revision, engine, prompt, created_at, updated_at)
+         VALUES ('rt-old', 'bot-old', 'sess-old', 'Morning', '0 8 * * *', 1, 3, 'fixture', 'Summarize', ?, ?)`,
+      )
+      .run(ts, ts);
+    legacyDb
+      .query(
+        `INSERT INTO runs (id, bot_id, session_id, origin, engine, status, routine_id, routine_slot, created_at, updated_at)
+         VALUES ('run-old', 'bot-old', 'sess-old', 'routine', 'fixture', 'running', 'rt-old', '2026-11-22T08:00:00.000Z', ?, ?)`,
+      )
+      .run(ts, ts);
+    legacyDb
+      .query(
+        `INSERT INTO approvals (id, bot_id, session_id, run_id, operation_kind, operation_id, canonical_arguments_json, attempt_id, prompt, awakeable, deadline, status, created_at, updated_at)
+         VALUES ('appr-old', 'bot-old', 'sess-old', 'run-old', 'capability', 'notes.append', '{}', 'attempt-old', 'Append?', 'awk_old', ?, 'pending', ?, ?)`,
+      )
+      .run(ts, ts, ts);
+    legacyDb
+      .query(
+        `INSERT INTO script_runs (id, run_id, bot_id, digest, occurrence, source, status, created_at, updated_at)
+         VALUES ('sr-old', 'run-old', 'bot-old', 'abc', 1, 'return 1', 'running', ?, ?)`,
+      )
+      .run(ts, ts);
+    return legacyDb;
+  }
+
+  it("keeps prompt routines, runs and the rows that reference them", () => {
+    const dbPath = createTempDbPath();
+    createDatabaseAt005(dbPath).close();
+
+    const store = openSqliteStore({ filename: dbPath });
+    try {
+      const db = store.database.db;
+      expect(db.query("SELECT id, engine, prompt, script, revision FROM routines").all()).toEqual([
+        { id: "rt-old", engine: "fixture", prompt: "Summarize", script: null, revision: 3 },
+      ]);
+      expect(
+        db.query("SELECT id, origin, engine, status, routine_id, routine_slot FROM runs").all(),
+      ).toEqual([
+        {
+          id: "run-old",
+          origin: "routine",
+          engine: "fixture",
+          status: "running",
+          routine_id: "rt-old",
+          routine_slot: "2026-11-22T08:00:00.000Z",
+        },
+      ]);
+      expect(db.query("SELECT id, run_id FROM approvals").all()).toEqual([
+        { id: "appr-old", run_id: "run-old" },
+      ]);
+      expect(db.query("SELECT id, run_id FROM script_runs").all()).toEqual([
+        { id: "sr-old", run_id: "run-old" },
+      ]);
+      expect(db.query("PRAGMA foreign_key_check").all()).toEqual([]);
+      expect(store.getRoutine("rt-old")).toEqual({
+        id: "rt-old",
+        botId: "bot-old",
+        sessionId: "sess-old",
+        name: "Morning",
+        cron: "0 8 * * *",
+        enabled: true,
+        revision: 3,
+        engine: "fixture",
+        prompt: "Summarize",
+        script: null,
+        createdAt: ts,
+        updatedAt: ts,
+      });
+    } finally {
+      store.close();
+    }
+  });
+
+  it("keeps the one active run per session after the rebuild", () => {
+    const dbPath = createTempDbPath();
+    createDatabaseAt005(dbPath).close();
+
+    const store = openSqliteStore({ filename: dbPath });
+    try {
+      expect(() =>
+        store.database.db
+          .query(
+            `INSERT INTO runs (id, bot_id, session_id, origin, engine, status, created_at, updated_at)
+             VALUES ('run-second', 'bot-old', 'sess-old', 'web', 'fixture', 'queued', ?, ?)`,
+          )
+          .run(ts, ts),
+      ).toThrow(/UNIQUE constraint failed/);
+    } finally {
+      store.close();
+    }
+  });
+
+  it.each([
+    { name: "both prompt and script", engine: "fixture", prompt: "'p'", script: "'return 1'" },
+    { name: "neither prompt nor script", engine: "fixture", prompt: "NULL", script: "NULL" },
+    { name: "a script with a chat engine", engine: "codex", prompt: "NULL", script: "'return 1'" },
+    { name: "a prompt with engine script", engine: "script", prompt: "'p'", script: "NULL" },
+  ])("the table rejects a routine with $name", ({ engine, prompt, script }) => {
+    const store = openSqliteStore({ filename: createTempDbPath() });
+    try {
+      const { session } = seedFixture(store);
+      expect(() =>
+        store.database.db
+          .query(
+            `INSERT INTO routines (id, bot_id, session_id, name, cron, enabled, revision, engine, prompt, script, created_at, updated_at)
+             VALUES ('rt-bad', 'bot-fixture', '${session.id}', 'Bad', '* * * * *', 1, 1, '${engine}', ${prompt}, ${script}, ?, ?)`,
+          )
+          .run(ts, ts),
+      ).toThrow(/CHECK constraint failed/);
+    } finally {
+      store.close();
+    }
+  });
+
+  it("stores a script routine and a script run for it", async () => {
+    const store = openSqliteStore({ filename: createTempDbPath() });
+    try {
+      const { bot, session } = seedFixture(store);
+      const routine = store.createRoutine({
+        id: "rt-script",
+        botId: bot.id,
+        sessionId: session.id,
+        name: "Ping",
+        cron: "* * * * *",
+        enabled: true,
+        engine: "script",
+        script: "return 1",
+      });
+      expect(routine).toMatchObject({ engine: "script", prompt: null, script: "return 1" });
+
+      const admission = await store.admit({
+        botId: bot.id,
+        sessionId: session.id,
+        origin: "routine",
+        idempotencyKey: "routine:rt-script:slot",
+        engine: "script",
+        input: { parts: [{ type: "text", text: "Ping" }] },
+        routineId: "rt-script",
+        routineSlot: "2026-11-22T15:00:00.000Z",
+      });
+      expect(admission.run.engine).toBe("script");
+    } finally {
+      store.close();
+    }
+  });
+
+  it("refuses a script run for a prompt routine and for a non-routine origin", async () => {
+    const store = openSqliteStore({ filename: createTempDbPath() });
+    try {
+      const { bot, session } = seedFixture(store);
+      store.createRoutine({
+        id: "rt-prompt",
+        botId: bot.id,
+        sessionId: session.id,
+        name: "Prompt",
+        cron: "* * * * *",
+        enabled: true,
+        engine: "fixture",
+        prompt: "hello",
+      });
+      const request = {
+        botId: bot.id,
+        sessionId: session.id,
+        idempotencyKey: "k1",
+        engine: "script" as const,
+        input: { parts: [{ type: "text" as const, text: "x" }] },
+      };
+      await expectDomainRejection(
+        () =>
+          store.admit({
+            ...request,
+            origin: "routine",
+            routineId: "rt-prompt",
+            routineSlot: "2026-11-22T15:00:00.000Z",
+          }),
+        { status: 409, code: "routine.scope_mismatch" },
+      );
+      await expectDomainRejection(() => store.admit({ ...request, origin: "http" }), {
+        status: 400,
+        code: "run.invalid_request",
+      });
     } finally {
       store.close();
     }

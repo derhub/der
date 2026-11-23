@@ -23,6 +23,7 @@ import {
   type RoutineId,
   type RoutineSlot,
   type RoutineStore,
+  type RoutineTarget,
   type RunStore,
   type SessionStore,
 } from "@der/domain";
@@ -72,16 +73,23 @@ const writeMemoryBodySchema = compileSchema(
   }),
 );
 
+const routineBodyFields = {
+  id: id.optional(),
+  sessionId: id,
+  name: z.string().min(1),
+  cron: z.string().min(1),
+  enabled: z.boolean().default(true),
+};
+
 const createRoutineBodySchema = compileSchema(
-  z.object({
-    id: id.optional(),
-    sessionId: id,
-    name: z.string().min(1),
-    cron: z.string().min(1),
-    enabled: z.boolean().default(true),
-    engine: engineKind.optional(),
-    prompt: z.string().min(1),
-  }),
+  z.union([
+    z.strictObject({
+      ...routineBodyFields,
+      engine: engineKind.optional(),
+      prompt: z.string().min(1),
+    }),
+    z.strictObject({ ...routineBodyFields, script: z.string().min(1) }),
+  ]),
 );
 
 const updateRoutineBodySchema = compileSchema(
@@ -91,6 +99,7 @@ const updateRoutineBodySchema = compileSchema(
     enabled: z.boolean().optional(),
     engine: engineKind.optional(),
     prompt: z.string().min(1).optional(),
+    script: z.string().min(1).optional(),
     expectedRevision: z.number().int().positive().optional(),
   }),
 );
@@ -405,16 +414,19 @@ function createRoutineRoutes(deps: {
     }
 
     const routineId = parsedBody.data.id ?? `rt_${crypto.randomUUID()}`;
-    const resolvedEngine = parsedBody.data.engine ?? session.engine ?? bot.defaultEngine;
+    const body = parsedBody.data;
+    const target: RoutineTarget =
+      "script" in body
+        ? { engine: "script", script: body.script }
+        : { engine: body.engine ?? session.engine ?? bot.defaultEngine, prompt: body.prompt };
     const configured = await deps.routineSchedule.configure(routineId, {
       kind: "create",
       botId,
-      sessionId: parsedBody.data.sessionId,
-      name: parsedBody.data.name,
-      cron: parsedBody.data.cron,
-      enabled: parsedBody.data.enabled,
-      engine: resolvedEngine,
-      prompt: parsedBody.data.prompt,
+      sessionId: body.sessionId,
+      name: body.name,
+      cron: body.cron,
+      enabled: body.enabled,
+      ...target,
     });
     return jsonResponse(configured, 201);
   });
@@ -459,6 +471,7 @@ function createRoutineRoutes(deps: {
       ...(parsedBody.data.enabled !== undefined ? { enabled: parsedBody.data.enabled } : {}),
       ...(parsedBody.data.engine !== undefined ? { engine: parsedBody.data.engine } : {}),
       ...(parsedBody.data.prompt !== undefined ? { prompt: parsedBody.data.prompt } : {}),
+      ...(parsedBody.data.script !== undefined ? { script: parsedBody.data.script } : {}),
       ...(parsedBody.data.expectedRevision !== undefined
         ? { expectedRevision: parsedBody.data.expectedRevision }
         : {}),
