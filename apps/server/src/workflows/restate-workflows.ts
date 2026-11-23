@@ -113,24 +113,40 @@ export interface DecideCommandInput {
   readonly channelIntake?: ChannelIntakeMetadata;
 }
 
+// The SDK forwards `err.stack` to the engine as a string, but once the server modules are
+// loaded Bun can hand back a structured stack, which the engine rejects and breaks the retry.
+function withStringStack(error: unknown): unknown {
+  if (error instanceof restate.RestateError) {
+    return error;
+  }
+  const plain = new Error(error instanceof Error ? error.message : String(error));
+  Object.defineProperty(plain, "stack", { value: `Error: ${plain.message}` });
+  return plain;
+}
+
 export function createRestateStepDriver(
   ctx: restate.Context | restate.WorkflowContext,
-  options?: { readonly wrapTerminalErrors?: boolean },
+  options?: {
+    readonly wrapTerminalErrors?: boolean;
+    readonly retry?: Omit<restate.RunOptions<unknown>, "serde">;
+  },
 ): CoordinatorDriver {
   const wrapErrors = options?.wrapTerminalErrors ?? false;
+  const retry = options?.retry;
 
   return {
     runStep<T>(name: string, fn: () => Promise<T>): Promise<T> {
-      return ctx.run(name, async () => {
+      const action = async (): Promise<T> => {
         try {
           return await fn();
         } catch (error) {
-          if (wrapErrors) {
+          if (wrapErrors && error instanceof DomainError) {
             toRestateTerminalError(error);
           }
-          throw error;
+          throw retry === undefined ? error : withStringStack(error);
         }
-      });
+      };
+      return retry === undefined ? ctx.run(name, action) : ctx.run(name, action, retry);
     },
 
     nowMs(): Promise<number> {

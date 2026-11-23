@@ -58,7 +58,7 @@ interface CapabilityContext {
 - `input` and `output` are Zod schemas. Inputs and outputs cross a JSON boundary, so use JSON-compatible types.
 - `ctx.botId` is the bot that owns the calling Run. Scope data by it, as the host capabilities do (`apps/server/src/capabilities/scope.ts`).
 - `ctx.effect` is set for a `write` called from a Script. It carries the identity of the recorded Effect (`runId`, `operationKind: "capability"`, `operationId` = the capability id, `canonicalArguments`, `attemptId`). Use `attemptId` as an idempotency key against the upstream system.
-- `ctx.signal` aborts when the Script is cancelled. Under Restate it also aborts when the current attempt ends (for example when the server restarts), which is not a cancel: an abort is not proof the Script was cancelled.
+- `ctx.signal` in direct mode aborts when the ScriptRun is cancelled or the server closes. Under Restate a cancel does not abort it: cancel marks the ScriptRun and later calls end as cancelled, while a call already running continues. There the signal aborts when the current attempt ends (for example a server restart), which is not a cancel.
 - `example` is one line of Script that calls the capability. It is shown to the agent and counts toward search ranking.
 
 ### Ids

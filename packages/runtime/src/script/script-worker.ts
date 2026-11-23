@@ -24,10 +24,9 @@ export interface ScriptWorkerReply {
 }
 
 export interface ScriptWorkerFailure {
-  readonly kind: string;
-  readonly message: string;
-  readonly call?: string;
-  readonly line?: number;
+  readonly hostCall?: unknown;
+  readonly message?: unknown;
+  readonly line?: unknown;
 }
 
 export type ScriptWorkerMessage =
@@ -162,7 +161,7 @@ async function run(init: ScriptWorkerInit): Promise<void> {
     ) {
       finish({ type: "done", limit: "memory" });
     } else {
-      finish({ type: "done", error: { kind: "script", message } });
+      finish({ type: "done", error: { message } });
     }
   };
 
@@ -173,7 +172,7 @@ async function run(init: ScriptWorkerInit): Promise<void> {
       jobs.error.dispose();
       finishWithEngineError(dumped);
     } else if (!finished && pending.size === 0) {
-      finish({ type: "done", error: { kind: "script", message: "script ended without a result" } });
+      finish({ type: "done", error: { message: "script ended without a result" } });
     }
   };
 

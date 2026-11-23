@@ -8,10 +8,9 @@ import {
   createHardenedDockerProvider,
   DEFAULT_ENGINE_SHADOW_HOMES,
   probeDockerIsolation,
-  SandboxControlError,
 } from "@der/runtime/sandbox";
 
-const IMAGE = "alpine:3.22";
+const IMAGE = process.env["DER_KILL_TEST_IMAGE"] ?? "alpine:3.22";
 const socketPath =
   process.env["DER_ROOTLESS_DOCKER_SOCKET"] ?? `/run/user/${process.getuid?.() ?? 0}/docker.sock`;
 const dockerHost = `unix://${socketPath}`;
@@ -36,8 +35,10 @@ function docker(...args: string[]) {
   return bunCommandRunner.exec("docker", args, { env: { DOCKER_HOST: dockerHost } });
 }
 
+const LIST_SLEEPS = `for d in /proc/[0-9]*; do c=$(tr '\\0' ' ' < $d/cmdline 2>/dev/null); case "$c" in "sleep 60"*) echo "\${d#/proc/}";; esac; done`;
+
 async function sleepPids(containerId: string): Promise<string[]> {
-  const result = await docker("exec", containerId, "pgrep", "-f", "sleep 600");
+  const result = await docker("exec", containerId, "sh", "-c", LIST_SLEEPS);
   return result.stdout.split("\n").filter((line) => line.length > 0);
 }
 
@@ -109,22 +110,28 @@ describe.skipIf(!ready)("kill a spawned process inside a real rootless container
     expect(await waitFor(async () => (await sleepPids(handle.id)).length === 0, 5_000)).toBe(true);
   }, 30_000);
 
-  it("rejects kill() when the process ignores the signal and stays alive", async () => {
+  it("ends a process that ignores SIGTERM after escalation and resolves kill()", async () => {
     const handle = await createSandbox();
     const spawned = await handle.process.spawn("trap '' TERM; sleep 600 & sleep 600");
     expect(await waitFor(async () => (await sleepPids(handle.id)).length >= 2, 10_000)).toBe(true);
 
-    const failure = await spawned.kill("SIGTERM").then(
-      () => undefined,
-      (error: unknown) => error,
-    );
-    expect(failure).toBeInstanceOf(SandboxControlError);
-    expect((failure as SandboxControlError).message).toContain(
-      `Spawned process "trap '' TERM; sleep 600 & sleep 600" survived signal SIGTERM`,
-    );
-    expect((await sleepPids(handle.id)).length).toBe(2);
+    const killed = await spawned.kill("SIGTERM").then(() => "resolved");
+    expect(killed).toBe("resolved");
+    await spawned.wait();
 
-    await spawned.kill("SIGKILL");
+    expect(await waitFor(async () => (await sleepPids(handle.id)).length === 0, 5_000)).toBe(true);
+  }, 30_000);
+
+  it("ends descendants that lost the marker, started with a cleared environment or a new session", async () => {
+    const handle = await createSandbox();
+    const spawned = await handle.process.spawn(
+      "sleep 601 & env -i sleep 602 & setsid sleep 603 & sleep 604",
+    );
+    expect(await waitFor(async () => (await sleepPids(handle.id)).length >= 4, 10_000)).toBe(true);
+
+    await spawned.kill("SIGTERM");
+    await spawned.wait();
+
     expect(await waitFor(async () => (await sleepPids(handle.id)).length === 0, 5_000)).toBe(true);
   }, 30_000);
 });

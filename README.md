@@ -85,7 +85,7 @@ Each `execute` call creates a `ScriptRun` bound to the calling Run (`packages/st
 - A Script ends with its Run. When the Run finishes, unfinished ScriptRuns are cancelled and their pending Approvals expire.
 - A Script that does not replay the same calls on resume fails with kind `nondeterministic`.
 - With `DER_RESTATE_MODE=direct` there is no journal. A Script interrupted by a restart is not resumed; it is marked `interrupted`.
-- The Codex bridge sets the MCP `tool_timeout_sec` of its host tools to 3900 seconds (65 minutes) through adapter config, so an `execute` call that waits for an Approval is not cut early (`packages/runtime/src/engines/codex.ts`). Not confirmed against a real Codex binary.
+- der does not change Codex's tool timeout, so Codex may end a long `execute` call before a pending Approval is decided; calling `execute` again with the same Script returns the result.
 
 ### Script routines
 

@@ -472,3 +472,57 @@ describe("end a run that owns a parked script under Restate", () => {
     expect(host.published).toEqual([]);
   }, 150_000);
 });
+
+describe("end a script run that hits an unexpected failure under Restate", () => {
+  it("predicate throws: the call fails with kind capability and records no effect", async () => {
+    const { server, host, owner } = await startOwned("restate-predicate-throws");
+    const applied: string[] = [];
+    host.catalog.add(
+      defineCapability({
+        id: "ledger.post",
+        description: "Post an entry",
+        input: z.object({ text: z.string() }),
+        output: z.object({ posted: z.boolean() }),
+        effect: "write",
+        approval: () => {
+          throw new Error("rule broke");
+        },
+        async execute(input) {
+          applied.push(input.text);
+          return { posted: true };
+        },
+      }) as unknown as Capability,
+    );
+    const scriptRun = await submitScript(
+      server,
+      owner,
+      `return der.ledger.post({ text: "entry" });`,
+    );
+
+    const result = await server.scriptRuns!.attach(scriptRun.id, AbortSignal.timeout(30_000));
+
+    expect(result).toEqual({
+      ok: false,
+      error: { kind: "capability", message: "rule broke", call: "ledger.post" },
+      logs: [],
+    });
+    expect(applied).toEqual([]);
+    expect(server.store.getLatestApprovalForRun(owner.run.id)).toBeUndefined();
+  }, 120_000);
+
+  it("bounded: a finish step that keeps failing ends the script run failed instead of retrying forever", async () => {
+    const { server, owner } = await startOwned("restate-bounded");
+    server.store.database.db.run(
+      `CREATE TRIGGER refuse_completed BEFORE UPDATE ON script_runs WHEN NEW.status = 'completed' BEGIN SELECT RAISE(ABORT, 'disk full'); END`,
+    );
+    const scriptRun = await submitScript(server, owner, `return 1;`);
+
+    const result = await server.scriptRuns!.attach(scriptRun.id, AbortSignal.timeout(60_000));
+
+    expect(result).toMatchObject({
+      ok: false,
+      error: { kind: "capability", message: expect.stringContaining("disk full") },
+    });
+    expect(server.scriptRunStore.get(scriptRun.id)?.status).toBe("failed");
+  }, 120_000);
+});

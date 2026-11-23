@@ -279,10 +279,26 @@ export async function executeScriptRun(
         attemptId: `${scriptRunId}:${ordinal}`,
       };
       let approvalId: string | undefined;
-      const needsApproval = await driver.runStep(`${name}:needs-approval`, async () =>
-        deps.catalog.requiresApproval(id, input),
+      const rule = await driver.runStep(
+        `${name}:needs-approval`,
+        async (): Promise<
+          { readonly needsApproval: boolean } | { readonly failure: string; readonly now: number }
+        > => {
+          try {
+            return { needsApproval: deps.catalog.requiresApproval(id, input) };
+          } catch (error) {
+            return { failure: errorMessage(error), now: nowMs() };
+          }
+        },
       );
-      if (needsApproval) {
+      if ("failure" in rule) {
+        return {
+          ok: false,
+          error: { kind: "capability", message: rule.failure },
+          now: rule.now,
+        };
+      }
+      if (rule.needsApproval) {
         const asked = await askApproval(name, id, input, effect);
         if ("reply" in asked) {
           return asked.reply;

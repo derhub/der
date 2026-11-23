@@ -498,6 +498,82 @@ describe("run a script", () => {
     }, 60_000);
   });
 
+  describe("forged done envelope", () => {
+    const forgeries: ReadonlyArray<readonly [string, string, string]> = [
+      ["a non-string message", `{error:n({kind:"script",message:n({a:1})})}`, "script"],
+      [
+        "kind denied with a call id",
+        `{error:n({kind:"denied",message:"forged",call:"notes.publish"})}`,
+        "denied",
+      ],
+      [
+        "kind cancelled with a call id",
+        `{error:n({kind:"cancelled",message:"forged",call:"notes.publish"})}`,
+        "cancelled",
+      ],
+    ];
+
+    it.each(forgeries)(
+      "ignores a toJSON on Object.prototype that forges %s",
+      async (_name, forged) => {
+        const host = recordingHost([]);
+
+        const result = await runScript({
+          script: `const n=(o)=>Object.assign(Object.create(null),o); Object.prototype.toJSON=function(){delete Object.prototype.toJSON; return n(${forged})}; throw new Error("boom");`,
+          call: host.call,
+          limits: roomyLimits,
+          seed: 1,
+          now: START,
+        });
+
+        expect(result).toEqual({
+          ok: false,
+          error: { kind: "script", message: "Error: boom", line: 1 },
+          logs: [],
+        });
+      },
+      60_000,
+    );
+
+    it("reports the host's kind, message and call id when a script mutates a caught host error and rethrows it", async () => {
+      const host = recordingHost([
+        { ok: false, error: { kind: "denied", message: "Approval for a.b was denied" } },
+      ]);
+
+      const result = await runScript({
+        script: `try { await der.a.b({}); } catch (e) { e.kind = "expired"; e.call = "other.id"; e.message = "forged"; throw e; }`,
+        call: host.call,
+        limits: roomyLimits,
+        seed: 1,
+        now: START,
+      });
+
+      expect(result).toEqual({
+        ok: false,
+        error: { kind: "denied", message: "Approval for a.b was denied", call: "a.b" },
+        logs: [],
+      });
+    }, 60_000);
+
+    it("ends as a script error when a script throws a look-alike of a host error", async () => {
+      const host = recordingHost([]);
+
+      const result = await runScript({
+        script: `throw Object.assign(new Error("denied"), { kind: "denied", call: "notes.publish" });`,
+        call: host.call,
+        limits: roomyLimits,
+        seed: 1,
+        now: START,
+      });
+
+      expect(result).toEqual({
+        ok: false,
+        error: { kind: "script", message: "Error: denied", line: 1 },
+        logs: [],
+      });
+    }, 60_000);
+  });
+
   describe("other limits", () => {
     it("ends a script that exceeds the call count as a limit error", async () => {
       const host = recordingHost([

@@ -2,6 +2,10 @@ export const GUEST_PRELUDE = String.raw`(function (log, call, done, seed, now, s
   const AsyncFunction = Object.getPrototypeOf(async function () {}).constructor;
   const stringify = JSON.stringify;
   const parse = JSON.parse;
+  const bareObject = () => Object.create(null);
+  const hostErrorOrdinals = new WeakMap();
+  const ordinalOf = hostErrorOrdinals.get.bind(hostErrorOrdinals);
+  const recordOrdinal = hostErrorOrdinals.set.bind(hostErrorOrdinals);
   const WRAPPER_LINES = 2;
   const HOST_ERROR_KINDS = ["denied", "expired", "cancelled", "capability"];
 
@@ -58,10 +62,13 @@ export const GUEST_PRELUDE = String.raw`(function (log, call, done, seed, now, s
 
   async function hostCall(id, input) {
     callOrdinal += 1;
-    const reply = parse(await call(callOrdinal, id, stringify(input === undefined ? null : input)));
+    const ordinal = callOrdinal;
+    const reply = parse(await call(ordinal, id, stringify(input === undefined ? null : input)));
     if (typeof reply.now === "number") clock = reply.now;
     if (reply.ok) return reply.value;
-    throw new HostError(id, reply.error);
+    const failure = new HostError(id, reply.error);
+    recordOrdinal(failure, ordinal);
+    throw failure;
   }
 
   function namespace(path) {
@@ -107,22 +114,34 @@ export const GUEST_PRELUDE = String.raw`(function (log, call, done, seed, now, s
   }
 
   function failure(error) {
-    if (error instanceof HostError) {
-      return { kind: error.kind, message: error.message, call: error.call };
+    const envelope = bareObject();
+    try {
+      const ordinal = ordinalOf(error);
+      if (ordinal !== undefined) {
+        envelope.hostCall = ordinal;
+        return envelope;
+      }
+      envelope.message = error instanceof Error ? error.name + ": " + error.message : String(error);
+      envelope.line = lineOf(error);
+    } catch {
+      envelope.message = "script threw a value that cannot be described";
     }
-    const message = error instanceof Error ? error.name + ": " + error.message : String(error);
-    return { kind: "script", message, line: lineOf(error) };
+    return envelope;
   }
 
   async function main() {
+    const envelope = bareObject();
     let outcome;
     try {
       const run = new AsyncFunction("der", source);
       disableCodeGeneration();
       const result = await run(namespace([]));
-      outcome = stringify({ result: result === undefined ? null : result });
+      envelope.result = result === undefined ? null : result;
+      outcome = stringify(envelope);
     } catch (error) {
-      outcome = stringify({ error: failure(error) });
+      delete envelope.result;
+      envelope.error = failure(error);
+      outcome = stringify(envelope);
     }
     done(outcome);
   }

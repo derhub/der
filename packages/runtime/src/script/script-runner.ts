@@ -1,5 +1,10 @@
 import type { JsonValue } from "@der/domain";
-import type { ScriptWorkerInit, ScriptWorkerMessage, ScriptWorkerReply } from "./script-worker";
+import type {
+  ScriptWorkerFailure,
+  ScriptWorkerInit,
+  ScriptWorkerMessage,
+  ScriptWorkerReply,
+} from "./script-worker";
 
 export interface ScriptLimits {
   readonly memoryBytes: number;
@@ -26,6 +31,8 @@ export type ScriptCallReply =
       readonly error: { readonly kind: ScriptHostErrorKind; readonly message: string };
       readonly now?: number;
     };
+
+type ScriptFailure = Extract<ScriptResult, { ok: false }>["error"];
 
 export type ScriptResult =
   | {
@@ -124,6 +131,10 @@ export async function runScript(options: RunScriptOptions): Promise<ScriptResult
   let callsInFlight = 0;
   let lastHeardAt = performance.now();
   let callQueue: Promise<void> = Promise.resolve();
+  const hostFailures = new Map<
+    number,
+    { kind: ScriptHostErrorKind; message: string; call: string }
+  >();
 
   const finish = (result: ScriptResult): void => {
     if (outcome.verdict !== undefined) {
@@ -185,6 +196,13 @@ export async function runScript(options: RunScriptOptions): Promise<ScriptResult
             : { kind: "capability", message: reply.error.message },
           now: reply.now,
         };
+    if (!wire.ok && wire.error !== undefined) {
+      hostFailures.set(message.call, {
+        kind: wire.error.kind as ScriptHostErrorKind,
+        message: wire.error.message,
+        call: message.id,
+      });
+    }
     lastHeardAt = performance.now();
     worker.postMessage(wire);
   };
@@ -212,23 +230,27 @@ export async function runScript(options: RunScriptOptions): Promise<ScriptResult
     }
   };
 
+  const describeFailure = (error: ScriptWorkerFailure): ScriptFailure => {
+    const recorded =
+      typeof error.hostCall === "number" ? hostFailures.get(error.hostCall) : undefined;
+    if (recorded !== undefined) {
+      return recorded;
+    }
+    return {
+      kind: "script",
+      message:
+        typeof error.message === "string" ? error.message : "script failed with an invalid error",
+      ...(Number.isInteger(error.line) ? { line: error.line as number } : {}),
+    };
+  };
+
   const finishDone = (message: Extract<ScriptWorkerMessage, { type: "done" }>): void => {
     if (message.limit === "memory") {
       fail("limit", `memory limit of ${limits.memoryBytes} bytes exceeded`);
     } else if (message.limit === "time") {
       fail("limit", `active time limit of ${limits.activeMs} ms exceeded`);
     } else if (message.error !== undefined) {
-      const error = message.error;
-      finish({
-        ok: false,
-        error: {
-          kind: isHostErrorKind(error.kind) ? error.kind : "script",
-          message: error.message,
-          ...(error.call === undefined ? {} : { call: error.call }),
-          ...(error.line === undefined ? {} : { line: error.line }),
-        },
-        logs,
-      });
+      finish({ ok: false, error: describeFailure(message.error), logs });
     } else {
       finish({ ok: true, result: (message.result ?? null) as JsonValue, logs, truncated: false });
     }

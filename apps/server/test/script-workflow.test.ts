@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it } from "bun:test";
-import { formatUtcTimestamp } from "@der/domain";
+import * as z from "zod";
+import { defineCapability, formatUtcTimestamp, type Capability } from "@der/domain";
 import { startServer, type RunningServer } from "#main";
 import { createTempDatabase, waitUntil } from "./fixtures/restate-harness";
 import {
@@ -303,5 +304,44 @@ describe("stop a script", () => {
     expect(server.store.getApproval(approval.id)?.decision.status).toBe("expired");
     expect(host.published).toEqual([]);
     expect(server.scriptRunStore.get(scriptRun.id)?.status).toBe("cancelled");
+  }, 60_000);
+});
+
+describe("run a call whose approval rule fails", () => {
+  it("predicate throws: the call fails with kind capability and records no effect", async () => {
+    const { server, host } = await startDirectServer();
+    const applied: string[] = [];
+    host.catalog.add(
+      defineCapability({
+        id: "ledger.post",
+        description: "Post an entry",
+        input: z.object({ text: z.string() }),
+        output: z.object({ posted: z.boolean() }),
+        effect: "write",
+        approval: () => {
+          throw new Error("rule broke");
+        },
+        async execute(input) {
+          applied.push(input.text);
+          return { posted: true };
+        },
+      }) as unknown as Capability,
+    );
+    const owner = await admitOwningRun(server, "predicate-throws");
+    const scriptRun = await submitScript(
+      server,
+      owner,
+      `return der.ledger.post({ text: "entry" });`,
+    );
+
+    const result = await server.scriptRuns!.attach(scriptRun.id, AbortSignal.timeout(30_000));
+
+    expect(result).toEqual({
+      ok: false,
+      error: { kind: "capability", message: "rule broke", call: "ledger.post" },
+      logs: [],
+    });
+    expect(applied).toEqual([]);
+    expect(server.store.getLatestApprovalForRun(owner.run.id)).toBeUndefined();
   }, 60_000);
 });

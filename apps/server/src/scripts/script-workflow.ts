@@ -23,6 +23,11 @@ export interface ScriptCancelDeps {
   readonly now?: () => Date;
 }
 
+const STEP_RETRY = {
+  maxRetryAttempts: 5,
+  initialRetryInterval: 100,
+  maxRetryInterval: 2_000,
+} as const;
 const NONDETERMINISTIC_STATUS = 570;
 const CANCELLED_STATUS = 409;
 
@@ -146,7 +151,10 @@ export function createScriptWorkflow(deps: ScriptExecutionDeps) {
           ctx: restate.WorkflowContext,
           input: { readonly scriptRunId: string },
         ): Promise<ExecuteResult> => {
-          const driver = createRestateStepDriver(ctx, { wrapTerminalErrors: true });
+          const driver = createRestateStepDriver(ctx, {
+            wrapTerminalErrors: true,
+            retry: STEP_RETRY,
+          });
           const attemptEnded = ctx.request().attemptCompletedSignal;
           try {
             const result = await executeScriptRun(deps, driver, input.scriptRunId, {
@@ -157,14 +165,18 @@ export function createScriptWorkflow(deps: ScriptExecutionDeps) {
             if (!(error instanceof restate.TerminalError) || attemptEnded.aborted) {
               throw error;
             }
-            return ctx.run("script-fail", async () => {
-              const row = await deps.scriptRuns.finish(
-                input.scriptRunId,
-                "failed",
-                failedResult("capability", error.message),
-              );
-              return row.result ?? failedResult("capability", error.message);
-            });
+            return ctx.run(
+              "script-fail",
+              async () => {
+                const row = await deps.scriptRuns.finish(
+                  input.scriptRunId,
+                  "failed",
+                  failedResult("capability", error.message),
+                );
+                return row.result ?? failedResult("capability", error.message);
+              },
+              STEP_RETRY,
+            );
           }
         },
       ),
