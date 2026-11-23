@@ -69,6 +69,8 @@ export {
   type SkillId,
 } from "./common";
 export {
+  capabilityDescriptor,
+  capabilitySearchHit,
   engineEvent,
   engineReadiness,
   sandboxRequest,
@@ -76,6 +78,8 @@ export {
   toolDescriptor,
   toolOperation,
   toolResult,
+  type CapabilityDescriptor,
+  type CapabilitySearchHit,
   type EngineEvent,
   type EngineReadiness,
   type SandboxRequest,

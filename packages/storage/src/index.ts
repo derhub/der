@@ -2,6 +2,7 @@ export { canonicalizeJson, fingerprintJson } from "./canonical";
 export { isSqliteBusyError, SqliteDatabase, type SqliteDatabaseOptions } from "./database";
 export {
   applyMigrations,
+  CAPABILITY_OPERATION_KIND_MIGRATION,
   CORE_MIGRATION,
   CORE_MIGRATIONS,
   OUTBOX_DESTINATIONS_MIGRATION,

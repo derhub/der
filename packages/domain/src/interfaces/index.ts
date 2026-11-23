@@ -1,3 +1,12 @@
+export {
+  CapabilityCatalog,
+  defineCapability,
+  renderDeclaration,
+  type Capability,
+  type CapabilityApprovalPolicy,
+  type CapabilityContext,
+  type Catalog,
+} from "./capability";
 export type { Engine } from "./engine";
 export {
   defineIntegration,

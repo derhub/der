@@ -10,6 +10,7 @@ import {
   CORE_MIGRATION,
   fingerprintJson,
   openSqliteStore,
+  OUTBOX_DESTINATIONS_MIGRATION,
   type SqliteStore,
   type StorageMigration,
 } from "../src/index";
@@ -108,6 +109,7 @@ describe("configure SQLite WAL, foreign keys, busy timeout, and migration seam",
         "001-core",
         "002-memory-seam-test",
         "003-outbox-destinations",
+        "004-capability-operation-kind",
       ]);
     } finally {
       store.close();
@@ -127,9 +129,127 @@ describe("configure SQLite WAL, foreign keys, busy timeout, and migration seam",
         "001-core",
         "002-memory-seam-test",
         "003-outbox-destinations",
+        "004-capability-operation-kind",
       ]);
     } finally {
       reopened.close();
+    }
+  });
+});
+
+describe("capability operation kind", () => {
+  it("stores and reads back an approval and an effect of kind capability", async () => {
+    const store = openSqliteStore({
+      filename: createTempDbPath(),
+      now: makeFixedClock("2026-11-22T15:00:00Z").now,
+    });
+    try {
+      const { bot, session } = seedFixture(store);
+      const { run } = await store.admit({
+        botId: bot.id,
+        sessionId: session.id,
+        origin: "web",
+        idempotencyKey: "req-capability",
+        input: { parts: [{ type: "text", text: "Run script" }] },
+      });
+      const effect = {
+        runId: run.id,
+        operationKind: "capability" as const,
+        operationId: "notes.append",
+        canonicalArguments: { text: "hello" },
+        attemptId: "sr_1:1",
+      };
+
+      const requested = await store.requestApproval({
+        botId: bot.id,
+        sessionId: session.id,
+        runId: run.id,
+        effect,
+        prompt: "Append note?",
+        awakeable: "awk_capability_1",
+        deadline: "2026-11-22T15:05:00Z",
+      });
+      expect(requested.approval.effect).toEqual(effect);
+
+      await store.decide({
+        approvalId: requested.approval.id,
+        botId: bot.id,
+        sessionId: session.id,
+        runId: run.id,
+        status: "approved",
+        actor: "operator",
+        decidedAt: "2026-11-22T15:01:00Z",
+      });
+      const started = await store.beginEffect(effect, { approvalId: requested.approval.id });
+      await store.completeEffect(started.effect.id, { id: "n1" });
+
+      expect(store.getEffect(effect)).toMatchObject({
+        identity: effect,
+        status: "completed",
+        outcome: { id: "n1" },
+      });
+    } finally {
+      store.close();
+    }
+  });
+
+  it("keeps approvals and effects written before 004 and still rejects an unknown kind", () => {
+    const dbPath = createTempDbPath();
+    const ts = "2026-11-22T15:00:00.000Z";
+    const legacyDb = new Database(dbPath, { create: true, strict: true });
+    legacyDb.exec("PRAGMA foreign_keys = ON;");
+    applyMigrations(legacyDb, [CORE_MIGRATION, OUTBOX_DESTINATIONS_MIGRATION]);
+    legacyDb
+      .query(
+        `INSERT INTO bots (id, name, persona, default_engine, allowed_engines_json, workspace_path, created_at, updated_at)
+         VALUES ('bot-old', 'Old Bot', 'Concise', 'fixture', '["fixture"]', NULL, ?, ?)`,
+      )
+      .run(ts, ts);
+    legacyDb
+      .query(
+        `INSERT INTO sessions (id, bot_id, title, engine, created_at, updated_at)
+         VALUES ('sess-old', 'bot-old', 'Old Session', 'fixture', ?, ?)`,
+      )
+      .run(ts, ts);
+    legacyDb
+      .query(
+        `INSERT INTO runs (id, bot_id, session_id, origin, engine, status, created_at, updated_at)
+         VALUES ('run-old', 'bot-old', 'sess-old', 'web', 'fixture', 'running', ?, ?)`,
+      )
+      .run(ts, ts);
+    legacyDb
+      .query(
+        `INSERT INTO approvals (id, bot_id, session_id, run_id, operation_kind, operation_id, canonical_arguments_json, attempt_id, prompt, awakeable, deadline, status, created_at, updated_at)
+         VALUES ('appr-old', 'bot-old', 'sess-old', 'run-old', 'mcp', 'github.create_issue', '{"title":"x"}', 'attempt-old', 'Create?', 'awk_old', ?, 'pending', ?, ?)`,
+      )
+      .run(ts, ts, ts);
+    legacyDb
+      .query(
+        `INSERT INTO effects (id, run_id, operation_kind, operation_id, canonical_arguments_json, attempt_id, status, started_at, updated_at)
+         VALUES ('eff-old', 'run-old', 'mcp', 'github.create_issue', '{"title":"x"}', 'attempt-old', 'started', ?, ?)`,
+      )
+      .run(ts, ts);
+    legacyDb.close();
+
+    const store = openSqliteStore({ filename: dbPath });
+    try {
+      const db = store.database.db;
+      expect(db.query("SELECT id, operation_kind FROM approvals").all()).toEqual([
+        { id: "appr-old", operation_kind: "mcp" },
+      ]);
+      expect(db.query("SELECT id, operation_kind, status FROM effects").all()).toEqual([
+        { id: "eff-old", operation_kind: "mcp", status: "started" },
+      ]);
+      expect(() =>
+        db
+          .query(
+            `INSERT INTO effects (id, run_id, operation_kind, operation_id, canonical_arguments_json, attempt_id, status, started_at, updated_at)
+             VALUES ('eff-bad', 'run-old', 'bogus', 'x', '{}', 'a', 'started', ?, ?)`,
+          )
+          .run(ts, ts),
+      ).toThrow(/CHECK constraint failed/);
+    } finally {
+      store.close();
     }
   });
 });

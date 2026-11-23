@@ -84,3 +84,22 @@ export const toolResult = z.object({
   detail: z.string().optional(),
 });
 export type ToolResult = z.infer<typeof toolResult>;
+
+export const capabilityDescriptor = z.object({
+  id: z.string().min(1),
+  description: z.string(),
+  effect: z.enum(["read", "write"]),
+  requiresApproval: z.boolean(),
+  inputSchema: jsonValue,
+  outputSchema: jsonValue,
+  example: z.string().optional(),
+});
+export type CapabilityDescriptor = z.infer<typeof capabilityDescriptor>;
+
+export const capabilitySearchHit = z.object({
+  id: z.string().min(1),
+  summary: z.string(),
+  declaration: z.string().min(1),
+  example: z.string().optional(),
+});
+export type CapabilitySearchHit = z.infer<typeof capabilitySearchHit>;

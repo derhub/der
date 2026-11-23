@@ -12,6 +12,7 @@ import {
   type ToolOperation,
   type ToolResult,
 } from "../schemas/execution";
+import { CapabilityCatalog, type Capability, type Catalog } from "./capability";
 import type { Tools } from "./tools";
 
 export interface ToolExecutionContext {
@@ -59,6 +60,7 @@ export interface IntegrationContext {
 
 export interface IntegrationContribution {
   readonly tools?: readonly ToolDefinition[];
+  readonly capabilities?: readonly Capability[];
   readonly outboxSinks?: readonly OutboxSink[];
   readonly listTools?: () => Promise<readonly ToolDefinition[]>;
   start?(): Promise<void>;
@@ -148,6 +150,7 @@ export class IntegrationRegistry implements Tools {
   private readonly staticTools = new Map<string, ToolDefinition>();
   private readonly dynamicTools = new Map<string, ToolDefinition>();
   private readonly outboxSinks = new Map<string, OutboxSink>();
+  private readonly capabilityCatalog = new CapabilityCatalog();
   private readonly verifyApproval: ToolApprovalVerifier | undefined;
   private dynamicLoaded = false;
 
@@ -166,6 +169,10 @@ export class IntegrationRegistry implements Tools {
         code: "integration.duplicate_id",
       });
     }
+  }
+
+  get catalog(): Catalog {
+    return this.capabilityCatalog;
   }
 
   private registerContribution(integrationId: string, contribution: IntegrationContribution): void {
@@ -207,7 +214,26 @@ export class IntegrationRegistry implements Tools {
       newSinks.push(sink);
     }
 
+    const newCapabilities = contribution.capabilities ?? [];
+    const seenCapabilityIds = new Set<string>();
+    for (const capability of newCapabilities) {
+      if (this.capabilityCatalog.has(capability.id) || seenCapabilityIds.has(capability.id)) {
+        throw new DomainError({
+          type: "https://der.invalid/problems/duplicate-capability-id",
+          title: "Duplicate capability ID",
+          status: 409,
+          detail: `Capability "${capability.id}" is already registered.`,
+          instance: `/integrations/${integrationId}/capabilities/${capability.id}`,
+          code: "integration.duplicate_capability_id",
+        });
+      }
+      seenCapabilityIds.add(capability.id);
+    }
+
     this.integrations.set(integrationId, { id: integrationId, contribution });
+    for (const capability of newCapabilities) {
+      this.capabilityCatalog.add(capability);
+    }
     for (const tool of newTools) {
       this.staticTools.set(tool.id, tool);
     }

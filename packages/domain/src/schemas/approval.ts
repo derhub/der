@@ -8,6 +8,7 @@ export const effectOperationKind = z.enum([
   "docker",
   "engine-permission",
   "fixture",
+  "capability",
 ]);
 export type EffectOperationKind = z.infer<typeof effectOperationKind>;
 
@@ -17,6 +18,7 @@ export const persistedEffectOperationKind = z.enum([
   "docker",
   "engine-permission",
   "fixture",
+  "capability",
   "legacy",
 ]);
 export type PersistedEffectOperationKind = z.infer<typeof persistedEffectOperationKind>;
