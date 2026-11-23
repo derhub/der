@@ -1,11 +1,8 @@
 import { mkdirSync } from "node:fs";
 import { resolve } from "node:path";
-import * as z from "zod";
 import {
   defineIntegration,
-  defineTool,
   IntegrationRegistry,
-  sandboxRequest,
   type Approval,
   type ApprovalResolutionInput,
   type Bot,
@@ -13,7 +10,6 @@ import {
   type Catalog,
   type ChannelBinding,
   type ChannelIntakeMetadata,
-  type EffectIdentity,
   type Engine,
   type EngineKind,
   type EngineReadiness,
@@ -29,21 +25,11 @@ import {
   type RunAdmission,
   type RunId,
   type RunRequest,
-  type Sandbox,
   type Session,
   type SessionId,
   type Skill,
-  type ToolResult,
-  type Tools,
 } from "@der/domain";
-import type { AnyTool } from "@tanstack/ai";
-import { compiledParsers } from "@der/domain/compiled";
-import {
-  createMcpIntegration,
-  deniedToolResult,
-  effectIdentityMatches,
-  type ApprovalVerifier,
-} from "@der/mcp";
+import { createMcpIntegration } from "@der/mcp";
 import { buildRunContext, createSkillCatalog, type SkillCatalog } from "@der/runtime/context";
 import {
   createAntigravityEngine,
@@ -51,9 +37,6 @@ import {
   createCodexEngine,
   DEFAULT_TERMS_COVERAGE,
   diagnoseEngine,
-  digestJson,
-  normalizeToJsonValue,
-  type ApprovalBroker,
   type EngineAuthProbeResult,
   type LoadEngineRunInput,
 } from "@der/runtime/engines";
@@ -64,8 +47,6 @@ import {
   createDockerWasmerSandbox,
   createHardenedDockerProvider,
   DEFAULT_ENGINE_SHADOW_HOMES,
-  DOCKER_TOOL_DESCRIPTOR,
-  WASMER_TOOL_DESCRIPTOR,
   type CommandRunner,
   type DockerNetworkPolicy,
   type OfficialEngineKind,
@@ -92,15 +73,11 @@ import {
   createDirectRoutineScheduleClient,
   createDirectWorkflowDriver,
   createFixtureEngine,
-  createFixtureTools,
   createRestateFetchHandler,
   createRestateWorkflowDriver,
   createRoutineScheduleClient,
   createRoutineScheduleObject,
   createRunCoordinator,
-  executeApprovedEffectStep,
-  finalizeInterruptedUncertainStep,
-  UncertainEffectError,
   type AnyRestateService,
   type ConfigureRoutineInput,
   type ConfigureRoutineResult,
@@ -109,6 +86,7 @@ import {
   type RunCoordinator,
 } from "./workflows/index";
 import { createHostCapabilities } from "./capabilities/index";
+import { createFixtureCapabilities } from "./capabilities/fixture";
 import { createExecuteTool } from "./code-mode/execute";
 import { codeModeInstructions } from "./code-mode/instructions";
 import { createCatalogSearchCapability, createSearchTool } from "./code-mode/search";
@@ -192,7 +170,6 @@ export interface CreateServerOptions {
   readonly extraMigrations?: readonly StorageMigration[];
   readonly now?: () => Date;
   readonly engines?: ReadonlyMap<EngineKind, Engine>;
-  readonly tools?: Tools;
   readonly catalog?: Catalog;
   readonly integrations?: readonly Integration[];
   readonly skills?: SkillCatalog;
@@ -200,7 +177,6 @@ export interface CreateServerOptions {
   readonly probeEngineAuth?: (engine: OfficialEngineKind) => Promise<EngineAuthProbeResult>;
   readonly extraRestateServices?: readonly AnyRestateService[];
   readonly extraHttpHandler?: ExtraHttpHandler;
-  readonly reconcileEffect?: (effect: EffectIdentity) => Promise<ToolResult | undefined>;
   readonly outboxSinks?: readonly OutboxSink[];
 }
 
@@ -210,9 +186,9 @@ export interface RunningServer {
   readonly memory: SqliteMemory;
   readonly routines: SqliteRoutines;
   readonly skills: SkillCatalog;
-  readonly tools: Tools;
+  readonly catalog: Catalog;
   readonly scriptRunStore: SqliteScriptRuns;
-  readonly scriptRuns?: ScriptRuns;
+  readonly scriptRuns: ScriptRuns;
   readonly engines: ReadonlyMap<EngineKind, Engine>;
   readonly coordinator: RunCoordinator;
   readonly workflow: DurableWorkflow;
@@ -268,104 +244,10 @@ function toMcpServerConfigs(
   }));
 }
 
-function createStoreApprovalVerifier(store: SqliteStore): ApprovalVerifier {
-  return (effect: EffectIdentity): boolean => {
-    const approval = store.getLatestApprovalForRun(effect.runId);
-    if (!approval || approval.decision.status !== "approved") {
-      return false;
-    }
-    return effectIdentityMatches(approval.effect, effect);
-  };
-}
-
-const fixtureToolInputSchema = z.record(z.string(), z.unknown());
-
 function createFixtureIntegration(): Integration {
-  const fixtureTools = createFixtureTools();
   return defineIntegration({
     id: "fixture",
-    setup() {
-      return {
-        tools: [
-          defineTool({
-            id: "fixture.apply",
-            operationKind: "fixture",
-            name: "Fixture Apply",
-            description: "Applies one deterministic credential-free fixture effect.",
-            inputSchema: fixtureToolInputSchema,
-            descriptorInputSchema: {
-              type: "object",
-              properties: {
-                target: { type: "string" },
-                mode: { type: "string" },
-              },
-            },
-            approval: "always",
-            execute: async (_input, ctx) => fixtureTools.invoke({ effect: ctx.effect }),
-          }),
-          defineTool({
-            id: "fixture.uncertain",
-            operationKind: "fixture",
-            name: "Fixture Uncertain",
-            description: "Simulates a dispatched effect whose upstream response is lost.",
-            inputSchema: fixtureToolInputSchema,
-            descriptorInputSchema: {
-              type: "object",
-              properties: {
-                target: { type: "string" },
-                mode: { type: "string" },
-              },
-            },
-            approval: "always",
-            execute: async (_input, ctx) => fixtureTools.invoke({ effect: ctx.effect }),
-          }),
-        ],
-      };
-    },
-  });
-}
-
-function createSandboxIntegration(input: {
-  readonly kind: "docker" | "wasmer";
-  readonly descriptor: typeof DOCKER_TOOL_DESCRIPTOR;
-  readonly sandbox: Sandbox;
-  readonly verifyApproval: ApprovalVerifier;
-}): Integration {
-  return defineIntegration({
-    id: `sandbox.${input.kind}`,
-    setup() {
-      return {
-        tools: [
-          defineTool({
-            id: input.descriptor.id,
-            operationKind: input.kind,
-            name: input.descriptor.name,
-            description: input.descriptor.description,
-            inputSchema: sandboxRequest,
-            descriptorInputSchema: input.descriptor.inputSchema,
-            approval: "always",
-            execute: async (parsedRequest, ctx) => {
-              const authorized = await input.verifyApproval(ctx.effect);
-              if (!authorized) {
-                return deniedToolResult(
-                  "tool.approval_required",
-                  `Exact-operation approval is required for ${input.descriptor.id}.`,
-                );
-              }
-              const result = await input.sandbox.execute(parsedRequest);
-              return compiledParsers.toolResult.parse({
-                ok: result.exitCode === 0 && !result.timedOut,
-                isError: result.exitCode !== 0 || result.timedOut,
-                outcome: result,
-                ...(result.timedOut
-                  ? { detail: `${input.kind} sandbox execution timed out.` }
-                  : {}),
-              });
-            },
-          }),
-        ],
-      };
-    },
+    setup: () => ({ capabilities: createFixtureCapabilities().capabilities }),
   });
 }
 
@@ -470,92 +352,13 @@ function createShadowHomeAuthProbe(
   };
 }
 
-export async function buildEngineHostTools(input: {
-  readonly run: Run;
-  readonly store: SqliteStore;
-  readonly tools: Tools;
-  readonly approvalBroker: ApprovalBroker;
-  readonly reconcileEffect?: (effect: EffectIdentity) => Promise<ToolResult | undefined>;
-}): Promise<Array<AnyTool>> {
-  const descriptors = input.tools.list ? await input.tools.list() : [];
-
-  return descriptors.map((descriptor): AnyTool => ({
-    name: descriptor.id,
-    description: descriptor.description,
-    inputSchema: descriptor.inputSchema as AnyTool["inputSchema"],
-    metadata: { requiresApproval: descriptor.requiresApproval },
-    execute: async (rawArgs: unknown, ctx?: { readonly signal?: AbortSignal }) => {
-      const canonicalArguments = normalizeToJsonValue(rawArgs ?? {});
-      const canonicalArgsDigest = await digestJson(canonicalArguments);
-      const effectDigest = await digestJson({
-        runId: input.run.id,
-        operationKind: descriptor.kind,
-        operationId: descriptor.id,
-        canonicalArgsDigest,
-      });
-      const effect: EffectIdentity = {
-        runId: input.run.id,
-        operationKind: descriptor.kind,
-        operationId: descriptor.id,
-        canonicalArguments,
-        attemptId: `${input.run.id}:tool:${effectDigest}`,
-      };
-
-      if (descriptor.requiresApproval) {
-        const decision = await input.approvalBroker.requestApproval({
-          effect,
-          prompt: `Approve host tool ${descriptor.id}?`,
-          signal: ctx?.signal ?? new AbortController().signal,
-        });
-        if (decision.status !== "approved") {
-          return deniedToolResult(
-            "tool.approval_required",
-            decision.status === "expired"
-              ? `Approval expired for host tool "${descriptor.id}".`
-              : `Operator denied host tool "${descriptor.id}".`,
-          );
-        }
-
-        const stepOutcome = await executeApprovedEffectStep(
-          {
-            store: input.store,
-            tools: input.tools,
-            ...(input.reconcileEffect ? { reconcileEffect: input.reconcileEffect } : {}),
-          },
-          {
-            run: input.run,
-            approvalId: decision.approvalId,
-            effect,
-          },
-        );
-        if (stepOutcome.kind === "uncertain") {
-          await finalizeInterruptedUncertainStep(
-            { store: input.store },
-            {
-              run: input.run,
-              effectId: stepOutcome.effectId,
-              detail: stepOutcome.detail,
-            },
-          );
-          throw new UncertainEffectError(stepOutcome.detail);
-        }
-        return stepOutcome.toolResult;
-      }
-
-      return input.tools.invoke({ effect });
-    },
-  }));
-}
-
 function createContextLoader(input: {
   readonly store: SqliteStore;
   readonly memory: SqliteMemory;
   readonly skills: SkillCatalog;
-  readonly tools: Tools;
   readonly coordinator: RunCoordinator;
-  readonly reconcileEffect?: (effect: EffectIdentity) => Promise<ToolResult | undefined>;
   readonly maxTokens: number;
-  readonly codeMode?: {
+  readonly codeMode: {
     readonly catalog: Catalog;
     readonly scriptRunStore: SqliteScriptRuns;
     readonly scriptRuns: ScriptRuns;
@@ -583,35 +386,19 @@ function createContextLoader(input: {
 
     const approvalBroker = input.coordinator.createApprovalBroker(run);
 
-    const hostTools = await buildEngineHostTools({
-      run,
-      store: input.store,
-      tools: input.tools,
-      approvalBroker,
-      ...(input.reconcileEffect ? { reconcileEffect: input.reconcileEffect } : {}),
-    });
-
     const codeMode = input.codeMode;
     return {
       messages: [...built.messages],
-      systemPrompts: codeMode
-        ? [...built.systemPrompts, codeModeInstructions(codeMode.catalog)]
-        : [...built.systemPrompts],
-      tools: codeMode
-        ? [
-            ...hostTools,
-            createSearchTool({
-              catalog: codeMode.catalog,
-              maxResultBytes: codeMode.maxResultBytes,
-            }),
-            createExecuteTool({
-              run,
-              scriptRunStore: codeMode.scriptRunStore,
-              scriptRuns: codeMode.scriptRuns,
-              maxResultBytes: codeMode.maxResultBytes,
-            }),
-          ]
-        : hostTools,
+      systemPrompts: [...built.systemPrompts, codeModeInstructions(codeMode.catalog)],
+      tools: [
+        createSearchTool({ catalog: codeMode.catalog, maxResultBytes: codeMode.maxResultBytes }),
+        createExecuteTool({
+          run,
+          scriptRunStore: codeMode.scriptRunStore,
+          scriptRuns: codeMode.scriptRuns,
+          maxResultBytes: codeMode.maxResultBytes,
+        }),
+      ],
       approvalBroker,
     };
   };
@@ -760,6 +547,7 @@ export async function startServer(options: CreateServerOptions = {}): Promise<Ru
       ...(options.now ? { now: options.now } : {}),
     });
 
+  const closing = new AbortController();
   let integrationRegistry: IntegrationRegistry | undefined;
   let closeDirectDriver: (() => void) | undefined;
   let closeDirectScriptRuns: (() => Promise<void>) | undefined;
@@ -782,12 +570,11 @@ export async function startServer(options: CreateServerOptions = {}): Promise<Ru
         ? options.engines.has("fixture") || config.seedFixture
         : config.enabledEngines.includes("fixture") || config.seedFixture;
 
-    let tools: Tools;
-    if (options.tools !== undefined) {
-      tools = options.tools;
+    let catalog: Catalog;
+    if (options.catalog !== undefined) {
+      catalog = options.catalog;
     } else {
-      const verifyApproval = createStoreApprovalVerifier(store);
-      integrationRegistry = new IntegrationRegistry({ verifyApproval });
+      integrationRegistry = new IntegrationRegistry();
 
       if (hasFixtureEngine) {
         integrationRegistry.registerSync(createFixtureIntegration());
@@ -818,14 +605,6 @@ export async function startServer(options: CreateServerOptions = {}): Promise<Ru
         },
         runner,
       });
-      integrationRegistry.registerSync(
-        createSandboxIntegration({
-          kind: "docker",
-          descriptor: DOCKER_TOOL_DESCRIPTOR,
-          sandbox: dockerSandbox,
-          verifyApproval,
-        }),
-      );
 
       const wasmerRoots =
         config.wasmerAllowedRoots.length > 0 ? config.wasmerAllowedRoots : [workspaceHostPath];
@@ -843,14 +622,6 @@ export async function startServer(options: CreateServerOptions = {}): Promise<Ru
         maxTimeoutMs: config.wasmerMaxTimeoutMs,
         runner,
       });
-      integrationRegistry.registerSync(
-        createSandboxIntegration({
-          kind: "wasmer",
-          descriptor: WASMER_TOOL_DESCRIPTOR,
-          sandbox: wasmerSandbox,
-          verifyApproval,
-        }),
-      );
 
       const registry = integrationRegistry;
       registry.registerSync(
@@ -877,7 +648,6 @@ export async function startServer(options: CreateServerOptions = {}): Promise<Ru
         integrationRegistry.registerSync(
           createMcpIntegration({
             servers: toMcpServerConfigs(config.mcpServers),
-            verifyApproval,
           }),
         );
       }
@@ -887,14 +657,13 @@ export async function startServer(options: CreateServerOptions = {}): Promise<Ru
       }
 
       await integrationRegistry.start();
-      tools = integrationRegistry;
+      catalog = integrationRegistry.catalog;
     }
 
     const engines = new Map<EngineKind, Engine>(options.engines);
     const clockNow = options.now ?? (() => store.database.now());
-    const catalog = options.catalog ?? integrationRegistry?.catalog;
     const scriptRunStore = openSqliteScriptRuns({ database: store.database });
-    let scriptRuns: ScriptRuns | undefined;
+    let scriptRuns: ScriptRuns;
 
     let coordinator: RunCoordinator;
     let routineSchedule: RoutineScheduleClient;
@@ -905,10 +674,10 @@ export async function startServer(options: CreateServerOptions = {}): Promise<Ru
       }
     };
 
-    const scriptExecutionDeps = (scriptCatalog: Catalog): ScriptExecutionDeps => ({
+    const scriptExecutionDeps = (): ScriptExecutionDeps => ({
       store,
       scriptRuns: scriptRunStore,
-      catalog: scriptCatalog,
+      catalog,
       approvals: coordinator,
       limits: {
         memoryBytes: config.scriptMemoryBytes,
@@ -927,24 +696,20 @@ export async function startServer(options: CreateServerOptions = {}): Promise<Ru
       coordinator = createRunCoordinator({
         store,
         engines,
-        tools,
         driver: directDriver,
         approvalTimeoutMs: config.approvalTimeoutMs,
         now: clockNow,
         onRunFinished: cancelUnfinishedScriptRuns,
-        ...(options.reconcileEffect ? { reconcileEffect: options.reconcileEffect } : {}),
       });
       directDriver.setRunner((runId) => coordinator.executeRun(runId, directDriver));
       closeDirectDriver = () => directDriver.close();
-      if (catalog !== undefined) {
-        const directScriptRuns = createDirectScriptRuns({
-          ...scriptExecutionDeps(catalog),
-          driver: directDriver,
-          decide: (decision) => coordinator.decide(decision),
-        });
-        scriptRuns = directScriptRuns;
-        closeDirectScriptRuns = () => directScriptRuns.close();
-      }
+      const directScriptRuns = createDirectScriptRuns({
+        ...scriptExecutionDeps(),
+        driver: directDriver,
+        decide: (decision) => coordinator.decide(decision),
+      });
+      scriptRuns = directScriptRuns;
+      closeDirectScriptRuns = () => directScriptRuns.close();
 
       routineSchedule = createDirectRoutineScheduleClient({
         routines,
@@ -969,12 +734,10 @@ export async function startServer(options: CreateServerOptions = {}): Promise<Ru
       coordinator = createRunCoordinator({
         store,
         engines,
-        tools,
         driver: restateDriver,
         approvalTimeoutMs: config.approvalTimeoutMs,
         now: clockNow,
         onRunFinished: cancelUnfinishedScriptRuns,
-        ...(options.reconcileEffect ? { reconcileEffect: options.reconcileEffect } : {}),
       });
       routineSchedule = createRoutineScheduleClient(config.restateIngressUrl);
 
@@ -990,16 +753,14 @@ export async function startServer(options: CreateServerOptions = {}): Promise<Ru
         );
       }
 
-      if (catalog !== undefined) {
-        if (!hasRestateServiceNamed(extraServices, "ScriptWorkflow")) {
-          extraServices.push(createScriptWorkflow(scriptExecutionDeps(catalog)));
-        }
-        scriptRuns = createRestateScriptRuns(config.restateIngressUrl, {
-          scriptRuns: scriptRunStore,
-          decide: (decision) => coordinator.decide(decision),
-          now: clockNow,
-        });
+      if (!hasRestateServiceNamed(extraServices, "ScriptWorkflow")) {
+        extraServices.push(createScriptWorkflow(scriptExecutionDeps()));
       }
+      scriptRuns = createRestateScriptRuns(config.restateIngressUrl, {
+        scriptRuns: scriptRunStore,
+        decide: (decision) => coordinator.decide(decision),
+        now: clockNow,
+      });
 
       const restateFetchHandler = createRestateFetchHandler(coordinator, extraServices);
       restateServer = Bun.serve({
@@ -1014,20 +775,14 @@ export async function startServer(options: CreateServerOptions = {}): Promise<Ru
       store,
       memory,
       skills,
-      tools,
       coordinator,
-      ...(options.reconcileEffect ? { reconcileEffect: options.reconcileEffect } : {}),
       maxTokens: config.contextMaxTokens,
-      ...(catalog !== undefined && scriptRuns !== undefined
-        ? {
-            codeMode: {
-              catalog,
-              scriptRunStore,
-              scriptRuns,
-              maxResultBytes: config.scriptResultBytes,
-            },
-          }
-        : {}),
+      codeMode: {
+        catalog,
+        scriptRunStore,
+        scriptRuns,
+        maxResultBytes: config.scriptResultBytes,
+      },
     });
 
     if (options.engines === undefined) {
@@ -1037,7 +792,7 @@ export async function startServer(options: CreateServerOptions = {}): Promise<Ru
       }
       for (const kind of requested) {
         if (kind === "fixture") {
-          engines.set("fixture", createFixtureEngine(store));
+          engines.set("fixture", createFixtureEngine(store, loadRunInput, closing.signal));
         } else {
           engines.set(
             kind,
@@ -1055,7 +810,7 @@ export async function startServer(options: CreateServerOptions = {}): Promise<Ru
         }
       }
     } else if (config.seedFixture && !engines.has("fixture")) {
-      engines.set("fixture", createFixtureEngine(store));
+      engines.set("fixture", createFixtureEngine(store, loadRunInput, closing.signal));
     }
 
     const httpApp = createHttpApp({
@@ -1066,7 +821,7 @@ export async function startServer(options: CreateServerOptions = {}): Promise<Ru
       memory,
       routines,
       skills,
-      tools,
+      catalog,
       workflow: coordinator,
       routineSchedule,
       engines,
@@ -1163,9 +918,9 @@ export async function startServer(options: CreateServerOptions = {}): Promise<Ru
       memory,
       routines,
       skills,
-      tools,
+      catalog,
       scriptRunStore,
-      ...(scriptRuns !== undefined ? { scriptRuns } : {}),
+      scriptRuns,
       engines,
       coordinator,
       workflow: coordinator,
@@ -1185,6 +940,7 @@ export async function startServer(options: CreateServerOptions = {}): Promise<Ru
           }
         };
 
+        closing.abort();
         await runStep(() => startedOutbox.stop());
         await runStep(() => closeDirectScriptRuns?.());
         await runStep(() => closeDirectDriver?.());

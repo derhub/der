@@ -10,17 +10,11 @@ export {
 export type { Engine } from "./engine";
 export {
   defineIntegration,
-  defineTool,
   IntegrationRegistry,
   type Integration,
   type IntegrationContext,
   type IntegrationContribution,
-  type IntegrationRegistryOptions,
   type OutboxSink,
-  type ToolApprovalPolicy,
-  type ToolApprovalVerifier,
-  type ToolDefinition,
-  type ToolExecutionContext,
 } from "./integration";
 export type { Memory } from "./memory";
 export type { Sandbox } from "./sandbox";
@@ -44,5 +38,4 @@ export type {
   SessionStore,
   Store,
 } from "./store";
-export type { Tools } from "./tools";
 export type { RunCoordinator, Workflow, WorkflowDriver } from "./workflow";

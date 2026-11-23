@@ -1,20 +1,17 @@
 import {
+  defineCapability,
   defineIntegration,
-  defineTool,
+  DomainError,
+  type Capability,
   type Integration,
   type JsonValue,
-  type ToolDescriptor,
-  type ToolOperation,
-  type ToolResult,
-  type Tools,
 } from "@der/domain";
-import { compiledParsers } from "@der/domain/compiled";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import type { Transport } from "@modelcontextprotocol/sdk/shared/transport.js";
+import type { Tool } from "@modelcontextprotocol/sdk/types.js";
 import * as z from "zod";
-import { deniedToolResult, type ApprovalVerifier } from "./authorization";
 import { redactSecrets, ToolConfigurationError, ToolEffectUncertainError } from "./errors";
 
 export type McpTransportConfig =
@@ -48,21 +45,13 @@ export interface McpServerConfig {
 
 export interface McpToolsOptions {
   readonly servers: readonly McpServerConfig[];
-  readonly verifyApproval?: ApprovalVerifier;
   readonly clientName?: string;
   readonly clientVersion?: string;
 }
 
-export interface McpToolsHandle extends Tools {
-  list(): Promise<readonly ToolDescriptor[]>;
-  invoke(operation: ToolOperation): Promise<ToolResult>;
+export interface McpToolsHandle {
+  capabilities(): Promise<readonly Capability[]>;
   close(): Promise<void>;
-}
-
-interface DiscoveredTool {
-  readonly serverId: string;
-  readonly toolName: string;
-  readonly descriptor: ToolDescriptor;
 }
 
 interface ConnectedServer {
@@ -70,6 +59,8 @@ interface ConnectedServer {
   readonly client: Client;
   readonly secrets: readonly string[];
 }
+
+const mcpArgumentsSchema = z.record(z.string(), z.unknown());
 
 const VALID_SERVER_ID = /^[a-z0-9][a-z0-9_-]*$/;
 
@@ -108,64 +99,54 @@ function toJsonValue(value: unknown): JsonValue {
   return JSON.parse(JSON.stringify(value ?? null)) as JsonValue;
 }
 
-function normalizeMcpCallOutcome(result: {
+function textOf(blocks: readonly unknown[]): string[] {
+  const texts: string[] = [];
+  for (const block of blocks) {
+    if (typeof block === "object" && block !== null) {
+      const entry = block as Record<string, unknown>;
+      if (entry["type"] === "text" && typeof entry["text"] === "string") {
+        texts.push(entry["text"]);
+      }
+    }
+  }
+  return texts;
+}
+
+function mcpValue(result: {
   readonly structuredContent?: Record<string, unknown>;
   readonly content?: unknown;
-  readonly isError?: boolean;
-}): ToolResult {
-  const isError = result.isError === true;
+}): JsonValue {
   if (result.structuredContent !== undefined) {
-    return compiledParsers.toolResult.parse({
-      ok: !isError,
-      isError,
-      outcome: toJsonValue(result.structuredContent),
-    });
+    return toJsonValue(result.structuredContent);
   }
-
-  if (Array.isArray(result.content)) {
-    const textBlocks: string[] = [];
-    const normalizedBlocks: JsonValue[] = [];
-    for (const block of result.content) {
-      if (typeof block === "object" && block !== null) {
-        const entry = block as Record<string, unknown>;
-        if (entry["type"] === "text" && typeof entry["text"] === "string") {
-          textBlocks.push(entry["text"]);
-        }
-        normalizedBlocks.push(toJsonValue(entry));
-      }
-    }
-
-    if (textBlocks.length === 1 && normalizedBlocks.length === 1) {
-      const single = textBlocks[0]!;
-      try {
-        return compiledParsers.toolResult.parse({
-          ok: !isError,
-          isError,
-          outcome: toJsonValue(JSON.parse(single)),
-        });
-      } catch {
-        return compiledParsers.toolResult.parse({
-          ok: !isError,
-          isError,
-          outcome: single,
-          ...(isError ? { detail: single } : {}),
-        });
-      }
-    }
-
-    return compiledParsers.toolResult.parse({
-      ok: !isError,
-      isError,
-      outcome: normalizedBlocks,
-      ...(isError && textBlocks.length > 0 ? { detail: textBlocks.join("\n") } : {}),
-    });
+  if (!Array.isArray(result.content)) {
+    return null;
   }
+  const texts = textOf(result.content);
+  if (texts.length === 1 && result.content.length === 1) {
+    try {
+      return toJsonValue(JSON.parse(texts[0]!));
+    } catch {
+      return texts[0]!;
+    }
+  }
+  return toJsonValue(result.content);
+}
 
-  return compiledParsers.toolResult.parse({
-    ok: !isError,
-    isError,
-    outcome: null,
+function mcpFailure(code: string, detail: string, capabilityId: string): DomainError {
+  return new DomainError({
+    type: `https://der.invalid/problems/${code.replaceAll(".", "-").replaceAll("_", "-")}`,
+    title: "MCP call failed",
+    status: 502,
+    detail,
+    instance: `/capabilities/${capabilityId}`,
+    code,
   });
+}
+
+function identifierSegment(name: string): string {
+  const segment = name.replace(/[^A-Za-z0-9_$]/g, "_");
+  return /^[A-Za-z_$]/.test(segment) ? segment : `_${segment}`;
 }
 
 async function buildTransport(config: McpServerConfig): Promise<Transport> {
@@ -211,8 +192,6 @@ export function createMcpTools(options: McpToolsOptions): McpToolsHandle {
   }
 
   const connected = new Map<string, ConnectedServer>();
-  const catalog = new Map<string, DiscoveredTool>();
-  let catalogLoaded = false;
 
   const clientInfo = {
     name: options.clientName ?? "der-mcp",
@@ -243,153 +222,99 @@ export function createMcpTools(options: McpToolsOptions): McpToolsHandle {
     return entry;
   }
 
-  async function refreshCatalog(): Promise<readonly ToolDescriptor[]> {
-    catalog.clear();
-    const descriptors: ToolDescriptor[] = [];
-
-    for (const [serverId, config] of serverMap.entries()) {
-      const serverConn = await ensureConnected(serverId);
-      const allowedSet = config.allowedTools ? new Set(config.allowedTools) : undefined;
-      const readOnlySet = new Set(config.readOnlyTools ?? []);
-      const defaultRequiresApproval = config.defaultRequiresApproval ?? true;
-
-      const listed = await serverConn.client.listTools();
-      for (const tool of listed.tools) {
-        if (allowedSet && !allowedSet.has(tool.name)) {
-          continue;
+  function mcpCapability(
+    server: ConnectedServer,
+    id: string,
+    tool: Tool,
+    requiresApproval: boolean,
+  ): Capability {
+    const summary = tool.description ?? tool.title ?? tool.name;
+    return defineCapability({
+      id,
+      description: `${summary}\nInput JSON schema: ${JSON.stringify(tool.inputSchema)}`,
+      input: mcpArgumentsSchema,
+      output: z.unknown(),
+      effect: "write",
+      approval: requiresApproval ? "always" : "none",
+      async execute(args) {
+        let result: Awaited<ReturnType<Client["callTool"]>>;
+        try {
+          result = await server.client.callTool(
+            { name: tool.name, arguments: args },
+            undefined,
+            server.config.timeoutMs !== undefined
+              ? { timeout: server.config.timeoutMs }
+              : undefined,
+          );
+        } catch (error) {
+          const rawMessage = error instanceof Error ? error.message : String(error);
+          const safeMessage = redactSecrets(rawMessage, server.secrets);
+          if (requiresApproval) {
+            throw new ToolEffectUncertainError(
+              `MCP write "${id}" outcome is uncertain after dispatch: ${safeMessage}`,
+            );
+          }
+          throw mcpFailure("mcp.call_failed", safeMessage, id);
         }
-        const operationId = `${serverId}.${tool.name}`;
-        const requiresApproval = readOnlySet.has(tool.name) ? false : defaultRequiresApproval;
-
-        const descriptor = compiledParsers.toolDescriptor.parse({
-          kind: "mcp",
-          id: operationId,
-          name: tool.title ?? tool.name,
-          description: tool.description ?? "",
-          requiresApproval,
-          inputSchema: toJsonValue(tool.inputSchema),
-        });
-
-        catalog.set(operationId, {
-          serverId,
-          toolName: tool.name,
-          descriptor,
-        });
-        descriptors.push(descriptor);
-      }
-    }
-
-    descriptors.sort((a, b) => a.id.localeCompare(b.id));
-    catalogLoaded = true;
-    return descriptors;
+        const outcome = result as {
+          readonly structuredContent?: Record<string, unknown>;
+          readonly content?: unknown;
+          readonly isError?: boolean;
+        };
+        if (outcome.isError === true) {
+          const detail = Array.isArray(outcome.content) ? textOf(outcome.content).join("\n") : "";
+          throw mcpFailure(
+            "mcp.tool_error",
+            redactSecrets(detail || `MCP tool "${tool.name}" reported an error.`, server.secrets),
+            id,
+          );
+        }
+        return mcpValue(outcome);
+      },
+    }) as unknown as Capability;
   }
 
   return {
-    async list(): Promise<readonly ToolDescriptor[]> {
-      return refreshCatalog();
-    },
+    async capabilities(): Promise<readonly Capability[]> {
+      const capabilities = new Map<
+        string,
+        { readonly capability: Capability; readonly origin: string }
+      >();
 
-    async invoke(operation: ToolOperation): Promise<ToolResult> {
-      const parsedOp = compiledParsers.toolOperation.safeParse(operation);
-      if (!parsedOp.success) {
-        return deniedToolResult(
-          "tool.invalid_arguments",
-          `Invalid tool operation payload: ${parsedOp.error.message}`,
-        );
-      }
+      for (const [serverId, config] of serverMap.entries()) {
+        const server = await ensureConnected(serverId);
+        const allowedSet = config.allowedTools ? new Set(config.allowedTools) : undefined;
+        const readOnlySet = new Set(config.readOnlyTools ?? []);
+        const defaultRequiresApproval = config.defaultRequiresApproval ?? true;
 
-      const { effect } = parsedOp.data;
-      if (effect.operationKind !== "mcp") {
-        return deniedToolResult(
-          "tool.unrecognized_operation",
-          `Operation kind "${effect.operationKind}" is not handled by the MCP adapter.`,
-        );
-      }
-
-      if (!catalogLoaded) {
-        await refreshCatalog();
-      }
-
-      const discovered = catalog.get(effect.operationId);
-      if (!discovered) {
-        return deniedToolResult(
-          "tool.unrecognized_operation",
-          `MCP operation "${effect.operationId}" is not recognized or allowed.`,
-        );
-      }
-
-      if (
-        effect.canonicalArguments === null ||
-        typeof effect.canonicalArguments !== "object" ||
-        Array.isArray(effect.canonicalArguments)
-      ) {
-        return deniedToolResult(
-          "tool.invalid_arguments",
-          `MCP operation "${effect.operationId}" requires a JSON object argument payload.`,
-        );
-      }
-
-      if (discovered.descriptor.requiresApproval) {
-        if (!options.verifyApproval) {
-          return deniedToolResult(
-            "tool.approval_required",
-            `Exact-operation approval verifier is required for MCP operation "${effect.operationId}".`,
-          );
-        }
-        const authorized = await options.verifyApproval(effect);
-        if (!authorized) {
-          return deniedToolResult(
-            "tool.approval_required",
-            `Exact-operation approval is required for MCP operation "${effect.operationId}".`,
-          );
+        const listed = await server.client.listTools();
+        for (const tool of listed.tools) {
+          if (allowedSet && !allowedSet.has(tool.name)) {
+            continue;
+          }
+          const id = `mcp.${identifierSegment(serverId)}.${identifierSegment(tool.name)}`;
+          const origin = `${serverId}/${tool.name}`;
+          const existing = capabilities.get(id);
+          if (existing) {
+            throw new ToolConfigurationError(
+              "mcp.duplicate_capability_id",
+              `MCP tools "${existing.origin}" and "${origin}" both map to capability "${id}".`,
+            );
+          }
+          const requiresApproval = readOnlySet.has(tool.name) ? false : defaultRequiresApproval;
+          capabilities.set(id, {
+            capability: mcpCapability(server, id, tool, requiresApproval),
+            origin,
+          });
         }
       }
 
-      const serverConn = await ensureConnected(discovered.serverId);
-      try {
-        const rawResult = await serverConn.client.callTool(
-          {
-            name: discovered.toolName,
-            arguments: effect.canonicalArguments as Record<string, unknown>,
-          },
-          undefined,
-          serverConn.config.timeoutMs !== undefined
-            ? { timeout: serverConn.config.timeoutMs }
-            : undefined,
-        );
-
-        return normalizeMcpCallOutcome(
-          rawResult as {
-            readonly structuredContent?: Record<string, unknown>;
-            readonly content?: unknown;
-            readonly isError?: boolean;
-          },
-        );
-      } catch (error) {
-        const rawMessage = error instanceof Error ? error.message : String(error);
-        const safeMessage = redactSecrets(rawMessage, serverConn.secrets);
-
-        if (discovered.descriptor.requiresApproval) {
-          throw new ToolEffectUncertainError(
-            effect,
-            `MCP write "${effect.operationId}" outcome is uncertain after dispatch: ${safeMessage}`,
-          );
-        }
-
-        return compiledParsers.toolResult.parse({
-          ok: false,
-          isError: true,
-          outcome: { code: "mcp.call_failed" },
-          detail: safeMessage,
-        });
-      }
+      return [...capabilities.values()].map((entry) => entry.capability);
     },
 
     async close(): Promise<void> {
       const entries = [...connected.values()];
       connected.clear();
-      catalog.clear();
-      catalogLoaded = false;
       await Promise.all(
         entries.map(async (entry) => {
           try {
@@ -403,8 +328,6 @@ export function createMcpTools(options: McpToolsOptions): McpToolsHandle {
   };
 }
 
-const mcpArgumentsSchema = z.record(z.string(), z.unknown());
-
 export function createMcpIntegration(
   options: McpToolsOptions & { readonly id?: string },
 ): Integration {
@@ -413,24 +336,8 @@ export function createMcpIntegration(
     setup() {
       const handle = createMcpTools(options);
       return {
-        async listTools() {
-          const descriptors = await handle.list();
-          return descriptors.map((descriptor) =>
-            defineTool({
-              id: descriptor.id,
-              operationKind: "mcp",
-              name: descriptor.name,
-              description: descriptor.description,
-              inputSchema: mcpArgumentsSchema,
-              descriptorInputSchema: descriptor.inputSchema,
-              approval: descriptor.requiresApproval ? "always" : "none",
-              execute: async (_input, ctx) => handle.invoke({ effect: ctx.effect }),
-            }),
-          );
-        },
-        async stop() {
-          await handle.close();
-        },
+        listCapabilities: () => handle.capabilities(),
+        stop: () => handle.close(),
       };
     },
   });

@@ -116,7 +116,7 @@ function setup() {
     memory,
     routines,
     skills,
-    tools: { list: async () => [], invoke: async () => ({ ok: true, isError: false, outcome: null }) },
+    catalog,
     workflow: {
       admit: async () => {
         throw new Error("not used");

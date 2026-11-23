@@ -7,7 +7,8 @@ export function skillCapabilities(skills: SkillCatalog) {
   return [
     defineCapability({
       id: "skills.list",
-      description: "List the skills available to every bot, with the skill files that were rejected.",
+      description:
+        "List the skills available to every bot, with the skill files that were rejected.",
       input: z.strictObject({}),
       output: z.object({
         skills: z.array(skill),

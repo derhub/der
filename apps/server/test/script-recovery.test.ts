@@ -1,7 +1,6 @@
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "bun:test";
 import { formatUtcTimestamp } from "@der/domain";
 import { startServer, type RunningServer } from "../src/main";
-import { createFixtureTools } from "../src/workflows/index";
 import {
   allocateLocalTcpNumber,
   createTempDatabase,
@@ -65,7 +64,6 @@ async function startRestateServer(
       seedFixture,
       scriptGuestArtifactPath: guestArtifactPath,
     },
-    tools: createFixtureTools(),
     catalog: host.catalog,
   });
   await registerRestateDeployment(restate.adminUrl, server.restateUrl!, { force: true });

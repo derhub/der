@@ -14,8 +14,8 @@ import type { AnyTool } from "@tanstack/ai";
 import { createExecuteTool } from "../src/code-mode/execute";
 import { codeModeInstructions } from "../src/code-mode/instructions";
 import { createSearchTool } from "../src/code-mode/search";
+import { createFixtureCapabilities } from "../src/capabilities/fixture";
 import { startServer, type RunningServer } from "../src/main";
-import { createFixtureTools } from "../src/workflows/index";
 import { createTempDatabase, waitUntil } from "./fixtures/restate-harness";
 import {
   admitOwningRun,
@@ -69,7 +69,6 @@ async function startDirectServer(
       seedFixture: true,
       scriptGuestArtifactPath: guestArtifactPath,
     },
-    tools: createFixtureTools(),
     catalog: host.catalog,
     ...(options.engines === undefined ? {} : { engines: options.engines }),
   });
@@ -421,5 +420,82 @@ describe("describe the tools to the model", () => {
     expect(text).toContain("`await` every call");
     expect(text).toContain("including the text `import(` and a method named `.import(`");
     expect(text).toContain("`Date`, `Math.random` and `performance.now` return recorded values");
+  }, 60_000);
+});
+
+describe("give the engine its host tools", () => {
+  it("gives a fixture-engine run exactly search and execute", async () => {
+    const { server } = await startDirectServer();
+    const { run } = await server.coordinator.admit({
+      botId: server.seededFixture!.bot.id,
+      sessionId: server.seededFixture!.session.id,
+      origin: "http",
+      idempotencyKey: "code-mode-host-tools",
+      input: { parts: [{ type: "text", text: "tools:" }] },
+    });
+
+    await waitUntil(async () => server.store.getRun(run.id)?.status === "completed", {
+      timeoutMs: 10_000,
+      label: "run completed",
+    });
+
+    expect(
+      server.store
+        .listMessages(run.sessionId)
+        .find((message) => message.runId === run.id && message.role === "assistant")?.parts,
+    ).toEqual([{ type: "text", text: "Host tools: search, execute" }]);
+  }, 60_000);
+});
+
+describe("drive a fixture capability through the execute tool", () => {
+  it("raises one approval for the script call and reports the applied effect once it is approved", async () => {
+    const fixture = createFixtureCapabilities();
+    const { server } = await startDirectServer({ extra: fixture.capabilities });
+    const botId = server.seededFixture!.bot.id;
+    const sessionId = server.seededFixture!.session.id;
+    const { run } = await server.coordinator.admit({
+      botId,
+      sessionId,
+      origin: "http",
+      idempotencyKey: "code-mode-fixture-apply",
+      input: { parts: [{ type: "text", text: "lamp-1" }] },
+    });
+
+    const approval = await awaitPendingApproval(server, run.id);
+    const [scriptRun] = server.scriptRunStore.listUnfinished(run.id);
+
+    expect(approval.effect).toEqual({
+      runId: run.id,
+      operationKind: "capability",
+      operationId: "fixture.apply",
+      canonicalArguments: { target: "lamp-1", mode: "apply" },
+      attemptId: `${scriptRun!.id}:1`,
+    });
+    expect(fixture.applied).toEqual([]);
+
+    await decide(server, approval, { run, botId, sessionId }, "approved");
+    await waitUntil(async () => server.store.getRun(run.id)?.status === "completed", {
+      timeoutMs: 10_000,
+      label: "run completed",
+    });
+
+    expect(fixture.applied).toEqual([
+      {
+        operationId: "fixture.apply",
+        attemptId: `${scriptRun!.id}:1`,
+        runId: run.id,
+        canonicalArguments: { target: "lamp-1", mode: "apply" },
+      },
+    ]);
+    expect(
+      server.store
+        .listMessages(sessionId)
+        .find((message) => message.runId === run.id && message.role === "assistant")?.parts,
+    ).toEqual([
+      {
+        type: "text",
+        text: 'Applied fixture.apply: {"applied":true,"operationId":"fixture.apply","arguments":{"target":"lamp-1","mode":"apply"}}',
+      },
+    ]);
   }, 60_000);
 });

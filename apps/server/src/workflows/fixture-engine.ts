@@ -2,35 +2,27 @@ import type {
   Engine,
   EngineEvent,
   EngineReadiness,
+  ExecuteResult,
   Run,
   SessionStore,
-  ToolDescriptor,
-  ToolOperation,
-  ToolResult,
-  Tools,
 } from "@der/domain";
+import type { LoadEngineRunInput } from "@der/runtime/engines";
 
-export class UncertainEffectError extends Error {
-  readonly code = "effect.outcome_uncertain";
+const DENIED_TEXT = "Effect execution was denied by operator.";
+const EXPIRED_TEXT = "Approval expired before a decision was recorded.";
 
-  constructor(message: string) {
-    super(message);
-    this.name = "UncertainEffectError";
+function outcomeText(operationId: string, result: ExecuteResult): string {
+  if (result.ok) {
+    return `Applied ${operationId}: ${JSON.stringify(result.result)}`;
   }
+  return result.error.kind === "denied" ? DENIED_TEXT : EXPIRED_TEXT;
 }
 
-export interface FixtureToolRecord {
-  readonly operationId: string;
-  readonly attemptId: string;
-  readonly runId: string;
-  readonly canonicalArguments: unknown;
-}
-
-export interface FixtureToolsOptions {
-  readonly onInvoke?: (operation: ToolOperation) => void | Promise<void>;
-}
-
-export function createFixtureEngine(store: SessionStore): Engine {
+export function createFixtureEngine(
+  store: SessionStore,
+  loadRunInput: LoadEngineRunInput,
+  shutdown?: AbortSignal,
+): Engine {
   return {
     kind: "fixture",
     async diagnose(): Promise<EngineReadiness> {
@@ -47,6 +39,20 @@ export function createFixtureEngine(store: SessionStore): Engine {
       const triggerMessage = messages.find((msg) => msg.runId === run.id && msg.role === "user");
       const firstText = triggerMessage?.parts.find((part) => part.type === "text")?.text ?? "";
       const messageId = `msg_stream_${run.id}`;
+
+      function* reply(content: string, key = "1"): Generator<EngineEvent> {
+        yield {
+          type: "chunk",
+          chunkKey: `${run.id}:delta:${key}`,
+          chunk: { type: "TEXT_MESSAGE_CONTENT", messageId, delta: content },
+        };
+        yield {
+          type: "chunk",
+          chunkKey: `${run.id}:msg-end`,
+          chunk: { type: "TEXT_MESSAGE_END", messageId },
+        };
+        yield { type: "completed", finalMessage: { parts: [{ type: "text", text: content }] } };
+      }
 
       yield {
         type: "chunk",
@@ -78,30 +84,14 @@ export function createFixtureEngine(store: SessionStore): Engine {
       };
 
       if (firstText.startsWith("direct:")) {
-        const reply = firstText.slice("direct:".length).trim() || "Fixture direct reply.";
-        yield {
-          type: "chunk",
-          chunkKey: `${run.id}:delta:1`,
-          chunk: {
-            type: "TEXT_MESSAGE_CONTENT",
-            messageId,
-            delta: reply,
-          },
-        };
-        yield {
-          type: "chunk",
-          chunkKey: `${run.id}:msg-end`,
-          chunk: {
-            type: "TEXT_MESSAGE_END",
-            messageId,
-          },
-        };
-        yield {
-          type: "completed",
-          finalMessage: {
-            parts: [{ type: "text", text: reply }],
-          },
-        };
+        yield* reply(firstText.slice("direct:".length).trim() || "Fixture direct reply.");
+        return;
+      }
+
+      if (firstText.startsWith("tools:")) {
+        const input = await loadRunInput(run);
+        const names = (input.tools ?? []).map((tool) => tool.name).join(", ");
+        yield* reply(`Host tools: ${names}`);
         return;
       }
 
@@ -109,6 +99,8 @@ export function createFixtureEngine(store: SessionStore): Engine {
       const target = isUncertain
         ? firstText.slice("uncertain:".length).trim() || "sensor-1"
         : firstText.trim() || "lamp-1";
+      const operationId = isUncertain ? "fixture.uncertain" : "fixture.apply";
+      const mode = isUncertain ? "uncertain" : "apply";
 
       yield {
         type: "chunk",
@@ -120,104 +112,55 @@ export function createFixtureEngine(store: SessionStore): Engine {
         },
       };
 
+      const execute = (await loadRunInput(run)).tools?.find((tool) => tool.name === "execute");
+      if (execute?.execute === undefined) {
+        yield {
+          type: "failed",
+          code: "engine.fixture_failed",
+          detail: "The execute host tool is not available to the fixture engine.",
+        };
+        return;
+      }
+
+      const toolCallId = `${run.id}:execute`;
+      const script = `return await der.${operationId}(${JSON.stringify({ target, mode })});`;
       yield {
-        type: "approval_required",
-        effect: {
-          runId: run.id,
-          operationKind: "fixture",
-          operationId: isUncertain ? "fixture.uncertain" : "fixture.apply",
-          canonicalArguments: { target, mode: isUncertain ? "uncertain" : "apply" },
-          attemptId: "attempt-1",
-        },
-        prompt: `Approve ${isUncertain ? "fixture.uncertain" : "fixture.apply"} for ${target}?`,
+        type: "chunk",
+        chunkKey: `${toolCallId}:start`,
+        chunk: { type: "TOOL_CALL_START", toolCallId, toolCallName: "execute" },
       };
-    },
-  };
-}
+      yield {
+        type: "chunk",
+        chunkKey: `${toolCallId}:args`,
+        chunk: { type: "TOOL_CALL_ARGS", toolCallId, delta: JSON.stringify({ script }) },
+      };
+      yield {
+        type: "chunk",
+        chunkKey: `${toolCallId}:end`,
+        chunk: { type: "TOOL_CALL_END", toolCallId },
+      };
 
-export function createFixtureTools(options?: FixtureToolsOptions): Tools & {
-  readonly applied: FixtureToolRecord[];
-} {
-  const applied: FixtureToolRecord[] = [];
-  const descriptors: readonly ToolDescriptor[] = [
-    {
-      kind: "fixture",
-      id: "fixture.apply",
-      name: "Fixture Apply",
-      description: "Applies one deterministic credential-free fixture effect.",
-      requiresApproval: true,
-      inputSchema: {
-        type: "object",
-        properties: {
-          target: { type: "string" },
-          mode: { type: "string" },
-        },
-      },
-    },
-    {
-      kind: "fixture",
-      id: "fixture.uncertain",
-      name: "Fixture Uncertain",
-      description: "Simulates a dispatched effect whose upstream response is lost.",
-      requiresApproval: true,
-      inputSchema: {
-        type: "object",
-        properties: {
-          target: { type: "string" },
-          mode: { type: "string" },
-        },
-      },
-    },
-  ];
-
-  return {
-    applied,
-    async list() {
-      return descriptors;
-    },
-    async invoke(operation: ToolOperation): Promise<ToolResult> {
-      await options?.onInvoke?.(operation);
-      const { effect } = operation;
-      if (effect.operationKind !== "fixture") {
-        return {
-          ok: false,
-          isError: true,
-          outcome: null,
-          detail: `Unsupported host operation kind "${effect.operationKind}".`,
-        };
+      const result = (await execute.execute({ script }, { signal: shutdown })) as ExecuteResult;
+      if (shutdown?.aborted) {
+        // The process is closing: this attempt is abandoned and the next process resumes the Run.
+        await new Promise<never>(() => {});
       }
-
-      if (effect.operationId === "fixture.uncertain") {
-        throw new UncertainEffectError(
-          `Upstream response lost after dispatching ${effect.operationId} for run ${effect.runId}.`,
-        );
-      }
-
-      if (effect.operationId !== "fixture.apply") {
-        return {
-          ok: false,
-          isError: true,
-          outcome: null,
-          detail: `Unrecognized fixture operation "${effect.operationId}".`,
-        };
-      }
-
-      applied.push({
-        operationId: effect.operationId,
-        attemptId: effect.attemptId,
-        runId: effect.runId,
-        canonicalArguments: effect.canonicalArguments,
-      });
-
-      return {
-        ok: true,
-        isError: false,
-        outcome: {
-          applied: true,
-          operationId: effect.operationId,
-          arguments: effect.canonicalArguments,
+      yield {
+        type: "chunk",
+        chunkKey: `${toolCallId}:result`,
+        chunk: {
+          type: "TOOL_CALL_RESULT",
+          messageId,
+          toolCallId,
+          content: JSON.stringify(result),
         },
       };
+
+      if (!result.ok && result.error.kind !== "denied" && result.error.kind !== "expired") {
+        yield { type: "failed", code: "engine.fixture_failed", detail: result.error.message };
+        return;
+      }
+      yield* reply(outcomeText(operationId, result), "post-approval");
     },
   };
 }

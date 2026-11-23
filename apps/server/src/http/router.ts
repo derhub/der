@@ -12,6 +12,7 @@ import {
   type ApprovalEffectStore,
   type BotId,
   type BotStore,
+  type Catalog,
   type Engine,
   type EngineKind,
   type EngineReadiness,
@@ -24,7 +25,6 @@ import {
   type RoutineStore,
   type RunStore,
   type SessionStore,
-  type Tools,
 } from "@der/domain";
 import { compileSchema } from "@der/domain/compiled";
 import type { SkillCatalog } from "@der/runtime/context";
@@ -106,6 +106,8 @@ export interface HttpRoutinePort extends Pick<RoutineStore, "getRoutine"> {
   listSlots(routineId: RoutineId): MaybePromise<readonly RoutineSlot[]>;
 }
 
+export type HttpSkillPort = Pick<SkillCatalog, "loadCatalog" | "listSkills" | "readSkillBody">;
+
 export interface HttpRouterDeps {
   readonly bots: BotStore;
   readonly sessions: SessionStore;
@@ -113,8 +115,8 @@ export interface HttpRouterDeps {
   readonly approvals: ApprovalEffectStore;
   readonly memory: HttpMemoryPort;
   readonly routines: HttpRoutinePort;
-  readonly skills: SkillCatalog;
-  readonly tools: Tools;
+  readonly skills: HttpSkillPort;
+  readonly catalog: Catalog;
   readonly workflow: DurableWorkflow;
   readonly routineSchedule: RoutineScheduleClient;
   readonly engines: ReadonlyMap<EngineKind, Engine>;
@@ -160,7 +162,7 @@ function parsePositiveIntParam(
 function createHealthRoutes(deps: {
   readonly now: () => Date;
   readonly engines: ReadonlyMap<EngineKind, Engine>;
-  readonly tools: Tools;
+  readonly catalog: Catalog;
 }): Hono {
   const routes = new Hono();
 
@@ -189,15 +191,12 @@ function createHealthRoutes(deps: {
     return jsonResponse({ engines: readiness });
   });
 
-  routes.get("/api/tools", async () => {
-    const listed = deps.tools.list ? await deps.tools.list() : [];
-    return jsonResponse({ tools: listed });
-  });
+  routes.get("/api/capabilities", () => jsonResponse({ capabilities: deps.catalog.list() }));
 
   return routes;
 }
 
-function createSkillRoutes(deps: { readonly skills: SkillCatalog }): Hono {
+function createSkillRoutes(deps: { readonly skills: HttpSkillPort }): Hono {
   const routes = new Hono();
 
   routes.get("/api/skills", async () => {
@@ -679,7 +678,7 @@ export function createHttpApp(deps: HttpRouterDeps): Hono {
   app.onError(problemErrorHandler);
   app.use("*", sameOriginMiddleware(deps.config.allowedOrigins));
 
-  app.route("/", createHealthRoutes({ now, engines: deps.engines, tools: deps.tools }));
+  app.route("/", createHealthRoutes({ now, engines: deps.engines, catalog: deps.catalog }));
   app.route("/", createSkillRoutes({ skills: deps.skills }));
   app.route("/", createBotRoutes({ bots: deps.bots }));
   app.route("/", createMemoryRoutes({ bots: deps.bots, memory: deps.memory }));

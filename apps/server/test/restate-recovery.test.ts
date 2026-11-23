@@ -7,7 +7,6 @@ import {
 } from "@der/domain";
 import { compiledParsers } from "@der/domain/compiled";
 import { startServer, type RunningServer } from "../src/main";
-import { createFixtureTools } from "../src/workflows/index";
 import {
   allocateLocalTcpNumber,
   collectSseFrames,
@@ -18,13 +17,16 @@ import {
   type LocalRestateHandle,
   type TempDatabaseHandle,
 } from "./fixtures/restate-harness";
+import { createFixtureHost, ensureScriptGuest } from "./fixtures/script-host";
 
 let restateHandle: LocalRestateHandle | undefined;
+let guestArtifactPath = "";
 const cleanups: (() => Promise<void> | void)[] = [];
 
 beforeAll(async () => {
   restateHandle = await ensureLocalRestate();
-}, 30_000);
+  guestArtifactPath = await ensureScriptGuest();
+}, 120_000);
 
 afterEach(async () => {
   while (cleanups.length > 0) {
@@ -46,7 +48,7 @@ describe("recover a pending approval across Bun deployment replacement with Rest
     cleanups.push(() => tempDb.cleanup());
 
     const sharedRestateListen = await allocateLocalTcpNumber();
-    const toolsFirst = createFixtureTools();
+    const fixtureFirst = createFixtureHost();
     let serverFirst: RunningServer | undefined = await startServer({
       config: {
         host: "127.0.0.1",
@@ -65,8 +67,9 @@ describe("recover a pending approval across Bun deployment replacement with Rest
         ssePollIntervalMs: 20,
         sseKeepAliveMs: 5_000,
         seedFixture: true,
+        scriptGuestArtifactPath: guestArtifactPath,
       },
-      tools: toolsFirst,
+      catalog: fixtureFirst.catalog,
     });
     cleanups.push(async () => {
       if (serverFirst) {
@@ -122,7 +125,7 @@ describe("recover a pending approval across Bun deployment replacement with Rest
 
     const approval = waitingBeforeRestart.approval!;
     expect(approval.decision.status).toBe("pending");
-    expect(toolsFirst.applied).toHaveLength(0);
+    expect(fixtureFirst.applied).toHaveLength(0);
     expect(
       serverFirst.store
         .listOutboxEvents({ eventId: `approval:${approval.id}` })
@@ -147,7 +150,7 @@ describe("recover a pending approval across Bun deployment replacement with Rest
     serverFirst = undefined;
     await firstServerToClose.close();
 
-    const toolsReplacement = createFixtureTools();
+    const fixtureReplacement = createFixtureHost();
     const serverReplacement = await startServer({
       config: {
         host: "127.0.0.1",
@@ -166,8 +169,9 @@ describe("recover a pending approval across Bun deployment replacement with Rest
         ssePollIntervalMs: 20,
         sseKeepAliveMs: 5_000,
         seedFixture: false,
+        scriptGuestArtifactPath: guestArtifactPath,
       },
-      tools: toolsReplacement,
+      catalog: fixtureReplacement.catalog,
     });
     cleanups.push(() => serverReplacement.close());
 
@@ -248,16 +252,19 @@ describe("recover a pending approval across Bun deployment replacement with Rest
     );
 
     expect(completedRun.status).toBe("completed");
-    expect(toolsFirst.applied).toHaveLength(0);
-    expect(toolsReplacement.applied).toHaveLength(1);
-    expect(toolsReplacement.applied[0]).toMatchObject({
+    expect(fixtureFirst.applied).toHaveLength(0);
+    expect(fixtureReplacement.applied).toHaveLength(1);
+    expect(fixtureReplacement.applied[0]).toMatchObject({
       runId,
       operationId: "fixture.apply",
-      attemptId: "attempt-1",
+      attemptId: approval.effect.attemptId,
       canonicalArguments: { target: "lamp-recovery", mode: "apply" },
     });
 
-    const effectRecord = serverReplacement.store.getEffect(approval.effect);
+    const effectRecord = serverReplacement.store.getEffect({
+      ...approval.effect,
+      operationKind: "capability",
+    });
     expect(effectRecord?.status).toBe("completed");
     expect(
       serverReplacement.store
@@ -306,6 +313,7 @@ describe("recover a pending approval across Bun deployment replacement with Rest
         ssePollIntervalMs: 20,
         sseKeepAliveMs: 5_000,
         seedFixture: true,
+        scriptGuestArtifactPath: guestArtifactPath,
       },
     });
     cleanups.push(() => server.close());
@@ -354,6 +362,8 @@ describe("recover a pending approval across Bun deployment replacement with Rest
     });
 
     expect(interrupted.status).toBe("interrupted");
-    expect(server.store.getEffect(waiting.approval!.effect)?.status).toBe("unknown");
+    expect(
+      server.store.getEffect({ ...waiting.approval!.effect, operationKind: "capability" })?.status,
+    ).toBe("unknown");
   }, 45_000);
 });

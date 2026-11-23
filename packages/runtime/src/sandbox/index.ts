@@ -23,7 +23,6 @@ export {
 export {
   createDockerSandbox,
   createHardenedDockerProvider,
-  DOCKER_TOOL_DESCRIPTOR,
   type DockerSandboxConfig,
   type HardenedDockerProviderConfig,
 } from "./docker-sandbox";
@@ -39,7 +38,6 @@ export {
   validateWasmerDirectoryGrants,
   validateWasmerGuestPin,
   WASMER_RUNNER_CONTRACT,
-  WASMER_TOOL_DESCRIPTOR,
   type WasmerDirectoryGrant,
   type WasmerGrantPolicy,
   type WasmerGuestKind,

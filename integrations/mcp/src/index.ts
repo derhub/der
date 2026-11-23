@@ -1,9 +1,3 @@
-export {
-  createExactApprovalVerifier,
-  deniedToolResult,
-  effectIdentityMatches,
-  type ApprovalVerifier,
-} from "./authorization";
 export { redactSecrets, ToolConfigurationError, ToolEffectUncertainError } from "./errors";
 export {
   createMcpIntegration,

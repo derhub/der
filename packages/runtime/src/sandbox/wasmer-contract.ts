@@ -1,6 +1,5 @@
 import { realpathSync } from "node:fs";
 import { posix } from "node:path";
-import type { ToolDescriptor } from "@der/domain";
 import { SandboxControlError } from "./errors";
 
 export type WasmerRealPathResolver = (path: string) => string;
@@ -53,26 +52,6 @@ export const WASMER_RUNNER_CONTRACT: WasmerRunnerContract = {
     },
   },
 } as const;
-
-export const WASMER_TOOL_DESCRIPTOR: ToolDescriptor = {
-  kind: "wasmer",
-  id: "wasmer.execute",
-  name: "Wasmer Guest Execute",
-  description:
-    "Run a pinned Bash or Python WASI/WASIX guest with explicit directory grants and no network.",
-  requiresApproval: true,
-  inputSchema: {
-    type: "object",
-    properties: {
-      command: { type: "string", enum: ["bash", "python"] },
-      args: { type: "array", items: { type: "string" } },
-      readonlyPaths: { type: "array", items: { type: "string" } },
-      writablePaths: { type: "array", items: { type: "string" } },
-      timeoutMs: { type: "integer", minimum: 1 },
-    },
-    required: ["command", "args", "timeoutMs"],
-  },
-};
 
 const SHA256_DIGEST_PATTERN = /^sha256:[0-9a-f]{64}$/;
 const FLOATING_TAG_PATTERN = /(?:^|@|:)(?:latest|main|master|nightly|edge|canary)$/i;

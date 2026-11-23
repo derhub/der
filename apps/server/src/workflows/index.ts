@@ -11,13 +11,7 @@ export {
   type DirectWorkflowDriver,
   type DirectWorkflowDriverOptions,
 } from "./direct-workflow";
-export {
-  createFixtureEngine,
-  createFixtureTools,
-  UncertainEffectError,
-  type FixtureToolRecord,
-  type FixtureToolsOptions,
-} from "./fixture-engine";
+export { createFixtureEngine } from "./fixture-engine";
 export {
   createCommandsService,
   createRestateFetchHandler,
@@ -51,17 +45,13 @@ export {
   type UnattendedEligibilityResult,
 } from "./routine-schedule";
 export {
-  executeApprovedEffectStep,
   executeEnginePreApprovalStage,
-  finalizeCompletedWithEffectStep,
   finalizeDirectRunStep,
   finalizeInterruptedUncertainStep,
-  finalizeRejectedApprovalStep,
   loadAndStartRunStep,
   persistPendingApprovalStep,
   reconcileApprovalExpiryStep,
   type ApprovalDecisionPayload,
-  type ApprovedEffectStepResult,
   type AwaitApprovalInput,
   type AwaitApprovalOutcome,
   type DurableWorkflow,

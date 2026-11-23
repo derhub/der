@@ -19,12 +19,9 @@ import {
   type RunId,
   type RunRequest,
   type RunStore,
-  type ToolResult,
-  type Tools,
   type UtcTimestamp,
   type Workflow,
 } from "@der/domain";
-import { UncertainEffectError } from "./fixture-engine";
 
 export interface AwaitApprovalInput {
   readonly run: Run;
@@ -52,11 +49,9 @@ export type WorkflowStore = RunStore & ApprovalEffectStore;
 export interface WorkflowDeps {
   readonly store: WorkflowStore;
   readonly engines: ReadonlyMap<EngineKind, Engine>;
-  readonly tools: Tools;
   readonly approvalTimeoutMs: number;
   readonly eventBatchSize?: number;
   readonly now?: () => Date;
-  readonly reconcileEffect?: (effect: EffectIdentity) => Promise<ToolResult | undefined>;
   readonly onRunFinished?: (run: Run) => Promise<void>;
 }
 
@@ -70,11 +65,6 @@ async function finishRunAndNotify(
 }
 
 export type PreApprovalStageResult =
-  | {
-      readonly kind: "approval_required";
-      readonly effect: EffectIdentity;
-      readonly prompt: string;
-    }
   | {
       readonly kind: "completed";
       readonly finalMessageParts?: readonly MessagePart[];
@@ -90,18 +80,6 @@ export type PreApprovalStageResult =
       readonly detail: string;
     };
 
-export type ApprovedEffectStepResult =
-  | {
-      readonly kind: "executed";
-      readonly toolResult: ToolResult;
-      readonly reused: boolean;
-    }
-  | {
-      readonly kind: "uncertain";
-      readonly effectId: EffectId;
-      readonly detail: string;
-    };
-
 export interface ApprovalDecisionPayload {
   readonly approvalId: ApprovalId;
   readonly status: "approved" | "denied" | "expired";
@@ -110,6 +88,15 @@ export interface ApprovalDecisionPayload {
 }
 
 const DEFAULT_EVENT_BATCH_SIZE = 8;
+
+function isToolCallEnd(chunk: JsonValue): boolean {
+  return (
+    typeof chunk === "object" &&
+    chunk !== null &&
+    !Array.isArray(chunk) &&
+    chunk["type"] === "TOOL_CALL_END"
+  );
+}
 
 export async function loadAndStartRunStep(
   deps: WorkflowDeps,
@@ -209,21 +196,13 @@ export async function executeEnginePreApprovalStage(
           chunk: event.chunk,
           ...(event.isTerminal !== undefined ? { isTerminal: event.isTerminal } : {}),
         });
-        if (pendingChunks.length >= batchSize) {
+        if (pendingChunks.length >= batchSize || isToolCallEnd(event.chunk)) {
           await flush();
         }
         continue;
       }
 
       await flush();
-
-      if (event.type === "approval_required") {
-        return {
-          kind: "approval_required",
-          effect: event.effect,
-          prompt: event.prompt,
-        };
-      }
 
       if (event.type === "completed") {
         const postInterrupted = await readInterruptedStage();
@@ -252,12 +231,6 @@ export async function executeEnginePreApprovalStage(
     );
     if (interrupted) {
       return interrupted;
-    }
-    if (error instanceof UncertainEffectError) {
-      return {
-        kind: "interrupted",
-        detail: error.message,
-      };
     }
     throw error;
   }
@@ -354,198 +327,6 @@ export async function reconcileApprovalExpiryStep(
   }
 }
 
-function toolResultToJson(result: ToolResult): JsonValue {
-  return {
-    ok: result.ok,
-    outcome: result.outcome,
-    isError: result.isError,
-    ...(result.detail !== undefined ? { detail: result.detail } : {}),
-  };
-}
-
-export async function executeApprovedEffectStep(
-  deps: Pick<WorkflowDeps, "store" | "tools" | "reconcileEffect">,
-  input: {
-    readonly run: Run;
-    readonly approvalId: ApprovalId;
-    readonly effect: EffectIdentity;
-  },
-): Promise<ApprovedEffectStepResult> {
-  const begin = await deps.store.beginEffect(input.effect, { approvalId: input.approvalId });
-
-  if (begin.kind === "completed") {
-    const outcome = begin.effect.outcome as ToolResult | null;
-    return {
-      kind: "executed",
-      toolResult: outcome ?? { ok: true, outcome: null, isError: false },
-      reused: true,
-    };
-  }
-
-  if (begin.kind === "ambiguous") {
-    if (deps.reconcileEffect) {
-      const reconciled = await deps.reconcileEffect(input.effect);
-      if (reconciled !== undefined) {
-        await deps.store.completeEffect(begin.effect.id, toolResultToJson(reconciled));
-        return {
-          kind: "executed",
-          toolResult: reconciled,
-          reused: true,
-        };
-      }
-    }
-    await deps.store.markEffectUnknown(begin.effect.id);
-    return {
-      kind: "uncertain",
-      effectId: begin.effect.id,
-      detail: `Effect ${input.effect.operationKind}:${input.effect.operationId} (${input.effect.attemptId}) had a prior started marker with uncertain outcome.`,
-    };
-  }
-
-  try {
-    const toolResult = await deps.tools.invoke({ effect: input.effect });
-    await deps.store.completeEffect(begin.effect.id, toolResultToJson(toolResult));
-    return {
-      kind: "executed",
-      toolResult,
-      reused: false,
-    };
-  } catch (error) {
-    if (error instanceof UncertainEffectError) {
-      await deps.store.markEffectUnknown(begin.effect.id);
-      return {
-        kind: "uncertain",
-        effectId: begin.effect.id,
-        detail: error.message,
-      };
-    }
-    await deps.store.markEffectUnknown(begin.effect.id);
-    return {
-      kind: "uncertain",
-      effectId: begin.effect.id,
-      detail: error instanceof Error ? error.message : "Unknown error during effect execution.",
-    };
-  }
-}
-
-export async function finalizeCompletedWithEffectStep(
-  deps: WorkflowDeps,
-  input: {
-    readonly run: Run;
-    readonly effect: EffectIdentity;
-    readonly toolResult: ToolResult;
-  },
-): Promise<Run> {
-  const messageId = `msg_stream_${input.run.id}`;
-  const summaryText = input.toolResult.ok
-    ? `Applied ${input.effect.operationId}: ${JSON.stringify(input.toolResult.outcome)}`
-    : `Operation ${input.effect.operationId} failed: ${input.toolResult.detail ?? "error"}`;
-
-  await deps.store.appendRunEvents(input.run.id, [
-    {
-      chunkKey: `${input.run.id}:effect:${input.effect.attemptId}:result`,
-      chunk: {
-        type: "TOOL_CALL_RESULT",
-        messageId,
-        toolCallId: input.effect.attemptId,
-        content: JSON.stringify(input.toolResult),
-      },
-    },
-    {
-      chunkKey: `${input.run.id}:delta:post-approval`,
-      chunk: {
-        type: "TEXT_MESSAGE_CONTENT",
-        messageId,
-        delta: summaryText,
-      },
-    },
-    {
-      chunkKey: `${input.run.id}:msg-end`,
-      chunk: {
-        type: "TEXT_MESSAGE_END",
-        messageId,
-      },
-    },
-  ]);
-
-  const finished = await finishRunAndNotify(deps, {
-    runId: input.run.id,
-    status: "completed",
-    terminalEvent: {
-      chunkKey: `${input.run.id}:terminal`,
-      chunk: {
-        type: "RUN_FINISHED",
-        threadId: input.run.sessionId,
-        runId: input.run.id,
-      },
-    },
-    finalMessageParts: [{ type: "text", text: summaryText }],
-  });
-
-  return finished.run;
-}
-
-export async function finalizeRejectedApprovalStep(
-  deps: WorkflowDeps,
-  input: {
-    readonly run: Run;
-    readonly approvalId: ApprovalId;
-    readonly status: "denied" | "expired";
-  },
-): Promise<Run> {
-  const messageId = `msg_stream_${input.run.id}`;
-  const replyText =
-    input.status === "denied"
-      ? "Effect execution was denied by operator."
-      : "Approval expired before a decision was recorded.";
-
-  await deps.store.appendRunEvents(input.run.id, [
-    {
-      chunkKey: `${input.run.id}:approval:${input.approvalId}:${input.status}`,
-      chunk: {
-        type: "CUSTOM",
-        name: "approval.settled",
-        value: {
-          approvalId: input.approvalId,
-          status: input.status,
-        },
-      },
-    },
-    {
-      chunkKey: `${input.run.id}:delta:rejected`,
-      chunk: {
-        type: "TEXT_MESSAGE_CONTENT",
-        messageId,
-        delta: replyText,
-      },
-    },
-    {
-      chunkKey: `${input.run.id}:msg-end`,
-      chunk: {
-        type: "TEXT_MESSAGE_END",
-        messageId,
-      },
-    },
-  ]);
-
-  const finished = await finishRunAndNotify(deps, {
-    runId: input.run.id,
-    status: input.status === "denied" ? "completed" : "cancelled",
-    terminalEvent: {
-      chunkKey: `${input.run.id}:terminal`,
-      chunk: {
-        type: "RUN_FINISHED",
-        threadId: input.run.sessionId,
-        runId: input.run.id,
-      },
-    },
-    finalMessageParts: [{ type: "text", text: replyText }],
-    detail: replyText,
-  });
-
-  return finished.run;
-}
-
 export async function finalizeInterruptedUncertainStep(
   deps: Pick<WorkflowDeps, "store" | "now" | "onRunFinished">,
   input: {
@@ -582,7 +363,7 @@ export async function finalizeDirectRunStep(
   deps: WorkflowDeps,
   input: {
     readonly run: Run;
-    readonly outcome: Exclude<PreApprovalStageResult, { readonly kind: "approval_required" }>;
+    readonly outcome: PreApprovalStageResult;
   },
 ): Promise<Run> {
   const current = await deps.store.getRun(input.run.id);

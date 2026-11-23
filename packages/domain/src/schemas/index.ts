@@ -75,18 +75,12 @@ export {
   engineReadiness,
   sandboxRequest,
   sandboxResult,
-  toolDescriptor,
-  toolOperation,
-  toolResult,
   type CapabilityDescriptor,
   type CapabilitySearchHit,
   type EngineEvent,
   type EngineReadiness,
   type SandboxRequest,
   type SandboxResult,
-  type ToolDescriptor,
-  type ToolOperation,
-  type ToolResult,
 } from "./execution";
 export { memoryRecord, memoryWriteInput, type MemoryRecord, type MemoryWriteInput } from "./memory";
 export {

@@ -1,4 +1,4 @@
-import type { Sandbox, SandboxRequest, SandboxResult, ToolDescriptor } from "@der/domain";
+import type { Sandbox, SandboxRequest, SandboxResult } from "@der/domain";
 import { compiledParsers } from "@der/domain/compiled";
 import {
   createExecBackedGit,
@@ -30,24 +30,6 @@ import {
 } from "./docker-policy";
 import { SandboxControlError } from "./errors";
 import { bunCommandRunner, type CommandRunner } from "./process-runner";
-
-export const DOCKER_TOOL_DESCRIPTOR: ToolDescriptor = {
-  kind: "docker",
-  id: "docker.execute",
-  name: "Hardened Docker Sandbox Execute",
-  description: "Run a bounded command inside a hardened rootless Docker container.",
-  requiresApproval: true,
-  inputSchema: {
-    type: "object",
-    properties: {
-      command: { type: "string" },
-      args: { type: "array", items: { type: "string" } },
-      timeoutMs: { type: "integer", minimum: 1 },
-      network: { type: "string", enum: ["none", "scoped_egress"] },
-    },
-    required: ["command", "args", "timeoutMs", "network"],
-  },
-};
 
 export interface HardenedDockerProviderConfig {
   readonly dockerHost: string;

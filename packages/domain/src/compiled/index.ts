@@ -34,9 +34,6 @@ import {
   session,
   skill,
   skillFrontmatter,
-  toolDescriptor,
-  toolOperation,
-  toolResult,
   updateBotInput,
 } from "../schemas/index";
 
@@ -82,7 +79,4 @@ export const compiledParsers = {
   sandboxResult: compileSchema(sandboxResult),
   capabilityDescriptor: compileSchema(capabilityDescriptor),
   capabilitySearchHit: compileSchema(capabilitySearchHit),
-  toolDescriptor: compileSchema(toolDescriptor),
-  toolOperation: compileSchema(toolOperation),
-  toolResult: compileSchema(toolResult),
 } as const;

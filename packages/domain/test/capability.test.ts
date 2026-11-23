@@ -268,10 +268,35 @@ describe("register capabilities", () => {
     ).rejects.toMatchObject({ code: "integration.duplicate_capability_id" });
   });
 
-  it("keeps defineTool tools working beside capabilities", async () => {
+  it("adds the capabilities an integration lists at start", async () => {
     const registry = await registryWith(readWeather);
+    await registry.register(
+      defineIntegration({
+        id: "remote",
+        setup: () => ({ listCapabilities: async () => [appendNote] }),
+      }),
+    );
 
-    expect(await registry.list()).toEqual([]);
+    await registry.start();
+
+    expect(registry.catalog.list().map((entry) => entry.id)).toEqual([
+      "notes.append",
+      "weather.read",
+    ]);
+  });
+
+  it("fails start when a listed capability reuses a registered id and adds none of that integration's capabilities", async () => {
+    const registry = await registryWith(readWeather);
+    await registry.register(
+      defineIntegration({
+        id: "remote",
+        setup: () => ({ listCapabilities: async () => [appendNote, readWeather] }),
+      }),
+    );
+
+    await expect(registry.start()).rejects.toMatchObject({
+      code: "integration.duplicate_capability_id",
+    });
     expect(registry.catalog.list().map((entry) => entry.id)).toEqual(["weather.read"]);
   });
 });

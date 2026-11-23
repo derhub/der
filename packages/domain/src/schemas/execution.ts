@@ -1,5 +1,4 @@
 import * as z from "zod";
-import { effectIdentity, effectOperationKind } from "./approval";
 import { engineKind, jsonValue } from "./common";
 import { messagePart } from "./message";
 
@@ -9,11 +8,6 @@ export const engineEvent = z.discriminatedUnion("type", [
     chunkKey: z.string().min(1),
     chunk: jsonValue,
     isTerminal: z.boolean().optional(),
-  }),
-  z.object({
-    type: z.literal("approval_required"),
-    effect: effectIdentity,
-    prompt: z.string().min(1),
   }),
   z.object({
     type: z.literal("completed"),
@@ -61,29 +55,6 @@ export const sandboxResult = z.object({
   durationMs: z.number().nonnegative(),
 });
 export type SandboxResult = z.infer<typeof sandboxResult>;
-
-export const toolDescriptor = z.object({
-  kind: effectOperationKind,
-  id: z.string().min(1),
-  name: z.string().min(1),
-  description: z.string(),
-  requiresApproval: z.boolean(),
-  inputSchema: jsonValue,
-});
-export type ToolDescriptor = z.infer<typeof toolDescriptor>;
-
-export const toolOperation = z.object({
-  effect: effectIdentity,
-});
-export type ToolOperation = z.infer<typeof toolOperation>;
-
-export const toolResult = z.object({
-  ok: z.boolean(),
-  outcome: jsonValue,
-  isError: z.boolean(),
-  detail: z.string().optional(),
-});
-export type ToolResult = z.infer<typeof toolResult>;
 
 export const capabilityDescriptor = z.object({
   id: z.string().min(1),

@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it } from "bun:test";
+import { afterEach, beforeAll, describe, expect, it } from "bun:test";
 import { Hono } from "hono";
 import {
   PROBLEM_DETAILS_MEDIA_TYPE,
@@ -14,15 +14,20 @@ import {
 import { compiledParsers } from "@der/domain/compiled";
 import { handleRunEventsSse } from "../src/http/sse";
 import { startServer, type RunningServer } from "../src/main";
-import { createFixtureTools } from "../src/workflows/index";
 import {
   collectSseFrames,
   createTempDatabase,
   waitUntil,
   type TempDatabaseHandle,
 } from "./fixtures/restate-harness";
+import { createFixtureHost, ensureScriptGuest } from "./fixtures/script-host";
 
 const cleanups: (() => Promise<void> | void)[] = [];
+let guestArtifactPath = "";
+
+beforeAll(async () => {
+  guestArtifactPath = await ensureScriptGuest();
+}, 120_000);
 
 async function startVerticalSliceServer(options?: {
   readonly approvalTimeoutMs?: number;
@@ -30,7 +35,7 @@ async function startVerticalSliceServer(options?: {
   readonly now?: () => Date;
 }) {
   const tempDb: TempDatabaseHandle = createTempDatabase("der-vertical-");
-  const tools = createFixtureTools();
+  const fixture = createFixtureHost();
   const running: RunningServer = await startServer({
     config: {
       host: "127.0.0.1",
@@ -47,9 +52,10 @@ async function startVerticalSliceServer(options?: {
       ssePollIntervalMs: 15,
       sseKeepAliveMs: 2_000,
       seedFixture: options?.seedFixture ?? true,
+      scriptGuestArtifactPath: guestArtifactPath,
     },
     ...(options?.now ? { now: options.now } : {}),
-    tools,
+    catalog: fixture.catalog,
   });
 
   cleanups.push(async () => {
@@ -57,7 +63,7 @@ async function startVerticalSliceServer(options?: {
     tempDb.cleanup();
   });
 
-  return { server: running, tools, tempDb };
+  return { server: running, fixture, tempDb };
 }
 
 afterEach(async () => {
@@ -174,7 +180,7 @@ describe("serve operator bot, session, health, engine, and origin checks", () =>
 
 describe("enforce exact approval scope, decision replay, key conflicts, and SSE resume through HTTP 204", () => {
   it("runs a fixture approval end to end, enforces scope and key conflicts, and streams SSE with cursor resume and terminal 204", async () => {
-    const { server, tools } = await startVerticalSliceServer({ seedFixture: true });
+    const { server, fixture } = await startVerticalSliceServer({ seedFixture: true });
     const sessionId = server.seededFixture!.session.id;
     const botId = server.seededFixture!.bot.id;
 
@@ -378,17 +384,17 @@ describe("enforce exact approval scope, decision replay, key conflicts, and SSE 
     });
     expect(terminalReconnectRes.status).toBe(204);
 
-    expect(tools.applied).toHaveLength(1);
-    expect(tools.applied[0]?.operationId).toBe("fixture.apply");
+    expect(fixture.applied).toHaveLength(1);
+    expect(fixture.applied[0]?.operationId).toBe("fixture.apply");
     expect(
       server.store
         .listOutboxEvents({ eventId: `chat.replied:${runId}` })
         .map((row) => row.envelope.type),
     ).toEqual(["der.chat.replied"]);
-  });
+  }, 30_000);
 
   it("expires a timed-out approval and interrupts runs on uncertain effects", async () => {
-    const { server, tools } = await startVerticalSliceServer({
+    const { server, fixture } = await startVerticalSliceServer({
       approvalTimeoutMs: 120,
       seedFixture: true,
     });
@@ -409,7 +415,7 @@ describe("enforce exact approval scope, decision replay, key conflicts, and SSE 
     const expiredState = await waitUntil(async () => {
       const res = await fetch(`${server.url}/api/runs/${timeoutAdmission.run.id}`);
       const body = (await res.json()) as { run: Run; approval: Approval | null };
-      return body.run.status === "cancelled" && body.approval?.decision.status === "expired"
+      return body.run.status === "completed" && body.approval?.decision.status === "expired"
         ? body
         : false;
     });
@@ -432,7 +438,7 @@ describe("enforce exact approval scope, decision replay, key conflicts, and SSE 
     expect(compiledParsers.problemDetails.parse(await lateDecisionRes.json()).code).toBe(
       "approval.expired",
     );
-    expect(tools.applied).toHaveLength(0);
+    expect(fixture.applied).toHaveLength(0);
 
     const uncertainServer = await startVerticalSliceServer({
       approvalTimeoutMs: 5_000,
@@ -487,14 +493,17 @@ describe("enforce exact approval scope, decision replay, key conflicts, and SSE 
       return body.run.status === "interrupted" ? body.run : false;
     });
     expect(interruptedRun.status).toBe("interrupted");
-    expect(uncertainServer.server.store.getEffect(pendingUncertain.approval!.effect)?.status).toBe(
-      "unknown",
-    );
-  });
+    expect(
+      uncertainServer.server.store.getEffect({
+        ...pendingUncertain.approval!.effect,
+        operationKind: "capability",
+      })?.status,
+    ).toBe("unknown");
+  }, 30_000);
 
   it("rejects a backdated client decidedAt after the approval deadline with 409 approval.expired", async () => {
     let nowMs = Date.parse("2026-11-22T18:00:00.000Z");
-    const { server, tools } = await startVerticalSliceServer({
+    const { server, fixture } = await startVerticalSliceServer({
       approvalTimeoutMs: 60_000,
       seedFixture: true,
       now: () => new Date(nowMs),
@@ -541,8 +550,8 @@ describe("enforce exact approval scope, decision replay, key conflicts, and SSE 
     expect(compiledParsers.problemDetails.parse(await backdatedRes.json()).code).toBe(
       "approval.expired",
     );
-    expect(tools.applied).toHaveLength(0);
-  });
+    expect(fixture.applied).toHaveLength(0);
+  }, 30_000);
 
   it("omits SSE id on post-header error frames so reconnect resumes cleanly from the last committed cursor", async () => {
     const { server } = await startVerticalSliceServer({ seedFixture: true });

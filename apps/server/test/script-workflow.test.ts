@@ -1,7 +1,6 @@
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "bun:test";
 import { formatUtcTimestamp } from "@der/domain";
 import { startServer, type RunningServer } from "../src/main";
-import { createFixtureTools } from "../src/workflows/index";
 import { createTempDatabase, waitUntil } from "./fixtures/restate-harness";
 import {
   admitOwningRun,
@@ -47,7 +46,6 @@ async function startDirectServer(options: { readonly scriptMaxCalls?: number } =
       scriptGuestArtifactPath: guestArtifactPath,
       ...(options.scriptMaxCalls === undefined ? {} : { scriptMaxCalls: options.scriptMaxCalls }),
     },
-    tools: createFixtureTools(),
     catalog: host.catalog,
   });
   cleanups.push(async () => {
@@ -214,6 +212,59 @@ describe("ask for approval inside a script", () => {
     ).toBeUndefined();
     expect(server.scriptRunStore.get(scriptRun.id)?.status).toBe("failed");
     expect(server.store.getRun(owner.run.id)?.status).toBe("running");
+  }, 60_000);
+});
+
+describe("replay a write against the effects ledger", () => {
+  async function seededScript(server: RunningServer, key: string) {
+    const owner = await admitOwningRun(server, key);
+    const { scriptRun } = await server.scriptRunStore.acquire({
+      runId: owner.run.id,
+      botId: owner.botId,
+      source: `return der.notes.append({ text: "tick" });`,
+    });
+    const effect = {
+      runId: owner.run.id,
+      operationKind: "capability",
+      operationId: "notes.append",
+      canonicalArguments: { text: "tick" },
+      attemptId: `${scriptRun.id}:1`,
+    } as const;
+    const begun = await server.store.beginEffect(effect);
+    return { owner, scriptRun, effect, effectId: begun.effect.id };
+  }
+
+  it("returns the recorded outcome of a completed write without calling the capability again", async () => {
+    const { server, host } = await startDirectServer();
+    const { scriptRun, effectId } = await seededScript(server, "ledger-1");
+    await server.store.completeEffect(effectId, { ok: true, value: { count: 41 } });
+
+    await server.scriptRuns!.submit(scriptRun.id);
+    const result = await server.scriptRuns!.attach(scriptRun.id, AbortSignal.timeout(30_000));
+
+    expect(result).toEqual({ ok: true, result: { count: 41 }, logs: [], truncated: false });
+    expect(host.appended).toEqual([]);
+  }, 60_000);
+
+  it("interrupts the run without calling the capability again when a started write has no recorded outcome", async () => {
+    const { server, host } = await startDirectServer();
+    const { owner, scriptRun, effect } = await seededScript(server, "ledger-2");
+
+    await server.scriptRuns!.submit(scriptRun.id);
+    const result = await server.scriptRuns!.attach(scriptRun.id, AbortSignal.timeout(30_000));
+
+    expect(result).toEqual({
+      ok: false,
+      error: {
+        kind: "capability",
+        message: `Effect capability:notes.append (${effect.attemptId}) had a prior started marker with uncertain outcome.`,
+      },
+      logs: [],
+    });
+    expect(host.appended).toEqual([]);
+    expect(server.store.getEffect(effect)?.status).toBe("unknown");
+    expect(server.store.getRun(owner.run.id)?.status).toBe("interrupted");
+    expect(server.scriptRunStore.get(scriptRun.id)?.status).toBe("interrupted");
   }, 60_000);
 });
 
