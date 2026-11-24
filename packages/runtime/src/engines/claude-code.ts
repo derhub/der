@@ -54,6 +54,7 @@ export interface ClaudeCodeEngineConfig {
   readonly policy?: SandboxPolicy;
   readonly emitDiff?: boolean;
   readonly env?: Record<string, string>;
+  readonly autoCompactTokens?: number;
 }
 
 function withToolBridgeProvisioner(provisioner: ToolBridgeProvisioner) {
@@ -113,6 +114,9 @@ export function createClaudeCodeEngine(config: ClaudeCodeEngineConfig): Engine {
           : {}),
         env: {
           ...DEFAULT_ENGINE_SHADOW_HOMES["claude-code"].envOverrides,
+          ...(config.autoCompactTokens !== undefined
+            ? { CLAUDE_CODE_AUTO_COMPACT_WINDOW: String(config.autoCompactTokens) }
+            : {}),
           ...config.env,
         },
       });
