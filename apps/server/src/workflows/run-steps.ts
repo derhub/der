@@ -6,10 +6,13 @@ import {
   type ApprovalId,
   type ApprovalResolutionInput,
   type ChannelIntakeMetadata,
+  type ContextMode,
   type EffectId,
   type EffectIdentity,
   type Engine,
   type EngineKind,
+  type EngineSession,
+  type EngineSessionStore,
   type FinishRunInput,
   type FinishRunOutcome,
   type JsonValue,
@@ -23,6 +26,7 @@ import {
   type UtcTimestamp,
   type Workflow,
 } from "@der/domain";
+import { readSessionIdChunk } from "@der/runtime/engines";
 import type { ScriptRoutineDeps } from "./script-routine-stage";
 
 export interface AwaitApprovalInput {
@@ -46,10 +50,31 @@ export interface DurableWorkflow extends Workflow {
   awaitApproval?(input: AwaitApprovalInput, signal?: AbortSignal): Promise<AwaitApprovalOutcome>;
 }
 
-export type WorkflowStore = RunStore & ApprovalEffectStore;
+export type WorkflowStore = RunStore & ApprovalEffectStore & EngineSessionStore;
+
+/** How the context loader delivered one Run's context, handed to the engine step that consumes it. */
+export interface TurnRecord {
+  readonly contextMode: ContextMode;
+  /** Vendor session id the engine is asked to resume; absent on a rebuild. */
+  readonly resumedFrom?: string;
+  /** The engine can resume, so a finished turn leaves a vendor session to store. */
+  readonly saveable: boolean;
+  readonly baseHash: string;
+  readonly contextHash: string;
+  readonly lastOrdinal: number;
+}
+
+export type EngineSessionRow = Omit<EngineSession, "pendingRunId" | "updatedAt">;
+
+export interface TurnOutcome {
+  readonly contextMode: ContextMode;
+  readonly save?: EngineSessionRow;
+}
 
 export interface WorkflowDeps {
   readonly store: WorkflowStore;
+  /** Written by the context loader inside the engine step, read and cleared by it. */
+  readonly turns?: Map<RunId, TurnRecord>;
   readonly engines: ReadonlyMap<EngineKind, Engine>;
   readonly approvalTimeoutMs: number;
   readonly eventBatchSize?: number;
@@ -72,6 +97,7 @@ export type RunStageResult =
       readonly kind: "completed";
       readonly finalMessageParts?: readonly MessagePart[];
       readonly usage?: RunUsage;
+      readonly turn?: TurnOutcome;
     }
   | {
       readonly kind: "interrupted";
@@ -131,9 +157,14 @@ export async function loadAndStartRunStep(
   return { run: started, alreadyTerminal: false };
 }
 
+type EngineAttempt =
+  | RunStageResult
+  | { readonly kind: "resume-rejected"; readonly code: string; readonly detail: string };
+
 export async function executeEngineStage(deps: WorkflowDeps, run: Run): Promise<RunStageResult> {
-  const engine = run.engine === "script" ? undefined : deps.engines.get(run.engine);
-  if (!engine) {
+  const kind = run.engine === "script" ? undefined : run.engine;
+  const engine = kind === undefined ? undefined : deps.engines.get(kind);
+  if (kind === undefined || !engine) {
     return {
       kind: "failed",
       code: "engine.not_configured",
@@ -141,12 +172,63 @@ export async function executeEngineStage(deps: WorkflowDeps, run: Run): Promise<
     };
   }
 
+  try {
+    const first = await runEngineAttempt(deps, run, engine, kind);
+    if (first.kind !== "resume-rejected") {
+      return first;
+    }
+    deps.store.dropEngineSession(run.sessionId, kind);
+    const rebuilt = await runEngineAttempt(deps, run, engine, kind);
+    return rebuilt.kind === "resume-rejected"
+      ? { kind: "failed", code: rebuilt.code, detail: rebuilt.detail }
+      : rebuilt;
+  } finally {
+    deps.turns?.delete(run.id);
+  }
+}
+
+async function runEngineAttempt(
+  deps: WorkflowDeps,
+  run: Run,
+  engine: Engine,
+  kind: EngineKind,
+): Promise<EngineAttempt> {
   const batchSize = deps.eventBatchSize ?? DEFAULT_EVENT_BATCH_SIZE;
   const pendingChunks: {
     readonly chunkKey: string;
     readonly chunk: JsonValue;
     readonly isTerminal?: boolean;
   }[] = [];
+  let observedSessionId: string | undefined;
+
+  const turnOutcome = (): TurnOutcome | undefined => {
+    const turn = deps.turns?.get(run.id);
+    if (turn === undefined) {
+      return undefined;
+    }
+    return {
+      contextMode: turn.contextMode,
+      ...(turn.saveable && observedSessionId !== undefined
+        ? {
+            save: {
+              sessionId: run.sessionId,
+              engine: kind,
+              vendorSessionId: observedSessionId,
+              baseHash: turn.baseHash,
+              contextHash: turn.contextHash,
+              lastOrdinal: turn.lastOrdinal,
+            },
+          }
+        : {}),
+    };
+  };
+
+  // A resumed attempt buffers its chunks until the vendor confirms the session, so a rejected
+  // resume leaves nothing in the run events and the rebuild's chunks do not collide with them.
+  const isAwaitingResumeConfirmation = (): boolean => {
+    const resumedFrom = deps.turns?.get(run.id)?.resumedFrom;
+    return resumedFrom !== undefined && observedSessionId !== resumedFrom;
+  };
 
   const readInterruptedStage = async (
     fallbackDetail?: string,
@@ -192,15 +274,27 @@ export async function executeEngineStage(deps: WorkflowDeps, run: Run): Promise<
       }
 
       if (event.type === "chunk") {
+        observedSessionId = readSessionIdChunk(event.chunk) ?? observedSessionId;
         pendingChunks.push({
           chunkKey: event.chunkKey,
           chunk: event.chunk,
           ...(event.isTerminal !== undefined ? { isTerminal: event.isTerminal } : {}),
         });
-        if (pendingChunks.length >= batchSize || isToolCallEnd(event.chunk)) {
+        if (
+          !isAwaitingResumeConfirmation() &&
+          (pendingChunks.length >= batchSize || isToolCallEnd(event.chunk))
+        ) {
           await flush();
         }
         continue;
+      }
+
+      if (
+        event.type === "failed" &&
+        event.code === "engine.resume_unavailable" &&
+        isAwaitingResumeConfirmation()
+      ) {
+        return { kind: "resume-rejected", code: event.code, detail: event.detail };
       }
 
       await flush();
@@ -210,10 +304,12 @@ export async function executeEngineStage(deps: WorkflowDeps, run: Run): Promise<
         if (postInterrupted) {
           return postInterrupted;
         }
+        const turn = turnOutcome();
         return {
           kind: "completed",
           ...(event.finalMessage ? { finalMessageParts: event.finalMessage.parts } : {}),
           ...(event.usage !== undefined ? { usage: event.usage } : {}),
+          ...(turn !== undefined ? { turn } : {}),
         };
       }
 
@@ -417,7 +513,14 @@ export async function finalizeDirectRunStep(
         ? { finalMessageParts: input.outcome.finalMessageParts }
         : {}),
       ...(input.outcome.usage !== undefined ? { usage: input.outcome.usage } : {}),
+      ...(input.outcome.turn !== undefined ? { contextMode: input.outcome.turn.contextMode } : {}),
     });
+    if (input.outcome.turn?.save !== undefined) {
+      deps.store.saveEngineSession({
+        ...input.outcome.turn.save,
+        lastOrdinal: finished.finalMessage?.ordinal ?? input.outcome.turn.save.lastOrdinal,
+      });
+    }
     return finished.run;
   }
 

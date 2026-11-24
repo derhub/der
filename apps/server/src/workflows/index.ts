@@ -56,6 +56,8 @@ export {
   type AwaitApprovalOutcome,
   type DurableWorkflow,
   type RunStageResult,
+  type TurnOutcome,
+  type TurnRecord,
   type WorkflowDeps,
   type WorkflowStore,
 } from "./run-steps";

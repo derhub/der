@@ -451,6 +451,10 @@ describe("keep Memory schema and capability entry points distinct", () => {
       ...approvalEffectStore,
       ...outboxStore,
       ...routineStore,
+      getEngineSession: () => null,
+      markEngineSessionPending: () => undefined,
+      saveEngineSession: () => undefined,
+      dropEngineSession: () => undefined,
     };
 
     const outboxSink: OutboxSink = {

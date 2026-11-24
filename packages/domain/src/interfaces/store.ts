@@ -11,6 +11,7 @@ import type {
   BotId,
   ChannelBindingId,
   EffectId,
+  EngineKind,
   JsonValue,
   OutboxEventId,
   RoutineId,
@@ -21,6 +22,7 @@ import type { Message, MessagePart } from "../schemas/message";
 import type { Routine, RoutineTarget } from "../schemas/routine";
 import type {
   ChannelIntakeMetadata,
+  ContextMode,
   Run,
   RunAdmission,
   RunEvent,
@@ -69,6 +71,7 @@ export interface FinishRunInput {
   readonly detail?: string;
   readonly checkpoint?: JsonValue | null;
   readonly usage?: RunUsage;
+  readonly contextMode?: ContextMode;
 }
 
 export interface FinishRunOutcome {
@@ -164,5 +167,34 @@ export interface RoutineStore {
   getRoutine(routineId: RoutineId): MaybePromise<Routine | undefined>;
 }
 
+export interface EngineSession {
+  readonly sessionId: SessionId;
+  readonly engine: EngineKind;
+  readonly vendorSessionId: string;
+  readonly baseHash: string;
+  readonly contextHash: string;
+  /** Highest message ordinal the vendor session has seen. */
+  readonly lastOrdinal: number;
+  /** Run whose engine call is in flight; null once the call finished. */
+  readonly pendingRunId: RunId | null;
+  readonly updatedAt: UtcTimestamp;
+}
+
+export interface EngineSessionStore {
+  getEngineSession(sessionId: SessionId, engine: EngineKind): EngineSession | null;
+  /** No-op when the session has no row for the engine. */
+  markEngineSessionPending(sessionId: SessionId, engine: EngineKind, runId: RunId): void;
+  /** Upsert; clears `pendingRunId` and stamps `updatedAt`. */
+  saveEngineSession(row: Omit<EngineSession, "pendingRunId" | "updatedAt">): void;
+  dropEngineSession(sessionId: SessionId, engine: EngineKind): void;
+}
+
 export interface Store
-  extends BotStore, SessionStore, RunStore, ApprovalEffectStore, OutboxStore, RoutineStore {}
+  extends
+    BotStore,
+    SessionStore,
+    RunStore,
+    ApprovalEffectStore,
+    OutboxStore,
+    RoutineStore,
+    EngineSessionStore {}

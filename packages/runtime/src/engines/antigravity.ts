@@ -9,8 +9,15 @@ import {
   checkRunReadinessGate,
   extractCheckpointSessionId,
   linkAbortSignal,
+  isBroadResumeFailureMessage,
+  type EngineResumeTraits,
   type LoadEngineRunInput,
 } from "./stream-bridge";
+
+export const antigravityResume: EngineResumeTraits = {
+  resumable: false,
+  isResumeFailure: isBroadResumeFailureMessage,
+};
 
 export interface AntigravityEngineConfig {
   readonly model: string;
@@ -116,6 +123,7 @@ export function createAntigravityEngine(config: AntigravityEngineConfig): Engine
           abortController: controller,
           approvalBridge,
           sessionIdEventName: "antigravity.session-id",
+          isResumeFailure: antigravityResume.isResumeFailure,
           ...(resumeSessionId !== undefined ? { expectedResumeSessionId: resumeSessionId } : {}),
           ...(input.requireResume !== undefined ? { requireResume: input.requireResume } : {}),
         });

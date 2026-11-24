@@ -27,8 +27,17 @@ import {
   checkRunReadinessGate,
   extractCheckpointSessionId,
   linkAbortSignal,
+  type EngineResumeTraits,
   type LoadEngineRunInput,
 } from "./stream-bridge";
+
+const UNKNOWN_SESSION_MESSAGE = /No conversation found with session ID/i;
+
+/** `claude --resume <unknown id> -p` exits 1 with "No conversation found with session ID: <id>" on stderr. */
+export const claudeCodeResume: EngineResumeTraits = {
+  resumable: true,
+  isResumeFailure: (message) => UNKNOWN_SESSION_MESSAGE.test(message),
+};
 
 export interface ClaudeCodeEngineConfig {
   readonly model: ClaudeCodeModel;
@@ -136,6 +145,7 @@ export function createClaudeCodeEngine(config: ClaudeCodeEngineConfig): Engine {
           abortController: controller,
           approvalBridge,
           sessionIdEventName: "claude-code.session-id",
+          isResumeFailure: claudeCodeResume.isResumeFailure,
           ...(resumeSessionId !== undefined ? { expectedResumeSessionId: resumeSessionId } : {}),
           ...(input.requireResume !== undefined ? { requireResume: input.requireResume } : {}),
         });

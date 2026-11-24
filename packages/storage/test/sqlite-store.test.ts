@@ -115,6 +115,7 @@ describe("configure SQLite WAL, foreign keys, busy timeout, and migration seam",
         "005-script-runs",
         "006-script-routines",
         "007-run-usage",
+        "008-engine-sessions",
       ]);
     } finally {
       store.close();
@@ -138,6 +139,7 @@ describe("configure SQLite WAL, foreign keys, busy timeout, and migration seam",
         "005-script-runs",
         "006-script-routines",
         "007-run-usage",
+        "008-engine-sessions",
       ]);
     } finally {
       reopened.close();

@@ -13,8 +13,15 @@ import {
   checkRunReadinessGate,
   extractCheckpointSessionId,
   linkAbortSignal,
+  isBroadResumeFailureMessage,
+  type EngineResumeTraits,
   type LoadEngineRunInput,
 } from "./stream-bridge";
+
+export const codexResume: EngineResumeTraits = {
+  resumable: false,
+  isResumeFailure: isBroadResumeFailureMessage,
+};
 
 export interface CodexEngineConfig {
   readonly model: CodexModel;
@@ -94,6 +101,7 @@ export function createCodexEngine(config: CodexEngineConfig): Engine {
           ...(input.signal !== undefined ? { signal: input.signal } : {}),
           abortController: controller,
           sessionIdEventName: "codex.session-id",
+          isResumeFailure: codexResume.isResumeFailure,
           ...(resumeSessionId !== undefined ? { expectedResumeSessionId: resumeSessionId } : {}),
           ...(input.requireResume !== undefined ? { requireResume: input.requireResume } : {}),
         });

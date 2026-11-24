@@ -17,6 +17,28 @@ export interface EngineRunInput {
 
 export type LoadEngineRunInput = (run: Run) => Promise<EngineRunInput>;
 
+export interface EngineResumeTraits {
+  /** The engine resumes its vendor session between Runs; otherwise every Run rebuilds. */
+  readonly resumable: boolean;
+  /** True when an engine error message means the vendor refused the session it was asked to resume. */
+  readonly isResumeFailure: (message: string) => boolean;
+}
+
+/** Vendor session id carried by an engine's `<engine>.session-id` chunk, if `chunk` is one. */
+export function readSessionIdChunk(chunk: JsonValue): string | undefined {
+  if (
+    !isRecord(chunk) ||
+    chunk["type"] !== "CUSTOM" ||
+    typeof chunk["name"] !== "string" ||
+    !chunk["name"].endsWith(".session-id") ||
+    !isRecord(chunk["value"])
+  ) {
+    return undefined;
+  }
+  const sessionId = chunk["value"]["sessionId"];
+  return typeof sessionId === "string" && sessionId.length > 0 ? sessionId : undefined;
+}
+
 export function extractCheckpointSessionId(run: Run): string | undefined {
   if (
     run.checkpoint !== null &&
@@ -111,15 +133,15 @@ function isTransportLossMessage(message: string): boolean {
   );
 }
 
-function isResumeFailureMessage(message: string): boolean {
+export function isBroadResumeFailureMessage(message: string): boolean {
   const lower = message.toLowerCase();
-  return (
+  const mentionsSession =
     lower.includes("resume") ||
     lower.includes("not found") ||
     lower.includes("no such session") ||
     lower.includes("session") ||
-    lower.includes("thread")
-  );
+    lower.includes("thread");
+  return mentionsSession || isTransportLossMessage(message);
 }
 
 export async function* bridgeAdapterStream(options: {
@@ -131,11 +153,18 @@ export async function* bridgeAdapterStream(options: {
   readonly sessionIdEventName: string;
   readonly expectedResumeSessionId?: string;
   readonly requireResume?: boolean;
+  readonly isResumeFailure?: (message: string) => boolean;
 }): AsyncIterable<EngineEvent> {
+  const isResumeFailure = options.isResumeFailure ?? isBroadResumeFailureMessage;
   let seq = 0;
   let assistantText = "";
   let sawTerminal = false;
   let resumeMismatchDetail: string | undefined;
+  let resumeAccepted = false;
+  const isUnacceptedResume = () =>
+    options.requireResume === true &&
+    options.expectedResumeSessionId !== undefined &&
+    !resumeAccepted;
 
   try {
     for await (const rawChunk of options.stream) {
@@ -163,6 +192,9 @@ export async function* bridgeAdapterStream(options: {
         const value = chunk["value"] as Record<string, unknown>;
         const observedSessionId =
           typeof value["sessionId"] === "string" ? value["sessionId"] : undefined;
+        if (observedSessionId === options.expectedResumeSessionId) {
+          resumeAccepted = true;
+        }
         if (
           observedSessionId !== undefined &&
           observedSessionId !== options.expectedResumeSessionId
@@ -199,11 +231,7 @@ export async function* bridgeAdapterStream(options: {
           };
           return;
         }
-        if (
-          options.requireResume &&
-          options.expectedResumeSessionId !== undefined &&
-          (isResumeFailureMessage(message) || isTransportLossMessage(message))
-        ) {
+        if (isUnacceptedResume() && isResumeFailure(message)) {
           options.approvalBridge?.markTransportLost(message);
           yield {
             type: "failed",
@@ -285,10 +313,7 @@ export async function* bridgeAdapterStream(options: {
     options.approvalBridge?.markTransportLost(message);
     yield {
       type: "failed",
-      code:
-        options.requireResume && options.expectedResumeSessionId !== undefined
-          ? "engine.resume_unavailable"
-          : "engine.transport_lost",
+      code: isUnacceptedResume() ? "engine.resume_unavailable" : "engine.transport_lost",
       detail: message,
     };
     return;
@@ -312,10 +337,7 @@ export async function* bridgeAdapterStream(options: {
     options.approvalBridge?.markTransportLost("Engine stream ended without a terminal event.");
     yield {
       type: "failed",
-      code:
-        options.requireResume && options.expectedResumeSessionId !== undefined
-          ? "engine.resume_unavailable"
-          : "engine.transport_lost",
+      code: isUnacceptedResume() ? "engine.resume_unavailable" : "engine.transport_lost",
       detail: "Engine process transport closed before completing the run.",
     };
   }

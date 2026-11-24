@@ -23,6 +23,8 @@ export type {
   BeginEffectOutcome,
   BotStore,
   CreateRoutineInput,
+  EngineSession,
+  EngineSessionStore,
   FinishRunInput,
   FinishRunOutcome,
   MaybePromise,

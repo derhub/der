@@ -18,6 +18,9 @@ import {
   type EffectId,
   type EffectIdentity,
   type EffectRecord,
+  type EngineKind,
+  type EngineSession,
+  type EngineSessionStore,
   type JsonValue,
   type Message,
   type MessagePage,
@@ -67,6 +70,12 @@ import {
   upsertChannelBinding as upsertChannelBindingCommand,
   type UpsertChannelBindingInput,
 } from "./channel-outbox";
+import {
+  dropEngineSession as dropEngineSessionCommand,
+  getEngineSession as getEngineSessionQuery,
+  markEngineSessionPending as markEngineSessionPendingCommand,
+  saveEngineSession as saveEngineSessionCommand,
+} from "./engine-sessions";
 import { SqliteDatabase, type SqliteDatabaseOptions } from "./database";
 import { notFoundError, validationError } from "./errors";
 import {
@@ -119,7 +128,8 @@ export class SqliteStore
     RunStore,
     ApprovalEffectStore,
     OutboxStore,
-    RoutineStore
+    RoutineStore,
+    EngineSessionStore
 {
   readonly database: SqliteDatabase;
   private readonly maxEventBatchSize: number;
@@ -404,6 +414,22 @@ export class SqliteStore
 
   getRun(runId: RunId): Run | undefined {
     return getRunQuery(this.database, runId);
+  }
+
+  getEngineSession(sessionId: SessionId, engine: EngineKind): EngineSession | null {
+    return getEngineSessionQuery(this.database, sessionId, engine);
+  }
+
+  markEngineSessionPending(sessionId: SessionId, engine: EngineKind, runId: RunId): void {
+    markEngineSessionPendingCommand(this.database, sessionId, engine, runId);
+  }
+
+  saveEngineSession(row: Omit<EngineSession, "pendingRunId" | "updatedAt">): void {
+    saveEngineSessionCommand(this.database, row, this.nowUtc());
+  }
+
+  dropEngineSession(sessionId: SessionId, engine: EngineKind): void {
+    dropEngineSessionCommand(this.database, sessionId, engine);
   }
 
   listSessionRuns(sessionId: SessionId): Run[] {
