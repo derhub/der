@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import type { EngineSession, Message, RunId } from "@der/domain";
+import type { EngineSession, Message } from "@der/domain";
 
 export type TurnPlan =
   | {
@@ -9,18 +9,19 @@ export type TurnPlan =
     }
   | {
       readonly mode: "rebuild";
-      readonly reason: "none" | "replayed" | "base-changed" | "gap" | "not-resumable";
+      readonly reason: "none" | "pending" | "base-changed" | "gap" | "not-resumable";
     };
 
 export interface PlanTurnInput {
   readonly engineResumable: boolean;
   readonly stored: EngineSession | null;
-  readonly runId: RunId;
   readonly baseHash: string;
   readonly contextHash: string;
   /** Capped memory and skill catalog text; "" when both are empty. */
   readonly contextBlock: string;
   readonly messagesAfterLastOrdinal: readonly Message[];
+  /** The session's most recent earlier Run used a different engine than this Run. */
+  readonly previousRunOnOtherEngine: boolean;
 }
 
 function isUserText(message: Message): boolean {
@@ -45,14 +46,20 @@ export function planTurn(input: PlanTurnInput): TurnPlan {
   if (stored === null) {
     return { mode: "rebuild", reason: "none" };
   }
-  if (stored.pendingRunId === input.runId) {
-    return { mode: "rebuild", reason: "replayed" };
+  // A pending mark means some Run's delivery to this vendor session is uncertain, whether this
+  // Run replayed or an earlier one failed after the vendor may have accepted its prompt.
+  if (stored.pendingRunId !== null) {
+    return { mode: "rebuild", reason: "pending" };
   }
   if (stored.baseHash !== input.baseHash) {
     return { mode: "rebuild", reason: "base-changed" };
   }
   const newMessages = input.messagesAfterLastOrdinal;
-  if (newMessages.length === 0 || !newMessages.every(isUserText)) {
+  if (
+    input.previousRunOnOtherEngine ||
+    newMessages.length === 0 ||
+    !newMessages.every(isUserText)
+  ) {
     return { mode: "rebuild", reason: "gap" };
   }
   return {

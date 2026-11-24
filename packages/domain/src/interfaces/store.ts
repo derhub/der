@@ -72,6 +72,8 @@ export interface FinishRunInput {
   readonly checkpoint?: JsonValue | null;
   readonly usage?: RunUsage;
   readonly contextMode?: ContextMode;
+  /** Saved in the finish transaction at the reply's ordinal when there is one. */
+  readonly engineSession?: Omit<EngineSession, "pendingRunId" | "updatedAt">;
 }
 
 export interface FinishRunOutcome {
@@ -184,7 +186,10 @@ export interface EngineSessionStore {
   getEngineSession(sessionId: SessionId, engine: EngineKind): EngineSession | null;
   /** No-op when the session has no row for the engine. */
   markEngineSessionPending(sessionId: SessionId, engine: EngineKind, runId: RunId): void;
-  /** Upsert; clears `pendingRunId` and stamps `updatedAt`. */
+  /**
+   * Upsert; clears `pendingRunId` and stamps `updatedAt`. Replaces a stored row only when the
+   * incoming `lastOrdinal` is greater, so a replayed older finish is a no-op.
+   */
   saveEngineSession(row: Omit<EngineSession, "pendingRunId" | "updatedAt">): void;
   dropEngineSession(sessionId: SessionId, engine: EngineKind): void;
 }

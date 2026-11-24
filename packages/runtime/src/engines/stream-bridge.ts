@@ -100,7 +100,8 @@ function countOrNull(value: unknown): number | null {
   return typeof value === "number" ? value : null;
 }
 
-function readRunUsage(finished: Record<string, unknown>): RunUsage | undefined {
+/** Usage carried by an adapter `RUN_FINISHED` chunk, raw or as persisted in run events. */
+export function readRunUsage(finished: Record<string, unknown>): RunUsage | undefined {
   const usage = finished["usage"];
   if (
     !isRecord(usage) ||

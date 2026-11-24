@@ -39,11 +39,11 @@ function plan(overrides: Partial<Parameters<typeof planTurn>[0]> = {}): TurnPlan
   return planTurn({
     engineResumable: true,
     stored: STORED,
-    runId: "run-2",
     baseHash: "base-a",
     contextHash: "ctx-a",
     contextBlock: "[Bot Memory v2]\nlikes tea",
     messagesAfterLastOrdinal: [userText(5, "next question")],
+    previousRunOnOtherEngine: false,
     ...overrides,
   });
 }
@@ -70,14 +70,6 @@ describe("decide whether a Run resumes the vendor session or rebuilds", () => {
     });
   });
 
-  it("resumes when the pending mark belongs to an earlier Run", () => {
-    expect(plan({ stored: { ...STORED, pendingRunId: "run-1" } })).toEqual({
-      mode: "resume",
-      vendorSessionId: "vendor-1",
-      contextNote: null,
-    });
-  });
-
   it.each<{ name: string; input: Partial<Parameters<typeof planTurn>[0]>; plan: TurnPlan }>([
     {
       name: "the engine cannot resume",
@@ -90,9 +82,14 @@ describe("decide whether a Run resumes the vendor session or rebuilds", () => {
       plan: { mode: "rebuild", reason: "none" },
     },
     {
-      name: "the stored row was marked pending by this very Run",
-      input: { stored: { ...STORED, pendingRunId: "run-2" } },
-      plan: { mode: "rebuild", reason: "replayed" },
+      name: "the stored row is still pending from a Run that never saved",
+      input: { stored: { ...STORED, pendingRunId: "run-1" } },
+      plan: { mode: "rebuild", reason: "pending" },
+    },
+    {
+      name: "the previous Run of the session ran on another engine",
+      input: { previousRunOnOtherEngine: true },
+      plan: { mode: "rebuild", reason: "gap" },
     },
     {
       name: "the persona, system messages, code-mode text or model changed",
