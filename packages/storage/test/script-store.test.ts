@@ -52,11 +52,7 @@ async function openSqliteFixture() {
       return { runId: run.id, botId: bot.id };
     },
     async endRun(runId) {
-      await base.finishRun({
-        runId,
-        status: "completed",
-        terminalEvent: { chunkKey: `${runId}:terminal`, chunk: { type: "RUN_FINISHED", runId } },
-      });
+      await base.finishRun({ runId, end: { kind: "complete" } });
     },
     advance(ms) {
       nowMs += ms;

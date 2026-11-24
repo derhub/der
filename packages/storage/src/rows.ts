@@ -1,5 +1,7 @@
 import {
+  activeRunStatus,
   effectOperationKind,
+  type ActiveRunStatus,
   type Approval,
   type ApprovalDecision,
   type Bot,
@@ -405,4 +407,11 @@ export function mapOutboxEventRow(row: OutboxEventRow): OutboxEvent {
     createdAt: row.created_at,
     updatedAt: row.updated_at,
   });
+}
+
+/** SQL list of the active statuses, for `status IN ${ACTIVE_RUN_STATUS_SQL}`. */
+export const ACTIVE_RUN_STATUS_SQL = `(${activeRunStatus.options.map((status) => `'${status}'`).join(", ")})`;
+
+export function isActiveRunStatus(status: string): status is ActiveRunStatus {
+  return (activeRunStatus.options as readonly string[]).includes(status);
 }

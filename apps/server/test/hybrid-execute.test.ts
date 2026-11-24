@@ -60,14 +60,7 @@ function executeToolFor(server: RunningServer, run: Run, inlineWaitMs = INLINE_W
 }
 
 async function endOwningRun(server: RunningServer, owner: Owner) {
-  await server.store.finishRun({
-    runId: owner.run.id,
-    status: "completed",
-    terminalEvent: {
-      chunkKey: `${owner.run.id}:terminal`,
-      chunk: { type: "RUN_FINISHED", runId: owner.run.id },
-    },
-  });
+  await server.store.finishRun({ runId: owner.run.id, end: { kind: "complete" } });
   await server.scriptDriver.cancelRun(owner.run.id);
 }
 

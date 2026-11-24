@@ -51,6 +51,8 @@ export type {
   RequestApprovalInput,
   RequestApprovalOutcome,
   RoutineStore,
+  RunEnd,
+  ActiveRun,
   RunEventInput,
   RunStore,
   RunStreamState,

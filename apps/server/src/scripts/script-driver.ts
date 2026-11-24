@@ -125,7 +125,7 @@ export class ScriptDriver {
     steps: readonly StoredStep[],
     result: ExecuteResult,
   ): Promise<void> {
-    const { store, now } = this.deps;
+    const { store } = this.deps;
     const doubtful = steps.find((step) => step.status === "unknown");
     const run = await store.getRun(execution.runId);
     const effect =
@@ -134,7 +134,7 @@ export class ScriptDriver {
       return;
     }
     await finalizeInterruptedUncertainStep(
-      { store, now },
+      { store },
       { run, effectId: effect.id, detail: result.error.message },
     );
   }

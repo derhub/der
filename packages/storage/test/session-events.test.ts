@@ -45,14 +45,7 @@ async function runToEnd(
     idempotencyKey: key,
     input: { parts: [{ type: "text", text: key }] },
   });
-  await store.finishRun({
-    runId: admission.run.id,
-    status: "completed",
-    terminalEvent: {
-      chunkKey: `${admission.run.id}:terminal`,
-      chunk: { type: "RUN_FINISHED", runId: admission.run.id },
-    },
-  });
+  await store.finishRun({ runId: admission.run.id, end: { kind: "complete" } });
   return admission.run;
 }
 

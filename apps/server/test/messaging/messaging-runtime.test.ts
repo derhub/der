@@ -100,12 +100,10 @@ describe("serialize outbox delivery with backoff, restart resumption, and disabl
     });
     const finished = await store.finishRun({
       runId: run.id,
-      status: "completed",
-      terminalEvent: {
-        chunkKey: `${run.id}:terminal`,
-        chunk: { type: "RUN_FINISHED", runId: run.id },
+      end: {
+        kind: "complete",
+        finalMessageParts: [{ type: "text", text: "Delivered via outbox." }],
       },
-      finalMessageParts: [{ type: "text", text: "Delivered via outbox." }],
     });
     expect(finished.outboxEvents).toHaveLength(1);
     const rowId = finished.outboxEvents[0]!.id;
@@ -219,12 +217,10 @@ describe("serialize outbox delivery with backoff, restart resumption, and disabl
     });
     await store.finishRun({
       runId: run.id,
-      status: "completed",
-      terminalEvent: {
-        chunkKey: `${run.id}:terminal`,
-        chunk: { type: "RUN_FINISHED", runId: run.id },
+      end: {
+        kind: "complete",
+        finalMessageParts: [{ type: "text", text: "Blocked destination." }],
       },
-      finalMessageParts: [{ type: "text", text: "Blocked destination." }],
     });
 
     const terminalSink: OutboxSink = {
@@ -272,12 +268,7 @@ describe("serialize outbox delivery with backoff, restart resumption, and disabl
     });
     await store.finishRun({
       runId: run.id,
-      status: "completed",
-      terminalEvent: {
-        chunkKey: `${run.id}:terminal`,
-        chunk: { type: "RUN_FINISHED", runId: run.id },
-      },
-      finalMessageParts: [{ type: "text", text: "Retry after throw." }],
+      end: { kind: "complete", finalMessageParts: [{ type: "text", text: "Retry after throw." }] },
     });
 
     const throwingSink: OutboxSink = {
@@ -454,12 +445,10 @@ describe("wire generic outbox config and OutboxSink delivery into server startup
     });
     await store.finishRun({
       runId: run.id,
-      status: "completed",
-      terminalEvent: {
-        chunkKey: `${run.id}:terminal`,
-        chunk: { type: "RUN_FINISHED", runId: run.id },
+      end: {
+        kind: "complete",
+        finalMessageParts: [{ type: "text", text: "Delivered to custom webhook sink." }],
       },
-      finalMessageParts: [{ type: "text", text: "Delivered to custom webhook sink." }],
     });
 
     const received: { readonly kind: string; readonly target: string; readonly type: string }[] =

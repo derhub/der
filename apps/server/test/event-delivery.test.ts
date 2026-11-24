@@ -58,11 +58,7 @@ async function admitRun(store: SqliteStore, origin: RunRequest["origin"], key: s
 }
 
 async function finish(store: SqliteStore, runId: string) {
-  await store.finishRun({
-    runId,
-    status: "completed",
-    terminalEvent: { chunkKey: `${runId}:terminal`, chunk: { type: "RUN_FINISHED", runId } },
-  });
+  await store.finishRun({ runId, end: { kind: "complete" } });
 }
 
 function eventRuns(store: SqliteStore) {
@@ -178,7 +174,7 @@ describe("deliver a session event", () => {
   });
 
   it("fits a failed result's long message and logs into the event text limit and flags each cut", async () => {
-    const { store, deliver } = openStore(undefined, 200);
+    const { store, deliver } = openStore(undefined, 300);
     enqueue(store, "evt-1", {
       status: "failed",
       result: {
@@ -199,15 +195,15 @@ describe("deliver a session event", () => {
     ) as { text: string }[];
     expect({
       text: part!.text,
-      fits: new TextEncoder().encode(part!.text).byteLength <= 200,
+      bytes: new TextEncoder().encode(part!.text).byteLength,
     }).toEqual({
-      text: `{"status":"failed","result":{"ok":false,"error":{"kind":"capability","message":"${"z".repeat(68)} [message truncated]"},"logs":["[logs truncated]"]}}`,
-      fits: true,
+      text: `{"status":"failed","result":{"ok":false,"error":{"kind":"capability","message":"${"z".repeat(168)} [message truncated]"},"logs":["[logs truncated]"]}}`,
+      bytes: 300,
     });
   });
 
-  it("keeps a failed in-doubt result within an 80-byte limit as the in_doubt marker", async () => {
-    const { store, deliver } = openStore(undefined, 80);
+  it("keeps a failed in-doubt result's unknown write within the 256-byte minimum limit", async () => {
+    const { store, deliver } = openStore(undefined, 256);
     enqueue(store, "evt-1", {
       event: "script.finished",
       executionId: "exec-1",
@@ -225,7 +221,7 @@ describe("deliver a session event", () => {
     await deliver();
 
     expect(eventText(store)).toBe(
-      '{"event":"script.finished","executionId":"exec-1","status":"in_doubt","result":{"ok":false,"error":{"kind":"capability","message":"in_doubt"},"logs":[]}}',
+      `{"event":"script.finished","executionId":"exec-1","status":"in_doubt","result":{"ok":false,"error":{"kind":"capability","message":"${"r".repeat(57)} [message truncated] Unknown outcome: #1 notes.append."},"logs":[]}}`,
     );
   });
 
@@ -434,46 +430,70 @@ describe("recover an event Run admitted before a crash", () => {
     });
   }, 30_000);
 
-  it("ends at startup an event Run left running and then delivers the session's next event", async () => {
-    const tempDb = createTempDatabase("der-event-running-");
-    const before = openSqliteStore({ filename: tempDb.dbPath });
-    const { bot, session } = seedFixtureRecords(before);
-    const event = { botId: bot.id, sessionId: session.id, kind: "script.finished" } as const;
-    const { run } = await before.admit({
-      botId: bot.id,
-      sessionId: session.id,
-      origin: "event",
-      idempotencyKey: "evt-1",
-      input: { parts: [{ type: "text", text: '{"n":1}' }] },
-    });
-    before.enqueueSessionEvent({ ...event, id: "evt-1", payload: { n: 1 } });
-    before.markSessionEventDelivered("evt-1", run.id);
-    before.enqueueSessionEvent({ ...event, id: "evt-2", payload: { n: 2 } });
-    await before.markRunRunning(run.id);
-    before.close();
+  it.each(["running", "waiting_approval"] as const)(
+    "ends at startup an event Run left %s and then delivers the session's next event",
+    async (status) => {
+      const tempDb = createTempDatabase("der-event-running-");
+      const before = openSqliteStore({ filename: tempDb.dbPath });
+      const { bot, session } = seedFixtureRecords(before);
+      const event = { botId: bot.id, sessionId: session.id, kind: "script.finished" } as const;
+      const { run } = await before.admit({
+        botId: bot.id,
+        sessionId: session.id,
+        origin: "event",
+        idempotencyKey: "evt-1",
+        input: { parts: [{ type: "text", text: '{"n":1}' }] },
+      });
+      before.enqueueSessionEvent({ ...event, id: "evt-1", payload: { n: 1 } });
+      before.markSessionEventDelivered("evt-1", run.id);
+      before.enqueueSessionEvent({ ...event, id: "evt-2", payload: { n: 2 } });
+      await before.markRunRunning(run.id);
+      if (status === "waiting_approval") {
+        await before.requestApproval({
+          botId: bot.id,
+          sessionId: session.id,
+          runId: run.id,
+          effect: {
+            runId: run.id,
+            operationKind: "capability",
+            operationId: "notes.publish",
+            canonicalArguments: { text: "engine" },
+            attemptId: `${run.id}:engine`,
+          },
+          prompt: "Publish?",
+          awakeable: `direct_awk_${run.id}`,
+          deadline: "2099-01-01T00:00:00Z",
+        });
+      }
+      const left = before.getRun(run.id)?.status;
+      before.close();
 
-    const server = await startDirectServer(tempDb);
-    await waitUntil(() => server.store.listPendingSessionEvents().length === 0, {
-      timeoutMs: 3_000,
-      label: "the session's next event admitted",
-    });
+      const server = await startDirectServer(tempDb);
+      await waitUntil(() => server.store.listPendingSessionEvents().length === 0, {
+        timeoutMs: 3_000,
+        label: "the session's next event admitted",
+      });
 
-    const terminal = server.store.database.db
-      .query<{ chunk_json: string }, [string]>(
-        "SELECT chunk_json FROM run_events WHERE run_id = ? AND is_terminal = 1",
-      )
-      .all(run.id)
-      .map((row) => JSON.parse(row.chunk_json) as { type: string; code: string });
-    expect({
-      run: server.store.getRun(run.id)?.status,
-      terminal: terminal.map(({ type, code }) => ({ type, code })),
-      eventRuns: server.store.database.db
-        .query<{ id: string }, []>("SELECT id FROM runs WHERE origin = 'event' ORDER BY rowid")
-        .all().length,
-    }).toEqual({
-      run: "interrupted",
-      terminal: [{ type: "RUN_ERROR", code: "run.server_restarted" }],
-      eventRuns: 2,
-    });
-  }, 30_000);
+      const terminal = server.store.database.db
+        .query<{ chunk_json: string }, [string]>(
+          "SELECT chunk_json FROM run_events WHERE run_id = ? AND is_terminal = 1",
+        )
+        .all(run.id)
+        .map((row) => JSON.parse(row.chunk_json) as { type: string; code: string });
+      expect({
+        left,
+        run: server.store.getRun(run.id)?.status,
+        terminal: terminal.map(({ type, code }) => ({ type, code })),
+        eventRuns: server.store.database.db
+          .query<{ id: string }, []>("SELECT id FROM runs WHERE origin = 'event' ORDER BY rowid")
+          .all().length,
+      }).toEqual({
+        left: status,
+        run: "interrupted",
+        terminal: [{ type: "RUN_ERROR", code: "run.server_restarted" }],
+        eventRuns: 2,
+      });
+    },
+    30_000,
+  );
 });

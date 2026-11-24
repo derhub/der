@@ -92,6 +92,11 @@ describe("validate Phase 1 startup configuration", () => {
       message: /DER_RESTATE_MODE/,
     },
     {
+      name: "result limit below the 256-byte minimum",
+      env: { DER_SCRIPT_RESULT_BYTES: "255" },
+      message: /scriptResultBytes.*256/s,
+    },
+    {
       name: "malformed MCP servers JSON",
       env: { DER_MCP_SERVERS_JSON: "{not-json" },
       message: /DER_MCP_SERVERS_JSON/,

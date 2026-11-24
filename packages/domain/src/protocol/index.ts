@@ -40,3 +40,11 @@ export {
   type SseFrame,
 } from "./sse";
 export { formatUtcTimestamp, utcTimestamp, type UtcTimestamp } from "./timestamp";
+export {
+  TERMINAL_CHUNK_TYPES,
+  type TerminalChunkType,
+  isTerminalChunk,
+  streamChunk,
+  terminalChunkKey,
+  type StreamChunk,
+} from "./run-stream";

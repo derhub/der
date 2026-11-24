@@ -1,28 +1,20 @@
 import {
-  CLOUD_EVENT_SPEC_VERSION,
-  CLOUD_EVENT_TYPES,
   formatUtcTimestamp,
-  type CloudEvent,
-  type EngineSessionInput,
-  type JsonValue,
-  type Message,
-  type MessagePart,
-  type OutboxEvent,
+  isTerminalChunk,
+  terminalChunkKey,
   type Run,
   type RunAdmission,
   type RunEvent,
+  type RunEventInput,
   type RunId,
   type RunRequest,
   type RunStatus,
-  type RunUsage,
+  type RunStreamState,
   type SessionId,
-  type TerminalRunStatus,
 } from "@der/domain";
 import { compiledParsers } from "@der/domain/compiled";
 import { fingerprintJson } from "./canonical";
-import { insertOutboxForBindings } from "./channel-outbox";
 import type { SqliteDatabase } from "./database";
-import { handOverEngineSession } from "./engine-sessions";
 import { conflictError, notFoundError, validationError } from "./errors";
 import {
   mapBotRow,
@@ -31,49 +23,14 @@ import {
   mapRunRow,
   mapSessionRow,
   type BotRow,
-  type ChannelBindingRow,
   type MessageRow,
   type RoutineRow,
   type RunEventRow,
   type RunRow,
   type SessionRow,
+  ACTIVE_RUN_STATUS_SQL,
 } from "./rows";
-
-/** Appended chunks are never terminal: only `finishRun` writes the terminal chunk, with the status it sets. */
-export interface RunEventInput {
-  readonly chunkKey: string;
-  readonly chunk: JsonValue;
-}
-
-export interface FinishRunInput {
-  readonly runId: RunId;
-  readonly status: TerminalRunStatus;
-  readonly terminalEvent: RunEventInput;
-  readonly finalMessageParts?: readonly MessagePart[];
-  readonly detail?: string;
-  readonly checkpoint?: JsonValue | null;
-  readonly usage?: RunUsage;
-  /** Stored at the reply's ordinal, only by the finish that first makes the Run terminal. */
-  readonly engineSession?: EngineSessionInput;
-}
-
-/**
- * The first finish of an active Run writes its status and terminal chunk together and wins. A later
- * finish writes nothing and loses: `run` and `terminalEvent` are then the stored ones.
- */
-export interface FinishRunOutcome {
-  readonly won: boolean;
-  readonly run: Run;
-  readonly terminalEvent: RunEvent;
-  readonly finalMessage?: Message;
-  readonly outboxEvents: readonly OutboxEvent[];
-}
-
-export interface RunStreamState {
-  readonly highWaterMark: number;
-  readonly terminalSequence: number | undefined;
-  readonly status: RunStatus;
-}
+import { insertQueuedRun } from "./run-lifecycle";
 
 export async function admitRun(
   database: SqliteDatabase,
@@ -214,7 +171,7 @@ export async function admitRun(
     const activeRun = db
       .query<{ id: string }, [string]>(
         `SELECT id FROM runs
-         WHERE session_id = ? AND status IN ('queued', 'running', 'waiting_approval')`,
+         WHERE session_id = ? AND status IN ${ACTIVE_RUN_STATUS_SQL}`,
       )
       .get(valid.sessionId);
     if (activeRun) {
@@ -229,21 +186,16 @@ export async function admitRun(
     const runId = `run_${crypto.randomUUID()}`;
     const messageId = `msg_${crypto.randomUUID()}`;
 
-    db.query(
-      `INSERT INTO runs
-        (id, bot_id, session_id, origin, engine, status, routine_id, routine_slot, checkpoint_json, created_at, updated_at, finished_at)
-       VALUES (?, ?, ?, ?, ?, 'queued', ?, ?, NULL, ?, ?, NULL)`,
-    ).run(
-      runId,
-      valid.botId,
-      valid.sessionId,
-      valid.origin,
-      resolvedEngine,
-      valid.routineId ?? null,
-      valid.routineSlot ?? null,
-      now,
-      now,
-    );
+    insertQueuedRun(db, {
+      id: runId,
+      botId: valid.botId,
+      sessionId: valid.sessionId,
+      origin: valid.origin,
+      engine: resolvedEngine,
+      routineId: valid.routineId ?? null,
+      routineSlot: valid.routineSlot ?? null,
+      at: now,
+    });
 
     const ordinalRow = db
       .query<{ next_ordinal: number }, [string]>(
@@ -308,43 +260,6 @@ export function listSessionRuns(database: SqliteDatabase, sessionId: SessionId):
     .map(mapRunRow);
 }
 
-export async function markRunRunning(
-  database: SqliteDatabase,
-  runId: RunId,
-  checkpoint?: JsonValue | null,
-): Promise<Run> {
-  const now = formatUtcTimestamp(database.now());
-  return database.inTransactionWithRetry((db) => {
-    const existing = db.query<RunRow, [string]>("SELECT * FROM runs WHERE id = ?").get(runId);
-    if (!existing) {
-      throw notFoundError(
-        "run.not_found",
-        "Run not found",
-        `Run ${runId} does not exist.`,
-        `/api/runs/${runId}`,
-      );
-    }
-    if (existing.status === "queued" || existing.status === "waiting_approval") {
-      db.query(
-        `UPDATE runs
-         SET status = 'running', checkpoint_json = COALESCE(?, checkpoint_json), updated_at = ?
-         WHERE id = ?`,
-      ).run(checkpoint !== undefined ? JSON.stringify(checkpoint) : null, now, runId);
-    } else if (checkpoint !== undefined && existing.status === "running") {
-      db.query("UPDATE runs SET checkpoint_json = ?, updated_at = ? WHERE id = ?").run(
-        JSON.stringify(checkpoint),
-        now,
-        runId,
-      );
-    }
-    const updated = db.query<RunRow, [string]>("SELECT * FROM runs WHERE id = ?").get(runId);
-    if (!updated) {
-      throw new Error(`Run ${runId} disappeared`);
-    }
-    return mapRunRow(updated);
-  });
-}
-
 export async function appendRunEvents(
   database: SqliteDatabase,
   runId: RunId,
@@ -372,6 +287,10 @@ export async function appendRunEvents(
 
       const results: RunEvent[] = [];
       for (const entry of batch) {
+        // Only finishing a Run writes a terminal payload or the reserved key, whatever the caller.
+        if (isTerminalChunk(entry.chunk) || entry.chunkKey === terminalChunkKey(runId)) {
+          continue;
+        }
         const existing = db
           .query<RunEventRow, [string, string]>(
             "SELECT * FROM run_events WHERE run_id = ? AND chunk_key = ?",
@@ -468,232 +387,4 @@ export function readRunEventsAfter(
     )
     .all(runId, after, limit);
   return rows.map(mapRunEventRow);
-}
-
-const ACTIVE_RUN_STATUSES = new Set<string>(["queued", "running", "waiting_approval"]);
-
-export async function finishRun(
-  database: SqliteDatabase,
-  input: FinishRunInput,
-): Promise<FinishRunOutcome> {
-  const now = formatUtcTimestamp(database.now());
-  const instance = `/api/runs/${input.runId}`;
-
-  return database.inTransactionWithRetry((db) => {
-    const runRow = db.query<RunRow, [string]>("SELECT * FROM runs WHERE id = ?").get(input.runId);
-    if (!runRow) {
-      throw notFoundError(
-        "run.not_found",
-        "Run not found",
-        `Run ${input.runId} does not exist.`,
-        instance,
-      );
-    }
-
-    if (!ACTIVE_RUN_STATUSES.has(runRow.status)) {
-      const storedTerminal = db
-        .query<RunEventRow, [string]>(
-          "SELECT * FROM run_events WHERE run_id = ? AND is_terminal = 1 ORDER BY sequence LIMIT 1",
-        )
-        .get(input.runId);
-      if (!storedTerminal) {
-        throw new Error(`Run ${input.runId} ended without a terminal event`);
-      }
-      return {
-        won: false,
-        run: mapRunRow(runRow),
-        terminalEvent: mapRunEventRow(storedTerminal),
-        outboxEvents: [],
-      };
-    }
-
-    const existingTerminal = db
-      .query<RunEventRow, [string, string]>(
-        "SELECT * FROM run_events WHERE run_id = ? AND chunk_key = ?",
-      )
-      .get(input.runId, input.terminalEvent.chunkKey);
-
-    let terminalEvent: RunEvent;
-    if (existingTerminal) {
-      terminalEvent = mapRunEventRow(existingTerminal);
-    } else {
-      const seqRow = db
-        .query<{ next_seq: number }, [string]>(
-          "SELECT COALESCE(MAX(sequence), 0) + 1 AS next_seq FROM run_events WHERE run_id = ?",
-        )
-        .get(input.runId);
-      const nextSeq = seqRow?.next_seq ?? 1;
-      db.query(
-        `INSERT INTO run_events (run_id, sequence, chunk_key, chunk_json, is_terminal, created_at)
-         VALUES (?, ?, ?, ?, 1, ?)`,
-      ).run(
-        input.runId,
-        nextSeq,
-        input.terminalEvent.chunkKey,
-        JSON.stringify(input.terminalEvent.chunk),
-        now,
-      );
-      const insertedEvent = db
-        .query<RunEventRow, [string, number]>(
-          "SELECT * FROM run_events WHERE run_id = ? AND sequence = ?",
-        )
-        .get(input.runId, nextSeq);
-      if (!insertedEvent) {
-        throw new Error(`Terminal event for run ${input.runId} was not persisted`);
-      }
-      terminalEvent = mapRunEventRow(insertedEvent);
-    }
-
-    const finishedAt = runRow.finished_at ?? now;
-    db.query(
-      `UPDATE runs
-       SET status = ?, checkpoint_json = COALESCE(?, checkpoint_json), updated_at = ?, finished_at = ?,
-           input_tokens = COALESCE(?, input_tokens),
-           cached_input_tokens = COALESCE(?, cached_input_tokens),
-           cache_write_tokens = COALESCE(?, cache_write_tokens),
-           output_tokens = COALESCE(?, output_tokens),
-           reported_cost_usd = COALESCE(?, reported_cost_usd)
-       WHERE id = ?`,
-    ).run(
-      input.status,
-      input.checkpoint !== undefined ? JSON.stringify(input.checkpoint) : null,
-      now,
-      finishedAt,
-      input.usage?.inputTokens ?? null,
-      input.usage?.cachedInputTokens ?? null,
-      input.usage?.cacheWriteTokens ?? null,
-      input.usage?.outputTokens ?? null,
-      input.usage?.reportedCostUsd ?? null,
-      input.runId,
-    );
-
-    const outboxEvents: OutboxEvent[] = [];
-    let finalMessage: Message | undefined;
-
-    if (input.finalMessageParts !== undefined && input.finalMessageParts.length > 0) {
-      const existingReply = db
-        .query<MessageRow, [string]>(
-          "SELECT * FROM messages WHERE run_id = ? AND role = 'assistant' ORDER BY ordinal DESC LIMIT 1",
-        )
-        .get(input.runId);
-      if (existingReply) {
-        finalMessage = mapMessageRow(existingReply);
-      } else {
-        const ordinalRow = db
-          .query<{ next_ordinal: number }, [string]>(
-            "SELECT COALESCE(MAX(ordinal), 0) + 1 AS next_ordinal FROM messages WHERE session_id = ?",
-          )
-          .get(runRow.session_id);
-        const nextOrdinal = ordinalRow?.next_ordinal ?? 1;
-        const messageId = `msg_${crypto.randomUUID()}`;
-        db.query(
-          `INSERT INTO messages (id, bot_id, session_id, ordinal, role, parts_json, run_id, created_at)
-           VALUES (?, ?, ?, ?, 'assistant', ?, ?, ?)`,
-        ).run(
-          messageId,
-          runRow.bot_id,
-          runRow.session_id,
-          nextOrdinal,
-          JSON.stringify(input.finalMessageParts),
-          input.runId,
-          now,
-        );
-        const insertedMsg = db
-          .query<MessageRow, [string]>("SELECT * FROM messages WHERE id = ?")
-          .get(messageId);
-        if (insertedMsg) {
-          finalMessage = mapMessageRow(insertedMsg);
-        }
-      }
-
-      if (finalMessage) {
-        const sessionBindings = db
-          .query<ChannelBindingRow, [string, string]>(
-            `SELECT * FROM channel_bindings
-             WHERE bot_id = ? AND session_id = ? AND enabled = 1
-             ORDER BY created_at ASC, id ASC`,
-          )
-          .all(runRow.bot_id, runRow.session_id);
-
-        const chatEnvelope: CloudEvent = {
-          specversion: CLOUD_EVENT_SPEC_VERSION,
-          id: `chat.replied:${input.runId}`,
-          source: `/bots/${runRow.bot_id}`,
-          type: CLOUD_EVENT_TYPES.chatReplied,
-          time: now,
-          subject: `sessions/${runRow.session_id}/runs/${input.runId}`,
-          datacontenttype: "application/json",
-          data: {
-            botId: runRow.bot_id,
-            sessionId: runRow.session_id,
-            runId: input.runId,
-            message: finalMessage,
-          },
-        };
-
-        outboxEvents.push(...insertOutboxForBindings(db, sessionBindings, chatEnvelope, now));
-      }
-    }
-
-    if (runRow.routine_id !== null) {
-      const botBindings = db
-        .query<ChannelBindingRow, [string]>(
-          `SELECT * FROM channel_bindings
-           WHERE bot_id = ? AND enabled = 1
-           ORDER BY created_at ASC, id ASC`,
-        )
-        .all(runRow.bot_id);
-
-      const routineEnvelope: CloudEvent = {
-        specversion: CLOUD_EVENT_SPEC_VERSION,
-        id: `routine.finished:${input.runId}`,
-        source: `/bots/${runRow.bot_id}`,
-        type: CLOUD_EVENT_TYPES.routineFinished,
-        time: now,
-        subject: `bots/${runRow.bot_id}/routines/${runRow.routine_id}/runs/${input.runId}`,
-        datacontenttype: "application/json",
-        data: {
-          botId: runRow.bot_id,
-          routineId: runRow.routine_id,
-          runId: input.runId,
-          sessionId: runRow.session_id,
-          slot: runRow.routine_slot ?? runRow.created_at,
-          outcome: input.status,
-          finishedAt,
-          ...(input.detail !== undefined ? { detail: input.detail } : {}),
-        },
-      };
-
-      outboxEvents.push(...insertOutboxForBindings(db, botBindings, routineEnvelope, now));
-    }
-
-    // Only the write that ends an active Run hands over: no successor exists yet whose row this
-    // could replace.
-    if (["queued", "running", "waiting_approval"].includes(runRow.status)) {
-      handOverEngineSession(
-        db,
-        runRow.session_id,
-        input.engineSession && {
-          ...input.engineSession,
-          lastOrdinal: finalMessage?.ordinal ?? input.engineSession.lastOrdinal,
-        },
-        now,
-      );
-    }
-
-    const updatedRun = db
-      .query<RunRow, [string]>("SELECT * FROM runs WHERE id = ?")
-      .get(input.runId);
-    if (!updatedRun) {
-      throw new Error(`Run ${input.runId} disappeared`);
-    }
-
-    return {
-      won: true,
-      run: mapRunRow(updatedRun),
-      terminalEvent,
-      ...(finalMessage !== undefined ? { finalMessage } : {}),
-      outboxEvents,
-    };
-  });
 }

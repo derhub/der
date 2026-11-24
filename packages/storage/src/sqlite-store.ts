@@ -33,12 +33,17 @@ import {
   type Routine,
   type RoutineId,
   type RoutineStore,
+  type FinishRunInput,
+  type FinishRunOutcome,
+  type ActiveRun,
   type Run,
   type RunAdmission,
   type RunEvent,
+  type RunEventInput,
   type RunId,
   type RunRequest,
   type RunStore,
+  type RunStreamState,
   type Session,
   type SessionEvent,
   type SessionEventStore,
@@ -100,19 +105,14 @@ import {
   type RoutineRow,
   type SessionRow,
 } from "./rows";
+import { finishRun as finishRunCommand, startRun } from "./run-lifecycle";
 import {
   admitRun,
   appendRunEvents as appendRunEventsCommand,
-  finishRun as finishRunCommand,
   getRun as getRunQuery,
   getRunStreamState as getRunStreamStateQuery,
   listSessionRuns as listSessionRunsQuery,
-  markRunRunning as markRunRunningCommand,
   readRunEventsAfter as readRunEventsAfterQuery,
-  type FinishRunInput,
-  type FinishRunOutcome,
-  type RunEventInput,
-  type RunStreamState,
 } from "./runs";
 
 export type {
@@ -122,7 +122,7 @@ export type {
 } from "./approvals-effects";
 export type { CreateRoutineInput };
 export type { UpsertChannelBindingInput } from "./channel-outbox";
-export type { FinishRunInput, FinishRunOutcome, RunEventInput, RunStreamState } from "./runs";
+export type { FinishRunInput, FinishRunOutcome, RunEventInput, RunStreamState };
 
 export interface SqliteStoreOptions extends SqliteDatabaseOptions {
   readonly maxEventBatchSize?: number;
@@ -378,7 +378,7 @@ export class SqliteStore
     return countEventChain(this.database.db, sessionId);
   }
 
-  getActiveRun(sessionId: SessionId): Run | undefined {
+  getActiveRun(sessionId: SessionId): ActiveRun | undefined {
     return getActiveRun(this.database.db, sessionId);
   }
 
@@ -480,7 +480,7 @@ export class SqliteStore
   }
 
   markRunRunning(runId: RunId, checkpoint?: JsonValue | null): Promise<Run> {
-    return markRunRunningCommand(this.database, runId, checkpoint);
+    return startRun(this.database, runId, checkpoint);
   }
 
   appendRunEvents(runId: RunId, events: readonly RunEventInput[]): Promise<RunEvent[]> {

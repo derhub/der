@@ -15,7 +15,14 @@ import { compiledParsers } from "@der/domain/compiled";
 import type { SqliteDatabase } from "../database";
 import { conflictError, notFoundError, validationError } from "../errors";
 import { ensureMemoryRoutineSlotsMigration } from "../memory/migration";
-import { mapBotRow, mapRoutineRow, type BotRow, type RoutineRow, type SessionRow } from "../rows";
+import {
+  ACTIVE_RUN_STATUS_SQL,
+  mapBotRow,
+  mapRoutineRow,
+  type BotRow,
+  type RoutineRow,
+  type SessionRow,
+} from "../rows";
 
 interface RoutineSlotRow {
   readonly routine_id: string;
@@ -321,7 +328,7 @@ export class SqliteRoutines {
     const row = this.database.db
       .query<{ id: string }, [string]>(
         `SELECT id FROM runs
-         WHERE session_id = ? AND status IN ('queued', 'running', 'waiting_approval')
+         WHERE session_id = ? AND status IN ${ACTIVE_RUN_STATUS_SQL}
          LIMIT 1`,
       )
       .get(sessionId);

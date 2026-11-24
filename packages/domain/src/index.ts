@@ -36,6 +36,8 @@ export {
   type RequestApprovalOutcome,
   type RoutineStore,
   type RunCoordinator,
+  type RunEnd,
+  type ActiveRun,
   type RunEventInput,
   type RunStore,
   type RunStreamState,

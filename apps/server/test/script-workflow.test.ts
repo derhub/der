@@ -246,11 +246,7 @@ describe("decide Script Approvals", () => {
     await driver.kick(id);
     await store.finishRun({
       runId: run.id,
-      status: "cancelled",
-      terminalEvent: {
-        chunkKey: "cancelled",
-        chunk: { type: "RUN_ERROR", message: "cancelled", code: "run.cancelled" },
-      },
+      end: { kind: "fail", code: "run.cancelled", detail: "cancelled" },
     });
     await driver.cancelRun(run.id);
 
@@ -367,11 +363,7 @@ describe("preserve effect safety when the host cannot continue", () => {
     await started.promise;
     await store.finishRun({
       runId: run.id,
-      status: "cancelled",
-      terminalEvent: {
-        chunkKey: "cancelled",
-        chunk: { type: "RUN_ERROR", message: "cancelled", code: "run.cancelled" },
-      },
+      end: { kind: "fail", code: "run.cancelled", detail: "cancelled" },
     });
 
     await Promise.all([driving, driver.cancelRun(run.id)]);
@@ -416,11 +408,7 @@ describe("preserve effect safety when the host cannot continue", () => {
     await started.promise;
     await store.finishRun({
       runId: run.id,
-      status: "cancelled",
-      terminalEvent: {
-        chunkKey: "cancelled",
-        chunk: { type: "RUN_ERROR", message: "cancelled", code: "run.cancelled" },
-      },
+      end: { kind: "fail", code: "run.cancelled", detail: "cancelled" },
     });
     const cancelling = driver.cancelRun(run.id);
     expect(scripts.load(id).execution.status).toBe("running");
@@ -448,8 +436,7 @@ describe("end a detached Script in doubt", () => {
     if (endRunFirst) {
       await store.finishRun({
         runId: run.id,
-        status: "completed",
-        terminalEvent: { chunkKey: `${run.id}:terminal`, chunk: { type: "RUN_FINISHED" } },
+        end: { kind: "complete" },
       });
     }
     store.database.db.run("DROP TRIGGER refuse_updates");
@@ -504,7 +491,9 @@ describe("end a detached Script in doubt", () => {
 });
 
 /** Holds every finish of the Run until all callers in `order` have reached it, then lets them write in that order. */
-function finishInOrder(store: SqliteStore, order: readonly FinishRunInput["status"][]) {
+function finishInOrder(store: SqliteStore, order: readonly ("completed" | "interrupted")[]) {
+  const statusOf = (input: FinishRunInput) =>
+    input.end.kind === "complete" ? "completed" : "interrupted";
   const turns = new Map(order.map((status) => [status, Promise.withResolvers<void>()]));
   const written = new Map(order.map((status) => [status, Promise.withResolvers<void>()]));
   let arrived = 0;
@@ -520,11 +509,11 @@ function finishInOrder(store: SqliteStore, order: readonly FinishRunInput["statu
         return async (input: FinishRunInput) => {
           arrived += 1;
           if (arrived === order.length) void release();
-          await turns.get(input.status)!.promise;
+          await turns.get(statusOf(input))!.promise;
           try {
             return await target.finishRun(input);
           } finally {
-            written.get(input.status)!.resolve();
+            written.get(statusOf(input))!.resolve();
           }
         };
       }

@@ -15,9 +15,10 @@ import {
   type StoredStep,
   type UtcTimestamp,
 } from "@der/domain";
-import { resumeRunAfterDecision } from "./approvals-effects";
 import type { SqliteDatabase } from "./database";
 import { notFoundError } from "./errors";
+import { ACTIVE_RUN_STATUS_SQL } from "./rows";
+import { recordApprovalDecided } from "./run-lifecycle";
 import { enqueueSessionEvent } from "./session-events";
 
 interface ExecutionRow {
@@ -274,7 +275,7 @@ export class SqliteScriptStore implements ScriptStore {
           )
           .run(now, id).changes === 1;
       if (changed) {
-        resumeRunAfterDecision(db, this.#execution(db, id).runId, now);
+        recordApprovalDecided(db, this.#execution(db, id).runId, now);
       }
       return changed;
     });
@@ -316,7 +317,7 @@ export class SqliteScriptStore implements ScriptStore {
     return this.database.db
       .query<{ id: string }, []>(
         `SELECT s.id FROM script_runs s JOIN runs r ON r.id = s.run_id
-         WHERE s.status = 'in_doubt' AND r.status IN ('queued', 'running', 'waiting_approval')
+         WHERE s.status = 'in_doubt' AND r.status IN ${ACTIVE_RUN_STATUS_SQL}
          ORDER BY s.created_at, s.occurrence, s.id`,
       )
       .all()

@@ -1,14 +1,21 @@
 import type { Database } from "bun:sqlite";
 import {
+  type ActiveRun,
   type NewSessionEvent,
-  type Run,
   type RunId,
   type SessionEvent,
   type SessionId,
   type UtcTimestamp,
 } from "@der/domain";
 import { notFoundError } from "./errors";
-import { mapRunRow, mapSessionEventRow, type RunRow, type SessionEventRow } from "./rows";
+import {
+  ACTIVE_RUN_STATUS_SQL,
+  isActiveRunStatus,
+  mapRunRow,
+  mapSessionEventRow,
+  type RunRow,
+  type SessionEventRow,
+} from "./rows";
 
 export function enqueueSessionEvent(
   db: Database,
@@ -86,11 +93,13 @@ export function countEventChain(db: Database, sessionId: SessionId): number {
   );
 }
 
-export function getActiveRun(db: Database, sessionId: SessionId): Run | undefined {
+export function getActiveRun(db: Database, sessionId: SessionId): ActiveRun | undefined {
   const row = db
     .query<RunRow, [string]>(
-      "SELECT * FROM runs WHERE session_id = ? AND status IN ('queued', 'running', 'waiting_approval')",
+      `SELECT * FROM runs WHERE session_id = ? AND status IN ${ACTIVE_RUN_STATUS_SQL}`,
     )
     .get(sessionId);
-  return row ? mapRunRow(row) : undefined;
+  return row && isActiveRunStatus(row.status)
+    ? { ...mapRunRow(row), status: row.status }
+    : undefined;
 }

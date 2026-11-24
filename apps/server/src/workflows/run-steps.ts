@@ -1,7 +1,7 @@
 import {
   DomainError,
-  formatUtcTimestamp,
   runUsage,
+  streamChunk,
   type Approval,
   type ApprovalEffectStore,
   type ApprovalId,
@@ -18,6 +18,7 @@ import {
   type MessagePart,
   type Run,
   type RunAdmission,
+  type RunEnd,
   type RunEvent,
   type RunEventInput,
   type RunId,
@@ -70,7 +71,7 @@ export interface WorkflowDeps {
   readonly scriptRoutines?: () => ScriptRoutineDeps;
 }
 
-type RunFinishDeps = Pick<WorkflowDeps, "now" | "onRunFinished"> & {
+type RunFinishDeps = Pick<WorkflowDeps, "onRunFinished"> & {
   readonly store: Pick<RunStore, "finishRun">;
 };
 
@@ -178,7 +179,7 @@ export async function executeEngineStage(deps: WorkflowDeps, run: Run): Promise<
     await deps.store.appendRunEvents(run.id, [
       {
         chunkKey: `${run.id}:attempt-reset${earlier.keySuffix}`,
-        chunk: { type: "CUSTOM", name: ATTEMPT_RESET_EVENT },
+        chunk: streamChunk({ type: "CUSTOM", name: ATTEMPT_RESET_EVENT }),
       },
     ]);
   }
@@ -350,11 +351,11 @@ async function runEngineAttempt(
     await deps.store.appendRunEvents(run.id, [
       {
         chunkKey: `${run.id}:engine-attempt-finished${keySuffix}`,
-        chunk: {
+        chunk: streamChunk({
           type: "CUSTOM",
           name: ENGINE_ATTEMPT_FINISHED_EVENT,
           value,
-        },
+        }),
       },
     ]);
   };
@@ -369,10 +370,11 @@ async function runEngineAttempt(
       if (event.type === "chunk") {
         // finishRun writes the terminal chunk with the status that wins, so an interruption
         // committing after the engine's own RUN_FINISHED cannot leave a contradicting stream.
-        if (event.isTerminal) {
+        const chunk = streamChunk(event.chunk);
+        if (event.isTerminal || chunk === undefined) {
           continue;
         }
-        pendingChunks.push({ chunkKey: `${event.chunkKey}${keySuffix}`, chunk: event.chunk });
+        pendingChunks.push({ chunkKey: `${event.chunkKey}${keySuffix}`, chunk });
         if (pendingChunks.length >= batchSize || isToolCallEnd(event.chunk)) {
           await flush();
         }
@@ -441,7 +443,7 @@ async function runEngineAttempt(
 export function approvalRequestedEvent(approval: Approval): RunEventInput {
   return {
     chunkKey: `${approval.runId}:approval:${approval.id}:requested`,
-    chunk: {
+    chunk: streamChunk({
       type: "CUSTOM",
       name: "approval.requested",
       value: {
@@ -451,7 +453,7 @@ export function approvalRequestedEvent(approval: Approval): RunEventInput {
         prompt: approval.prompt,
         deadline: approval.deadline,
       },
-    },
+    }),
   };
 }
 
@@ -531,28 +533,33 @@ export async function finalizeInterruptedUncertainStep(
     readonly detail: string;
   },
 ): Promise<Run> {
-  const now = deps.now ? deps.now() : new Date();
   const finished = await finishRunAndNotify(deps, {
     runId: input.run.id,
-    status: "interrupted",
-    terminalEvent: {
-      chunkKey: `${input.run.id}:terminal`,
-      chunk: {
-        type: "RUN_ERROR",
-        message: input.detail,
-        code: "effect.outcome_uncertain",
-        runId: input.run.id,
-        threadId: input.run.sessionId,
-      },
-    },
-    detail: input.detail,
-    checkpoint: {
-      interruptedEffectId: input.effectId,
-      recordedAt: formatUtcTimestamp(now),
-    },
+    end: { kind: "interrupt", detail: input.detail, effectId: input.effectId },
   });
-
   return finished.run;
+}
+
+function runEnd(outcome: RunStageResult): RunEnd {
+  switch (outcome.kind) {
+    case "completed":
+      return {
+        kind: "complete",
+        ...(outcome.finalMessageParts !== undefined
+          ? { finalMessageParts: outcome.finalMessageParts }
+          : {}),
+        ...(outcome.usage !== undefined ? { usage: outcome.usage } : {}),
+        ...(outcome.engineSession !== undefined ? { engineSession: outcome.engineSession } : {}),
+      };
+    case "interrupted":
+      return {
+        kind: "interrupt",
+        detail: outcome.detail,
+        ...(outcome.effectId !== undefined ? { effectId: outcome.effectId } : {}),
+      };
+    case "failed":
+      return { kind: "fail", code: outcome.code, detail: outcome.detail };
+  }
 }
 
 export async function finalizeDirectRunStep(
@@ -562,71 +569,9 @@ export async function finalizeDirectRunStep(
     readonly outcome: RunStageResult;
   },
 ): Promise<Run> {
-  if (input.outcome.kind === "interrupted") {
-    const now = deps.now ? deps.now() : new Date();
-    const finished = await finishRunAndNotify(deps, {
-      runId: input.run.id,
-      status: "interrupted",
-      terminalEvent: {
-        chunkKey: `${input.run.id}:terminal`,
-        chunk: {
-          type: "RUN_ERROR",
-          message: input.outcome.detail,
-          code: "effect.outcome_uncertain",
-          runId: input.run.id,
-          threadId: input.run.sessionId,
-        },
-      },
-      detail: input.outcome.detail,
-      ...(input.outcome.effectId !== undefined
-        ? {
-            checkpoint: {
-              interruptedEffectId: input.outcome.effectId,
-              recordedAt: formatUtcTimestamp(now),
-            },
-          }
-        : {}),
-    });
-    return finished.run;
-  }
-
-  if (input.outcome.kind === "completed") {
-    const finished = await finishRunAndNotify(deps, {
-      runId: input.run.id,
-      status: "completed",
-      terminalEvent: {
-        chunkKey: `${input.run.id}:terminal`,
-        chunk: {
-          type: "RUN_FINISHED",
-          threadId: input.run.sessionId,
-          runId: input.run.id,
-        },
-      },
-      ...(input.outcome.finalMessageParts !== undefined
-        ? { finalMessageParts: input.outcome.finalMessageParts }
-        : {}),
-      ...(input.outcome.usage !== undefined ? { usage: input.outcome.usage } : {}),
-      ...(input.outcome.engineSession !== undefined
-        ? { engineSession: input.outcome.engineSession }
-        : {}),
-    });
-    return finished.run;
-  }
-
   const finished = await finishRunAndNotify(deps, {
     runId: input.run.id,
-    status: "failed",
-    terminalEvent: {
-      chunkKey: `${input.run.id}:terminal`,
-      chunk: {
-        type: "RUN_ERROR",
-        message: input.outcome.detail,
-        code: input.outcome.code,
-        runId: input.run.id,
-        threadId: input.run.sessionId,
-      },
-    },
-    detail: input.outcome.detail,
+    end: runEnd(input.outcome),
   });
   return finished.run;
 }

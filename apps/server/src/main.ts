@@ -1,8 +1,10 @@
 import { mkdirSync } from "node:fs";
 import { resolve } from "node:path";
 import {
+  activeRunStatus,
   defineIntegration,
   IntegrationRegistry,
+  type ActiveRunStatus,
   type Approval,
   type ApprovalResolutionInput,
   type Bot,
@@ -101,6 +103,26 @@ import { codeModeInstructions } from "./code-mode/instructions";
 import { createCatalogSearchCapability, createSearchTool } from "./code-mode/search";
 import { createEventDelivery, type DeliverEvents } from "./events/event-delivery";
 import { ScriptDriver } from "./scripts/script-driver";
+
+/** What a direct-mode restart does with an active Run: start it again, or end it. */
+type Recovery = "start" | "end";
+
+/** A Script Run is resumable: its execution is durable and its driver picks it up again. */
+const SCRIPT_RUN_RECOVERY = {
+  queued: "start",
+  running: "start",
+  waiting_approval: "start",
+} as const satisfies Record<ActiveRunStatus, Recovery>;
+
+/**
+ * Direct mode keeps no engine state across a restart, so an event Run an engine already started
+ * is ended; left active, it would hold its session's next event for ever.
+ */
+const EVENT_RUN_RECOVERY = {
+  queued: "start",
+  running: "end",
+  waiting_approval: "end",
+} as const satisfies Record<ActiveRunStatus, Recovery>;
 
 export interface SeededFixtureRecords {
   readonly bot: Bot;
@@ -829,46 +851,23 @@ export async function startServer(options: CreateServerOptions = {}): Promise<Ru
         }
       });
       resumeDirectRuns = async () => {
-        // Direct mode keeps no engine state across a restart, so an event Run that was running
-        // is ended; left active, it would hold its session's next event for ever.
-        const stranded = store.database.db
-          .query<{ id: RunId; session_id: string }, []>(
-            `SELECT id, session_id FROM runs
-             WHERE origin = 'event' AND engine != 'script' AND status = 'running'`,
+        const active = store.database.db
+          .query<{ id: RunId; engine: string; status: ActiveRunStatus }, ActiveRunStatus[]>(
+            `SELECT id, engine, status FROM runs
+             WHERE (engine = 'script' OR origin = 'event') AND status IN (${activeRunStatus.options.map(() => "?").join(", ")})
+             ORDER BY created_at, id`,
           )
-          .all();
-        for (const { id, session_id: sessionId } of stranded) {
-          const detail =
-            "The server restarted while this Run was running; direct mode cannot resume it.";
-          const finished = await store.finishRun({
-            runId: id,
-            status: "interrupted",
-            terminalEvent: {
-              chunkKey: `${id}:terminal`,
-              chunk: {
-                type: "RUN_ERROR",
-                message: detail,
-                code: "run.server_restarted",
-                runId: id,
-                threadId: sessionId,
-              },
-            },
-            detail,
-          });
+          .all(...activeRunStatus.options);
+        for (const { id, engine, status } of active) {
+          const recovery = (engine === "script" ? SCRIPT_RUN_RECOVERY : EVENT_RUN_RECOVERY)[status];
+          if (recovery === "start") {
+            await directDriver.start?.(id);
+            continue;
+          }
+          const finished = await store.finishRun({ runId: id, end: { kind: "server_restarted" } });
           if (finished.won) {
             await finishRun(finished.run);
           }
-        }
-        // An event Run still queued was admitted and never started (a crash after admission).
-        const resumable = store.database.db
-          .query<{ id: RunId }, []>(
-            `SELECT id FROM runs
-             WHERE (engine = 'script' AND status IN ('queued', 'running', 'waiting_approval'))
-                OR (origin = 'event' AND status = 'queued')`,
-          )
-          .all();
-        for (const { id } of resumable) {
-          await directDriver.start?.(id);
         }
       };
       closeDirectDriver = () => directDriver.close();

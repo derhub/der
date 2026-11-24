@@ -1,4 +1,5 @@
 import type {
+  ActiveRunStatus,
   BotStore,
   ExecuteResult,
   JsonValue,
@@ -7,9 +8,7 @@ import type {
   SessionEvent,
   SessionEventStore,
 } from "@der/domain";
-import { fitResult } from "../code-mode/execute";
-
-const encoder = new TextEncoder();
+import { boundResult } from "../code-mode/result-boundary";
 
 export interface EventDeliveryDeps {
   readonly store: SessionEventStore;
@@ -37,21 +36,19 @@ export function createEventDelivery(deps: EventDeliveryDeps): DeliverEvents {
 }
 
 /**
- * The event Run's text: the payload as JSON. A finished Script's result is fitted to
- * the size `execute` returns inline, less the rest of the payload, so a long result
- * cannot flood the Run.
+ * The event Run's text: the payload as JSON. A finished Script's result crosses the same
+ * boundary as an inline one, measured on this whole text, so a long result cannot flood the Run.
  */
 function eventText(payload: JsonValue, maxResultBytes: number): string {
   if (typeof payload === "object" && payload !== null && !Array.isArray(payload)) {
     const { result } = payload;
     if (typeof result === "object" && result !== null && !Array.isArray(result)) {
-      const envelope = encoder.encode(JSON.stringify({ ...payload, result: null })).byteLength - 4;
-      const fitted = fitResult(
-        result as unknown as ExecuteResult,
-        Math.max(0, maxResultBytes - envelope),
-        payload["status"] === "in_doubt",
-      );
-      return JSON.stringify({ ...payload, result: fitted });
+      const slot = JSON.stringify(`result-${crypto.randomUUID()}`);
+      const [prefix, suffix] = JSON.stringify({ ...payload, result: JSON.parse(slot) }).split(slot);
+      return boundResult(result as unknown as ExecuteResult, maxResultBytes, {
+        prefix: prefix!,
+        suffix: suffix!,
+      }).text;
     }
   }
   return JSON.stringify(payload);
@@ -83,14 +80,21 @@ function eventRequest(event: SessionEvent, maxResultBytes: number): RunRequest {
 }
 
 /**
- * An event that already has a Run was admitted before a crash. A Run still queued never
- * started; admitting the same request again starts it, as admission is idempotent per event.
+ * What delivering an event does with the active Run it was admitted to before a crash. A Run
+ * still queued never started; admitting the same request again starts it, as admission is
+ * idempotent per event. A started Run has a driver, or startup ended it.
  */
+const ADMITTED_RUN_RECOVERY = {
+  queued: "admit",
+  running: "none",
+  waiting_approval: "none",
+} as const satisfies Record<ActiveRunStatus, "admit" | "none">;
+
 async function deliverOne(deps: EventDeliveryDeps, event: SessionEvent): Promise<void> {
   const { store } = deps;
   if (event.runId !== null) {
     const active = store.getActiveRun(event.sessionId);
-    if (active?.id === event.runId && active.status === "queued") {
+    if (active?.id === event.runId && ADMITTED_RUN_RECOVERY[active.status] === "admit") {
       await deps.admit(eventRequest(event, deps.maxResultBytes));
     }
     store.markSessionEventDelivered(event.id, event.runId);

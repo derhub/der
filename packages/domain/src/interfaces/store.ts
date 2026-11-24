@@ -21,6 +21,7 @@ import type {
 import type { Message, MessagePart } from "../schemas/message";
 import type { Routine, RoutineTarget } from "../schemas/routine";
 import type {
+  ActiveRunStatus,
   ChannelIntakeMetadata,
   ContextMode,
   Run,
@@ -29,10 +30,10 @@ import type {
   RunRequest,
   RunStatus,
   RunUsage,
-  TerminalRunStatus,
 } from "../schemas/run";
 import type { CreateSessionInput, Session } from "../schemas/session";
 import type { NewSessionEvent, SessionEvent } from "../schemas/session-event";
+import type { StreamChunk } from "../protocol/run-stream";
 import type { UtcTimestamp } from "../protocol/timestamp";
 
 export type MaybePromise<T> = T | Promise<T>;
@@ -64,29 +65,40 @@ export interface SessionEventStore {
   markSessionEventDelivered(eventId: string, runId: RunId): void;
   countPendingSessionEvents(sessionId: SessionId): number;
   countEventChain(sessionId: SessionId): number;
-  getActiveRun(sessionId: SessionId): Run | undefined;
+  getActiveRun(sessionId: SessionId): ActiveRun | undefined;
 }
 
-/** Appended chunks are never terminal: only `finishRun` writes the terminal chunk, with the status it sets. */
+/** A Run that has not ended. */
+export type ActiveRun = Run & { readonly status: ActiveRunStatus };
+
 export interface RunEventInput {
   readonly chunkKey: string;
-  readonly chunk: JsonValue;
+  readonly chunk: StreamChunk;
 }
+
+/**
+ * How a Run ends. The Run lifecycle derives the status and the terminal chunk from it:
+ * `complete` ends `completed` with `RUN_FINISHED`; the others end with `RUN_ERROR`.
+ */
+export type RunEnd =
+  | {
+      readonly kind: "complete";
+      readonly finalMessageParts?: readonly MessagePart[];
+      readonly usage?: RunUsage;
+      /**
+       * The finish that first makes the Run terminal replaces the session's engine sessions with
+       * this one, at the reply's ordinal when there is one, or with none when absent. A finish of a
+       * Run that is already terminal writes nothing.
+       */
+      readonly engineSession?: EngineSessionInput;
+    }
+  | { readonly kind: "fail"; readonly code: string; readonly detail: string }
+  | { readonly kind: "interrupt"; readonly detail: string; readonly effectId?: EffectId }
+  | { readonly kind: "server_restarted" };
 
 export interface FinishRunInput {
   readonly runId: RunId;
-  readonly status: TerminalRunStatus;
-  readonly terminalEvent: RunEventInput;
-  readonly finalMessageParts?: readonly MessagePart[];
-  readonly detail?: string;
-  readonly checkpoint?: JsonValue | null;
-  readonly usage?: RunUsage;
-  /**
-   * The finish that first makes the Run terminal replaces the session's engine sessions with this
-   * one, at the reply's ordinal when there is one, or with none when absent. A finish of a Run
-   * that is already terminal writes nothing.
-   */
-  readonly engineSession?: EngineSessionInput;
+  readonly end: RunEnd;
 }
 
 /**

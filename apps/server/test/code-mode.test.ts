@@ -11,7 +11,8 @@ import {
   type Run,
 } from "@der/domain";
 import type { AnyTool } from "@tanstack/ai";
-import { createExecuteTool, fitResult } from "#code-mode/execute";
+import { createExecuteTool } from "#code-mode/execute";
+import { boundResult } from "#code-mode/result-boundary";
 import { codeModeInstructions } from "#code-mode/instructions";
 import { createSearchTool } from "#code-mode/search";
 import { createFixtureCapabilities } from "#capabilities/fixture";
@@ -434,20 +435,21 @@ describe("cap what execute hands back", () => {
     {
       case: "a long message and long logs",
       script:
-        'console.log("a".repeat(30)); console.log("b".repeat(30)); throw new Error("y".repeat(200));',
+        'console.log("a".repeat(60)); console.log("b".repeat(60)); throw new Error("y".repeat(400));',
       expected: {
         ok: false,
-        error: { kind: "script", message: `Error: ${"y".repeat(44)} [message truncated]` },
+        error: { kind: "script", message: `Error: ${"y".repeat(150)} [message truncated]` },
         logs: ["[logs truncated]"],
       },
     },
     {
       case: "a short message and long logs",
-      script: 'console.log("a".repeat(40)); console.log("b".repeat(40)); throw new Error("short");',
+      script:
+        'console.log("a".repeat(100)); console.log("b".repeat(100)); throw new Error("short");',
       expected: {
         ok: false,
         error: { kind: "script", message: "Error: short" },
-        logs: ["a".repeat(40), "[logs truncated]"],
+        logs: ["a".repeat(100), "[logs truncated]"],
       },
     },
   ])(
@@ -456,31 +458,17 @@ describe("cap what execute hands back", () => {
       const { server } = await startDirectServer();
       const owner = await admitOwningRun(server, "code-mode-truncate-error");
 
-      const result = await callTool(executeToolFor(server, owner.run, 150), {
+      const result = await callTool(executeToolFor(server, owner.run, 256), {
         script: testCase.script,
       });
 
       expect({
         result,
-        fits: new TextEncoder().encode(JSON.stringify(result)).byteLength <= 150,
+        fits: new TextEncoder().encode(JSON.stringify(result)).byteLength <= 256,
       }).toEqual({ result: testCase.expected, fits: true });
     },
     60_000,
   );
-
-  it("fits a failed result into an 80-byte limit", async () => {
-    const { server } = await startDirectServer();
-    const owner = await admitOwningRun(server, "code-mode-truncate-80");
-
-    const result = await callTool(executeToolFor(server, owner.run, 80), {
-      script: 'throw new Error("y".repeat(200));',
-    });
-
-    expect({ result, bytes: new TextEncoder().encode(JSON.stringify(result)).byteLength }).toEqual({
-      result: { ok: false, error: { kind: "script", message: "[message truncated]" }, logs: [] },
-      bytes: 80,
-    });
-  }, 60_000);
 
   it("fits a call to a 70,000-character unknown capability into the default limit", async () => {
     const { server } = await startDirectServer();
@@ -510,15 +498,13 @@ describe("cap what execute hands back", () => {
     const { server } = await startDirectServer();
     const owner = await admitOwningRun(server, "code-mode-truncate");
 
-    const result = await callTool(executeToolFor(server, owner.run, 20), {
-      script: `return "x".repeat(100);`,
+    const result = await callTool(executeToolFor(server, owner.run, 256), {
+      script: `return "x".repeat(400);`,
     });
 
-    expect(result).toEqual({
-      ok: true,
-      result: `"${"x".repeat(19)}`,
-      logs: [],
-      truncated: true,
+    expect({ result, bytes: new TextEncoder().encode(JSON.stringify(result)).byteLength }).toEqual({
+      result: { ok: true, result: `"${"x".repeat(204)}`, logs: [], truncated: true },
+      bytes: 256,
     });
   }, 60_000);
 });
@@ -643,19 +629,19 @@ describe("fit a failed result that ended in doubt", () => {
     {
       case: "every unknown write and the start of the stop reason",
       count: 2,
-      limit: 200,
-      bytes: 200,
-      message: `${"x".repeat(64)} [message truncated] Unknown outcome: #1 notes.append, #2 notes.append.`,
+      limit: 300,
+      bytes: 300,
+      message: `${"x".repeat(164)} [message truncated] Unknown outcome: #1 notes.append, #2 notes.append.`,
     },
     {
       case: "the unknown writes that fit and the count of the rest",
-      count: 5,
-      limit: 130,
-      bytes: 129,
-      message: "[message truncated] Unknown outcome: #1 notes.append, 4 omitted.",
+      count: 20,
+      limit: 256,
+      bytes: 256,
+      message: `${"x".repeat(6)} [message truncated] Unknown outcome: ${names(8)}, 12 omitted.`,
     },
   ])("keeps $case within the limit", ({ count, limit, bytes, message }) => {
-    const result = fitResult(ended(`${head}Unknown outcome: ${names(count)}.`), limit, true);
+    const { result } = boundResult(ended(`${head}Unknown outcome: ${names(count)}.`), limit);
 
     expect({ result, bytes: new TextEncoder().encode(JSON.stringify(result)).byteLength }).toEqual({
       result: ended(message),
@@ -663,8 +649,8 @@ describe("fit a failed result that ended in doubt", () => {
     });
   });
 
-  it.each([80, 81, 97, 120, 333, 1000])("never serializes past a limit of %i bytes", (limit) => {
-    const result = fitResult(
+  it.each([256, 257, 300, 333, 1000])("never serializes past a limit of %i bytes", (limit) => {
+    const { result } = boundResult(
       {
         ok: false,
         error: {
@@ -676,15 +662,14 @@ describe("fit a failed result that ended in doubt", () => {
         logs: ["l".repeat(50), "m".repeat(50)],
       },
       limit,
-      true,
     );
 
     expect(new TextEncoder().encode(JSON.stringify(result)).byteLength).toBeLessThanOrEqual(limit);
   });
 
-  it("returns the fixed in_doubt marker below the minimum limit", () => {
-    expect(fitResult(ended(`${head}Unknown outcome: ${names(2)}.`), 40, true)).toEqual(
-      ended("in_doubt"),
+  it("refuses a limit below the 256-byte minimum", () => {
+    expect(() => boundResult(ended(`${head}Unknown outcome: ${names(2)}.`), 255)).toThrow(
+      "result limit 255 is below the minimum of 256 bytes",
     );
   });
 });

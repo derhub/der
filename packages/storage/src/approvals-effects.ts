@@ -20,9 +20,11 @@ import {
 import { compiledParsers } from "@der/domain/compiled";
 import { canonicalizeJson } from "./canonical";
 import { insertOutboxForBindings } from "./channel-outbox";
+import { recordApprovalDecided, recordApprovalRequested } from "./run-lifecycle";
 import type { SqliteDatabase } from "./database";
 import { conflictError, notFoundError, validationError } from "./errors";
 import {
+  isActiveRunStatus,
   mapApprovalRow,
   mapEffectRow,
   mapOutboxEventRow,
@@ -139,14 +141,7 @@ export async function requestApproval(
       now,
     );
 
-    db.query(
-      `UPDATE runs
-       SET status = 'waiting_approval', updated_at = ?
-       WHERE id = ? AND status IN ('queued', 'running')
-         AND NOT EXISTS (
-           SELECT 1 FROM script_runs s WHERE 'script:' || s.id = ? AND s.detached_at IS NOT NULL
-         )`,
-    ).run(now, input.runId, input.awakeable);
+    recordApprovalRequested(db, input.runId, input.awakeable, now);
 
     const sessionBindings = db
       .query<ChannelBindingRow, [string, string]>(
@@ -236,25 +231,6 @@ export function listPendingScriptApprovalsPastDeadline(
     .map(mapApprovalRow);
 }
 
-/** A Run waits only on Approvals of attended executions; a detached execution's Approvals do not hold it. */
-export function resumeRunAfterDecision(
-  db: SqliteDatabase["db"],
-  runId: RunId,
-  at: UtcTimestamp,
-): void {
-  db.query(
-    `UPDATE runs SET status = 'running', updated_at = ?
-     WHERE id = ? AND status = 'waiting_approval'
-       AND NOT EXISTS (
-         SELECT 1 FROM approvals a
-         WHERE a.run_id = runs.id AND a.status = 'pending'
-           AND NOT EXISTS (
-             SELECT 1 FROM script_runs s WHERE 'script:' || s.id = a.awakeable AND s.detached_at IS NOT NULL
-           )
-       )`,
-  ).run(at, runId);
-}
-
 export async function decideApproval(
   database: SqliteDatabase,
   decision: ApprovalResolutionInput,
@@ -311,7 +287,7 @@ export async function decideApproval(
            WHERE id = ? AND status = 'pending'`,
         ).run(row.deadline, now, input.approvalId);
 
-        if (row.awakeable.startsWith("script:")) resumeRunAfterDecision(db, row.run_id, now);
+        if (row.awakeable.startsWith("script:")) recordApprovalDecided(db, row.run_id, now);
         return { kind: "expired", deadline: row.deadline };
       }
 
@@ -335,7 +311,7 @@ export async function decideApproval(
       }
 
       if (input.status === "approved" || row.awakeable.startsWith("script:")) {
-        resumeRunAfterDecision(db, row.run_id, now);
+        recordApprovalDecided(db, row.run_id, now);
       }
 
       const updated = db
@@ -454,10 +430,7 @@ export async function beginEffect(
         db
           .query("SELECT 1 FROM script_runs WHERE id = ? AND detached_at IS NOT NULL")
           .get(options.scriptExecutionId) !== null;
-      if (
-        run === null ||
-        (!detached && !["queued", "running", "waiting_approval"].includes(run.status))
-      ) {
+      if (run === null || (!detached && !isActiveRunStatus(run.status))) {
         throw conflictError(
           "effect.run_ended",
           "Run has ended",

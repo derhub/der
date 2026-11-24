@@ -3,6 +3,7 @@ import { Hono } from "hono";
 import {
   PROBLEM_DETAILS_MEDIA_TYPE,
   SSE_CACHE_CONTROL,
+  streamChunk,
   SSE_CONTENT_TYPE,
   type Approval,
   type Bot,
@@ -560,8 +561,11 @@ describe("enforce exact approval scope, decision replay, key conflicts, and SSE 
     });
 
     await server.store.appendRunEvents(run.id, [
-      { chunkKey: `${run.id}:1`, chunk: { type: "RUN_STARTED", runId: run.id } },
-      { chunkKey: `${run.id}:2`, chunk: { type: "TEXT_MESSAGE_CONTENT", delta: "part-1" } },
+      { chunkKey: `${run.id}:1`, chunk: streamChunk({ type: "RUN_STARTED", runId: run.id }) },
+      {
+        chunkKey: `${run.id}:2`,
+        chunk: streamChunk({ type: "TEXT_MESSAGE_CONTENT", delta: "part-1" }),
+      },
     ]);
 
     let readCalls = 0;
@@ -608,12 +612,7 @@ describe("enforce exact approval scope, decision replay, key conflicts, and SSE 
 
     await server.store.finishRun({
       runId: run.id,
-      status: "completed",
-      terminalEvent: {
-        chunkKey: `${run.id}:3`,
-        chunk: { type: "RUN_FINISHED", runId: run.id, threadId: sessionId },
-      },
-      finalMessageParts: [{ type: "text", text: "done" }],
+      end: { kind: "complete", finalMessageParts: [{ type: "text", text: "done" }] },
     });
 
     const reconnectRes = await fetch(`${server.url}/api/runs/${run.id}/events`, {

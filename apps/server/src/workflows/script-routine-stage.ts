@@ -1,4 +1,10 @@
-import type { ExecuteResult, Run, RoutineStore, ScriptStore } from "@der/domain";
+import {
+  streamChunk,
+  type ExecuteResult,
+  type Run,
+  type RoutineStore,
+  type ScriptStore,
+} from "@der/domain";
 import { routineScriptId } from "../scripts/script-execution";
 import type { ScriptDriver } from "../scripts/script-driver";
 import type { RunStageResult, WorkflowDeps } from "./run-steps";
@@ -49,21 +55,21 @@ export async function executeScriptRoutineStage(
   await deps.store.appendRunEvents(run.id, [
     {
       chunkKey: `${run.id}:started`,
-      chunk: { type: "RUN_STARTED", threadId: run.sessionId, runId: run.id },
+      chunk: streamChunk({ type: "RUN_STARTED", threadId: run.sessionId, runId: run.id }),
     },
     {
       chunkKey: `${toolCallId}:start`,
-      chunk: { type: "TOOL_CALL_START", toolCallId, toolCallName: "execute" },
+      chunk: streamChunk({ type: "TOOL_CALL_START", toolCallId, toolCallName: "execute" }),
     },
     {
       chunkKey: `${toolCallId}:args`,
-      chunk: {
+      chunk: streamChunk({
         type: "TOOL_CALL_ARGS",
         toolCallId,
         delta: JSON.stringify({ script: execution.source }),
-      },
+      }),
     },
-    { chunkKey: `${toolCallId}:end`, chunk: { type: "TOOL_CALL_END", toolCallId } },
+    { chunkKey: `${toolCallId}:end`, chunk: streamChunk({ type: "TOOL_CALL_END", toolCallId }) },
   ]);
 
   if (resumedId === undefined) {
@@ -80,12 +86,12 @@ export async function executeScriptRoutineStage(
 
   const resultEvent = {
     chunkKey: `${toolCallId}:result`,
-    chunk: {
+    chunk: streamChunk({
       type: "TOOL_CALL_RESULT",
       messageId,
       toolCallId,
       content: JSON.stringify(result),
-    },
+    }),
   };
   if (!result.ok) {
     await deps.store.appendRunEvents(run.id, [resultEvent]);
@@ -97,13 +103,13 @@ export async function executeScriptRoutineStage(
     resultEvent,
     {
       chunkKey: `${run.id}:msg-start`,
-      chunk: { type: "TEXT_MESSAGE_START", messageId, role: "assistant" },
+      chunk: streamChunk({ type: "TEXT_MESSAGE_START", messageId, role: "assistant" }),
     },
     {
       chunkKey: `${run.id}:delta:1`,
-      chunk: { type: "TEXT_MESSAGE_CONTENT", messageId, delta: text },
+      chunk: streamChunk({ type: "TEXT_MESSAGE_CONTENT", messageId, delta: text }),
     },
-    { chunkKey: `${run.id}:msg-end`, chunk: { type: "TEXT_MESSAGE_END", messageId } },
+    { chunkKey: `${run.id}:msg-end`, chunk: streamChunk({ type: "TEXT_MESSAGE_END", messageId }) },
   ]);
   return { kind: "completed", finalMessageParts: [{ type: "text", text }] };
 }

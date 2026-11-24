@@ -5,6 +5,7 @@ import { join } from "node:path";
 import { afterEach, describe, expect, it } from "bun:test";
 import {
   DomainError,
+  streamChunk,
   type FinishRunInput,
   type JsonValue,
   type RunEvent,
@@ -625,16 +626,21 @@ describe("append bounded run events and replay exclusively after cursor", () => 
       });
 
       const batch = await store.appendRunEvents(run.id, [
-        { chunkKey: `${run.id}:1`, chunk: { type: "RUN_STARTED", runId: run.id } },
-        { chunkKey: `${run.id}:2`, chunk: { type: "TEXT_MESSAGE_CONTENT", delta: "hel" } },
-        { chunkKey: `${run.id}:3`, chunk: { type: "TEXT_MESSAGE_CONTENT", delta: "lo" } },
-        { chunkKey: `${run.id}:2`, chunk: { type: "TEXT_MESSAGE_CONTENT", delta: "hel" } },
+        { chunkKey: `${run.id}:1`, chunk: streamChunk({ type: "RUN_STARTED", runId: run.id }) },
+        {
+          chunkKey: `${run.id}:2`,
+          chunk: streamChunk({ type: "TEXT_MESSAGE_CONTENT", delta: "hel" }),
+        },
+        {
+          chunkKey: `${run.id}:3`,
+          chunk: streamChunk({ type: "TEXT_MESSAGE_CONTENT", delta: "lo" }),
+        },
+        {
+          chunkKey: `${run.id}:2`,
+          chunk: streamChunk({ type: "TEXT_MESSAGE_CONTENT", delta: "hel" }),
+        },
       ]);
-      await store.finishRun({
-        runId: run.id,
-        status: "completed",
-        terminalEvent: { chunkKey: `${run.id}:terminal`, chunk: { type: "RUN_FINISHED" } },
-      });
+      await store.finishRun({ runId: run.id, end: { kind: "complete" } });
 
       expect(batch.map((event) => event.sequence)).toEqual([1, 2, 3, 2]);
       expect(store.getRunStreamState(run.id)).toEqual({
@@ -652,7 +658,10 @@ describe("append bounded run events and replay exclusively after cursor", () => 
       await expectDomainRejection(
         () =>
           store.appendRunEvents(run.id, [
-            { chunkKey: `${run.id}:5`, chunk: { type: "TEXT_MESSAGE_CONTENT", delta: "late" } },
+            {
+              chunkKey: `${run.id}:5`,
+              chunk: streamChunk({ type: "TEXT_MESSAGE_CONTENT", delta: "late" }),
+            },
           ]),
         { status: 409, code: "run.already_terminal" },
       );
@@ -875,13 +884,10 @@ describe("persist approvals, transactional outbox rows, and exact-operation effe
 
       const finished = await store.finishRun({
         runId: run.id,
-        status: "completed",
-        terminalEvent: {
-          chunkKey: `${run.id}:terminal`,
-          chunk: { type: "RUN_FINISHED", runId: run.id },
+        end: {
+          kind: "complete",
+          finalMessageParts: [{ type: "text", text: "Completed after expiry." }],
         },
-        finalMessageParts: [{ type: "text", text: "Completed after expiry." }],
-        detail: "Routine finished cleanly.",
       });
 
       expect(finished.run.status).toBe("completed");
@@ -1026,12 +1032,10 @@ describe("persist approvals, transactional outbox rows, and exact-operation effe
       });
       const finished = await store.finishRun({
         runId: run.id,
-        status: "completed",
-        terminalEvent: {
-          chunkKey: `${run.id}:terminal`,
-          chunk: { type: "RUN_FINISHED", runId: run.id },
+        end: {
+          kind: "complete",
+          finalMessageParts: [{ type: "text", text: "Webhook payload ready." }],
         },
-        finalMessageParts: [{ type: "text", text: "Webhook payload ready." }],
       });
       expect(finished.outboxEvents.map((event) => event.bindingId)).toContain("bind-webhook");
     } finally {
@@ -1182,23 +1186,14 @@ describe("bot policy", () => {
 });
 
 describe("finish a Run once", () => {
-  const completion = (runId: string) =>
-    ({
-      runId,
-      status: "completed",
-      terminalEvent: { chunkKey: `${runId}:terminal`, chunk: { type: "RUN_FINISHED", runId } },
-      finalMessageParts: [{ type: "text", text: "done" }],
-    }) as const;
-  const interruption = (runId: string) =>
-    ({
-      runId,
-      status: "interrupted",
-      terminalEvent: {
-        chunkKey: `${runId}:terminal`,
-        chunk: { type: "RUN_ERROR", code: "effect.outcome_uncertain", runId },
-      },
-      checkpoint: { interruptedEffectId: "eff-1" },
-    }) as const;
+  const completion = (runId: string): FinishRunInput => ({
+    runId,
+    end: { kind: "complete", finalMessageParts: [{ type: "text", text: "done" }] },
+  });
+  const interruption = (runId: string): FinishRunInput => ({
+    runId,
+    end: { kind: "interrupt", detail: "outcome unknown", effectId: "eff-1" },
+  });
 
   it.each<{
     order: string;
@@ -1223,13 +1218,16 @@ describe("finish a Run once", () => {
       second: completion,
       stored: {
         status: "interrupted",
-        checkpoint: { interruptedEffectId: "eff-1" },
+        checkpoint: { interruptedEffectId: "eff-1", recordedAt: "2026-11-22T16:00:00.000Z" },
         terminal: "RUN_ERROR",
         replies: [],
       },
     },
   ])("keeps the first of $order and reports that the second lost", async (testCase) => {
-    const store = openSqliteStore({ filename: createTempDbPath() });
+    const store = openSqliteStore({
+      filename: createTempDbPath(),
+      now: () => new Date("2026-11-22T16:00:00Z"),
+    });
     try {
       const { bot, session } = seedFixture(store);
       const { run } = await store.admit({
