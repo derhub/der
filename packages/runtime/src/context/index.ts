@@ -5,6 +5,7 @@ export {
   type BuildRunContextInput,
   type BuiltRunContext,
   type RunContextBot,
+  type RunContextCaps,
   type RunContextCompactionOptions,
 } from "./compaction";
 export {

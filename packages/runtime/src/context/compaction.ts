@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import type { Bot, MemoryRecord, Message, MessagePart, Skill } from "@der/domain";
 import type { ModelMessage, ToolCall } from "@tanstack/ai";
 import {
@@ -30,17 +31,27 @@ export interface RunContextCompactionOptions {
   readonly signal?: AbortSignal;
 }
 
+export interface RunContextCaps {
+  readonly memoryMaxBytes?: number;
+  readonly skillCatalogMaxBytes?: number;
+}
+
 export interface BuildRunContextInput {
   readonly bot: RunContextBot;
   readonly memory?: MemoryRecord;
   readonly skills?: readonly Skill[];
   readonly modelFamily?: ModelFamily;
+  readonly caps?: RunContextCaps;
+  readonly codeModeInstructions?: string;
   readonly messages: readonly Message[];
   readonly compaction: RunContextCompactionOptions;
 }
 
 export interface BuiltRunContext {
   readonly systemPrompts: readonly string[];
+  readonly baseHash: string;
+  readonly contextHash: string;
+  readonly contextBlock: string;
   readonly messages: readonly ModelMessage[];
   readonly compacted: boolean;
   readonly tokensBefore: number;
@@ -213,11 +224,37 @@ export function renderSafeSkillCatalog(
   return renderCatalog(skills.map(toSkillMetadata), family);
 }
 
+function capPointer(capability: string): string {
+  return `[truncated: the rest is available through the ${capability} capability]`;
+}
+
+function capText(text: string, maxBytes: number | undefined, capability: string): string {
+  if (maxBytes === undefined || Buffer.byteLength(text, "utf8") <= maxBytes) {
+    return text;
+  }
+  const pointer = capPointer(capability);
+  const budget = maxBytes - Buffer.byteLength(pointer, "utf8") - 1;
+  const kept: string[] = [];
+  let used = 0;
+  for (const line of text.split("\n")) {
+    used += Buffer.byteLength(line, "utf8") + 1;
+    if (used > budget) {
+      break;
+    }
+    kept.push(line);
+  }
+  return [...kept, pointer].join("\n");
+}
+
+function hashParts(parts: readonly string[]): string {
+  return createHash("sha256").update(JSON.stringify(parts)).digest("hex");
+}
+
 export async function buildRunContext(input: BuildRunContextInput): Promise<BuiltRunContext> {
-  const systemPrompts: string[] = [];
+  const basePrompts: string[] = [];
 
   if (input.bot.persona.trim().length > 0) {
-    systemPrompts.push(input.bot.persona.trim());
+    basePrompts.push(input.bot.persona.trim());
   }
 
   for (const msg of input.messages) {
@@ -226,19 +263,36 @@ export async function buildRunContext(input: BuildRunContextInput): Promise<Buil
     }
     const text = msg.parts.map(formatPartText).filter(Boolean).join("\n").trim();
     if (text.length > 0) {
-      systemPrompts.push(text);
+      basePrompts.push(text);
     }
   }
 
+  const contextParts: string[] = [];
+
   if (input.memory && input.memory.markdown.trim().length > 0) {
-    systemPrompts.push(`[Bot Memory v${input.memory.version}]\n${input.memory.markdown.trim()}`);
+    contextParts.push(
+      capText(
+        `[Bot Memory v${input.memory.version}]\n${input.memory.markdown.trim()}`,
+        input.caps?.memoryMaxBytes,
+        "memory",
+      ),
+    );
   }
 
   const skills = input.skills ?? [];
   const renderedSkills = renderSafeSkillCatalog(skills, input.modelFamily ?? "other");
   if (renderedSkills && renderedSkills.trim().length > 0) {
-    systemPrompts.push(renderedSkills.trim());
+    contextParts.push(capText(renderedSkills.trim(), input.caps?.skillCatalogMaxBytes, "skills"));
   }
+
+  const codeModePrompts =
+    input.codeModeInstructions !== undefined ? [input.codeModeInstructions] : [];
+  const systemPrompts = [...basePrompts, ...contextParts, ...codeModePrompts];
+  const hashes = {
+    baseHash: hashParts([...basePrompts, ...codeModePrompts]),
+    contextHash: hashParts(contextParts),
+    contextBlock: contextParts.join("\n\n"),
+  };
 
   let currentMessages: ModelMessage[] = messagesToModelMessages(input.messages);
 
@@ -259,6 +313,7 @@ export async function buildRunContext(input: BuildRunContextInput): Promise<Buil
   if (!shouldCompact) {
     return {
       systemPrompts,
+      ...hashes,
       messages: currentMessages,
       compacted: false,
       tokensBefore,
@@ -294,6 +349,7 @@ export async function buildRunContext(input: BuildRunContextInput): Promise<Buil
   if (!compactedMessages) {
     return {
       systemPrompts,
+      ...hashes,
       messages: currentMessages,
       compacted: false,
       tokensBefore,
@@ -316,6 +372,7 @@ export async function buildRunContext(input: BuildRunContextInput): Promise<Buil
 
   return {
     systemPrompts,
+    ...hashes,
     messages: compactedMessages,
     compacted: true,
     tokensBefore,
