@@ -36,6 +36,8 @@ export type MaybePromise<T> = T | Promise<T>;
 export interface MessagePage {
   readonly limit?: number;
   readonly afterOrdinal?: number;
+  /** Return the last `limit` messages after `afterOrdinal`, still in ascending order. */
+  readonly newest?: boolean;
 }
 
 export interface BotStore {
