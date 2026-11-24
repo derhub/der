@@ -5,10 +5,10 @@ An integration adds capabilities to the catalog that agents reach through the `s
 ## How an agent uses a capability
 
 1. The agent calls `search({ query })`. The catalog scores every capability against the query and returns the best matches with a TypeScript declaration and an example.
-2. The agent calls `execute({ script })` with a Script that calls `await der.<namespace>.<name>(input)`.
-3. The catalog validates the input against the capability's `input` schema, runs `execute`, and parses the result against the `output` schema. A `write` that needs approval waits for an operator decision first.
+2. The agent calls `execute({ script })` with a Script that calls `await step.run("<namespace>.<name>", input)`.
+3. The host validates the input against the capability's `input` schema before it stores the step, runs `execute`, and parses the result against the `output` schema. A `write` waits for an operator decision first when the bot's policy says `ask`.
 
-Everything else (limits, durability, script routines) is in the README under "Code mode".
+Everything else (limits, resume, policy, events, script routines) is in the README under "Code mode" and the sections that follow it.
 
 ## Define an integration
 
@@ -44,7 +44,7 @@ interface Capability<TInput extends z.ZodType, TOutput extends z.ZodType> {
   readonly input: TInput;
   readonly output: TOutput;
   readonly effect: "read" | "write";
-  readonly approval: "none" | "always" | ((input: z.infer<TInput>) => boolean);
+  readonly approval: "none" | "always" | ((input: z.infer<TInput>) => boolean); // the default; a bot's policy can override it
   readonly example?: string;
   execute(input: z.infer<TInput>, ctx: CapabilityContext): Promise<z.infer<TOutput>>;
 }
@@ -57,32 +57,36 @@ interface CapabilityContext {
 
 - `input` and `output` are Zod schemas. Inputs and outputs cross a JSON boundary, so use JSON-compatible types.
 - `ctx.botId` is the bot that owns the calling Run. Scope data by it, as the host capabilities do (`apps/server/src/capabilities/scope.ts`).
-- `ctx.effect` is set for a `write` called from a Script. It carries the identity of the recorded Effect (`runId`, `operationKind: "capability"`, `operationId` = the capability id, `canonicalArguments`, `attemptId`). Use `attemptId` as an idempotency key against the upstream system.
-- `ctx.signal` in direct mode aborts when the ScriptRun is cancelled or the server closes. Under Restate a cancel does not abort it: cancel marks the ScriptRun and later calls end as cancelled, while a call already running continues. There the signal aborts when the current attempt ends (for example a server restart), which is not a cancel.
+- `ctx.effect` is set for a `write` called from a Script. It carries the identity of the recorded Effect (`runId`, `operationKind: "capability"`, `operationId` = the capability id, `canonicalArguments`, `attemptId`). `attemptId` is the execution id and the step's position, and stays the same when the Script is re-run. Use it as an idempotency key against the upstream system.
+- `ctx.signal` aborts when the server closes. Cancelling a Script does not abort a call that is already running: the call gets up to ten seconds to finish, and no further step starts.
 - `example` is one line of Script that calls the capability. It is shown to the agent and counts toward search ranking.
 
 ### Ids
 
-An id is dot-separated, with at least two segments, and every segment matches `[A-Za-z_$][A-Za-z0-9_$]*`: `tasks.list`, `mcp.github.create_issue`. The first segment is the namespace. A Script calls the capability as `der.<id>`. `defineCapability` throws `integration.invalid_capability` for any other id.
+An id is dot-separated, with at least two segments, and every segment matches `[A-Za-z_$][A-Za-z0-9_$]*`: `tasks.list`, `mcp.github.create_issue`. The first segment is the namespace. A Script calls the capability as `step.run("<id>", input)`. `defineCapability` throws `integration.invalid_capability` for any other id.
 
 ### Effect class and approval
 
-- `effect: "read"` must have `approval: "none"`; `defineCapability` throws otherwise. Reads run as journaled steps and leave no Effect record.
-- `effect: "write"` gets an Effect record before it runs. The recorded outcome is replayed if the Script resumes, so the call is not repeated.
+- `effect: "read"` must have `approval: "none"`; `defineCapability` throws otherwise. A read's result is stored with its step and the read is not invoked again on a re-run; it leaves no Effect record.
+- `effect: "write"` is stored as a step and gets an Effect record before it runs. The recorded outcome is returned when the Script is re-run, so the call is applied once.
 - `approval: "always"` asks an operator for an exact-operation Approval on every call. The prompt shows the capability id and the first 400 characters of the input.
-- `approval: (input) => boolean` is evaluated against the validated input. It runs once per call, before the Approval is requested, in a journaled step: a replay reuses the recorded answer instead of evaluating it again. If the input does not validate, it counts as no approval and the call then fails with `capability.invalid_input`.
+- `approval: (input) => boolean` is evaluated against the validated input, once, when the step is first stored. The answer is stored with the step, so a re-run does not evaluate it again.
 - `approval: "none"` on a `write` runs without an Approval but is still recorded as an Effect.
 
-A denied or expired Approval ends the Script with error kind `denied` or `expired`.
+`approval` is the default, not the final word. Each bot has a policy that maps a capability id or a namespace to `allow`, `ask` or `deny`; the most specific entry wins, and the capability's `approval` applies where none matches (README, "Per-bot policy"). `ask` requests an Approval for the exact capability and arguments, `allow` runs the write without one, and `deny` rejects the step with error kind `refused`. A `read` set to `ask` runs without asking. A capability author cannot widen a deny.
 
-Scripts run one at a time per Run. A call a Script issues without `await` is carried to its recorded outcome before the Script's result is reported, unless the Script has already hit a limit or been cancelled; a call that ends in a `capability`, `denied`, `expired` or `cancelled` error replaces the Script's own result with that error. A `write` is refused, and the Run interrupted, when the Run has a write whose outcome is unknown.
+A denied or expired Approval rejects that step's promise with error kind `denied` or `expired`. The Script can catch it and carry on; an uncaught rejection ends the Script. A step a Script starts and never awaits still runs before the Script ends. A write is refused while another write of the same Run has an unknown outcome.
+
+### Input validation
+
+`Catalog.validateInput(id, input)` checks the input against the capability's `input` schema and throws `capability.invalid_input` (`400`). The host calls it before it stores a step, so an input that fails never reaches `execute` and nothing is stored; the Script ends with error kind `capability`. `Catalog.invoke` calls it again, so the schema is also the check for any other caller.
 
 ### Errors
 
-- A `DomainError` thrown by a `write` is recorded as a failed Effect and reaches the Script as an error of kind `capability`. A Script can catch it.
-- Any other error thrown by a `write` after dispatch is treated as an unknown outcome: the Effect is marked unknown, and the Script ends with kind `capability` and status `interrupted`. Throw a `DomainError` when the upstream call is known not to have happened.
-- Any error thrown by a `read` reaches the Script as kind `capability`.
-- Unknown ids fail with `capability.unknown` (`404`), invalid input with `capability.invalid_input` (`400`).
+- A `DomainError` thrown by a `write` is recorded as a failed Effect and rejects the step with kind `failed`. A Script can catch it.
+- Any other error thrown by a `write` after dispatch is treated as an unknown outcome: the Effect is marked unknown and the write is not repeated. The step's promise never settles, so nothing that depends on it runs. The execution ends `in_doubt` with error kind `capability`, and the owning Run is interrupted with `effect.outcome_uncertain`. The same holds when the server stops after a write began and before its outcome was recorded. Throw a `DomainError` when the upstream call is known not to have happened.
+- Any error thrown by a `read` rejects the step with kind `failed`. A read that was interrupted before its result was stored runs again on a re-run, so a read must have no effect.
+- Unknown ids fail with `capability.unknown` (`404`), invalid input with `capability.invalid_input` (`400`). Both end the Script with kind `capability` before a step is stored.
 
 ## The declaration an agent sees
 
@@ -97,7 +101,9 @@ type TasksRemoveOutput = {
   removed: number;
 };
 /** Remove tasks by id. Removing more than one task needs approval. */
-declare function der.tasks.remove(input: TasksRemoveInput): Promise<TasksRemoveOutput>;
+declare const step: {
+  run(id: "tasks.remove", input: TasksRemoveInput): Promise<TasksRemoveOutput>;
+};
 ```
 
 - Optional Zod fields render as optional properties. `.describe("...")` on a field renders as a doc comment on it.
@@ -128,7 +134,7 @@ export function createTasksIntegration(tasks: Task[] = []) {
     output: z.object({ tasks: z.array(task) }),
     effect: "read",
     approval: "none",
-    example: "await der.tasks.list({ openOnly: true })",
+    example: 'await step.run("tasks.list", { openOnly: true })',
     async execute(input) {
       return { tasks: tasks.filter((entry) => !input.openOnly || !entry.done) };
     },
@@ -141,7 +147,7 @@ export function createTasksIntegration(tasks: Task[] = []) {
     output: z.object({ removed: z.number().int() }),
     effect: "write",
     approval: (input) => input.ids.length > 1,
-    example: 'await der.tasks.remove({ ids: ["t1"] })',
+    example: 'await step.run("tasks.remove", { ids: ["t1"] })',
     async execute(input) {
       const before = tasks.length;
       tasks.splice(0, tasks.length, ...tasks.filter((entry) => !input.ids.includes(entry.id)));
@@ -169,15 +175,15 @@ await startServer({ integrations: [createTasksIntegration()] });
 An agent can then run:
 
 ```js
-const { tasks } = await der.tasks.list({ openOnly: true });
-return await der.tasks.remove({ ids: tasks.map((entry) => entry.id) });
+const { tasks } = await step.run("tasks.list", { openOnly: true });
+return await step.run("tasks.remove", { ids: tasks.map((entry) => entry.id) });
 ```
 
-With two or more open tasks the `tasks.remove` call waits for an operator Approval and then records one Effect. With one open task it runs at once and still records an Effect.
+With two or more open tasks and no policy entry for `tasks`, the `tasks.remove` call waits for an operator Approval and then records one Effect. A bot with `"tasks.remove": "allow"` skips the Approval, and one with `"tasks": "deny"` has the call rejected with kind `refused`. With one open task it runs at once and still records an Effect.
 
 ## Remote MCP tools
 
-`@der/mcp` (`integrations/mcp/src/mcp-tools.ts`) is an integration that uses `listCapabilities`. For each tool of each configured server it registers `mcp.<server>.<tool>`. Characters outside `[A-Za-z0-9_$]` in the server id or tool name become `_`, and a name that starts with a digit gets a leading `_`; two tools that map to the same id fail the integration with `mcp.duplicate_capability_id`. Every MCP capability is a `write` with `approval: "always"`, unless the tool is named in the server's `readOnlyTools` or the server sets `defaultRequiresApproval: false`. In both cases `approval` is `"none"`. A tool outside `allowedTools` (when set) is not registered. The server reads the server list from `DER_MCP_SERVERS_JSON`.
+`@der/mcp` (`integrations/mcp/src/mcp-tools.ts`) is an integration that uses `listCapabilities`. For each tool of each configured server it registers `mcp.<server>.<tool>`. Characters outside `[A-Za-z0-9_$]` in the server id or tool name become `_`, and a name that starts with a digit gets a leading `_`; two tools that map to the same id fail the integration with `mcp.duplicate_capability_id`. Every MCP capability is a `write` with `approval: "always"` as its default, unless the tool is named in the server's `readOnlyTools` or the server sets `defaultRequiresApproval: false`. In both cases `approval` is `"none"`. A tool outside `allowedTools` (when set) is not registered. The server reads the server list from `DER_MCP_SERVERS_JSON`.
 
 ## Run usage and context mode
 
