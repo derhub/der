@@ -591,6 +591,11 @@ export function OperatorSidebar({
                         />
                         <span {...stylex.props(styles.truncate)}>{entry.title}</span>
                       </span>
+                      {entry.pendingEventCount ? (
+                        <span {...stylex.props(styles.engineTag)}>
+                          {entry.pendingEventCount} waiting
+                        </span>
+                      ) : null}
                       {entry.engine ? (
                         <span {...stylex.props(styles.engineTag)}>{entry.engine}</span>
                       ) : null}

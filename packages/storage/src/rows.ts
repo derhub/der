@@ -14,6 +14,7 @@ import {
   type Run,
   type RunEvent,
   type Session,
+  type SessionEvent,
 } from "@der/domain";
 import { compiledParsers } from "@der/domain/compiled";
 
@@ -41,8 +42,20 @@ export interface SessionRow {
   readonly bot_id: string;
   readonly title: string;
   readonly engine: string | null;
+  readonly pending_event_count?: number;
   readonly created_at: string;
   readonly updated_at: string;
+}
+
+export interface SessionEventRow {
+  readonly id: string;
+  readonly bot_id: string;
+  readonly session_id: string;
+  readonly kind: string;
+  readonly payload_json: string;
+  readonly state: string;
+  readonly run_id: string | null;
+  readonly created_at: string;
 }
 
 export interface RoutineRow {
@@ -196,8 +209,24 @@ export function mapSessionRow(row: SessionRow): Session {
     botId: row.bot_id,
     title: row.title,
     ...(row.engine !== null ? { engine: row.engine } : {}),
+    ...(row.pending_event_count !== undefined
+      ? { pendingEventCount: row.pending_event_count }
+      : {}),
     createdAt: row.created_at,
     updatedAt: row.updated_at,
+  });
+}
+
+export function mapSessionEventRow(row: SessionEventRow): SessionEvent {
+  return compiledParsers.sessionEvent.parse({
+    id: row.id,
+    botId: row.bot_id,
+    sessionId: row.session_id,
+    kind: row.kind,
+    payload: JSON.parse(row.payload_json) as unknown,
+    state: row.state,
+    runId: row.run_id,
+    createdAt: row.created_at,
   });
 }
 

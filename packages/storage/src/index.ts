@@ -10,6 +10,7 @@ export {
   SCRIPT_ROUTINES_MIGRATION,
   SCRIPT_RUNS_MIGRATION,
   SCRIPT_STEPS_MIGRATION,
+  SESSION_EVENTS_MIGRATION,
   type StorageMigration,
 } from "./migrations";
 export {

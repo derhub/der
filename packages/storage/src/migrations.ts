@@ -38,6 +38,11 @@ const scriptStepsMigrationPath = resolve(import.meta.dirname, "../migrations/009
 
 const botPolicyMigrationPath = resolve(import.meta.dirname, "../migrations/010-bot-policy.sql");
 
+const sessionEventsMigrationPath = resolve(
+  import.meta.dirname,
+  "../migrations/011-session-events.sql",
+);
+
 export const CORE_MIGRATION: StorageMigration = {
   version: "001-core",
   sql: readFileSync(coreMigrationPath, "utf8"),
@@ -87,6 +92,12 @@ export const BOT_POLICY_MIGRATION: StorageMigration = {
   sql: readFileSync(botPolicyMigrationPath, "utf8"),
 };
 
+export const SESSION_EVENTS_MIGRATION: StorageMigration = {
+  version: "011-session-events",
+  sql: readFileSync(sessionEventsMigrationPath, "utf8"),
+  disableForeignKeys: true,
+};
+
 export const CORE_MIGRATIONS: readonly StorageMigration[] = [
   CORE_MIGRATION,
   OUTBOX_DESTINATIONS_MIGRATION,
@@ -97,6 +108,7 @@ export const CORE_MIGRATIONS: readonly StorageMigration[] = [
   ENGINE_SESSIONS_MIGRATION,
   SCRIPT_STEPS_MIGRATION,
   BOT_POLICY_MIGRATION,
+  SESSION_EVENTS_MIGRATION,
 ];
 
 export function applyMigrations(

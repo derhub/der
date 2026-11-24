@@ -40,6 +40,9 @@ import {
   type RunRequest,
   type RunStore,
   type Session,
+  type SessionEvent,
+  type SessionEventStore,
+  type NewSessionEvent,
   type SessionId,
   type SessionStore,
   type Store,
@@ -47,6 +50,14 @@ import {
   type UtcTimestamp,
 } from "@der/domain";
 import { compiledParsers } from "@der/domain/compiled";
+import {
+  countEventChain,
+  countPendingSessionEvents,
+  enqueueSessionEvent,
+  getActiveRun,
+  listPendingSessionEvents,
+  markSessionEventDelivered,
+} from "./session-events";
 import {
   beginEffect as beginEffectCommand,
   completeEffect as completeEffectCommand,
@@ -130,7 +141,8 @@ export class SqliteStore
     ApprovalEffectStore,
     OutboxStore,
     RoutineStore,
-    EngineSessionStore
+    EngineSessionStore,
+    SessionEventStore
 {
   readonly database: SqliteDatabase;
   private readonly maxEventBatchSize: number;
@@ -337,10 +349,37 @@ export class SqliteStore
   listSessions(botId: BotId): Session[] {
     const rows = this.database.db
       .query<SessionRow, [string]>(
-        "SELECT * FROM sessions WHERE bot_id = ? ORDER BY created_at ASC, id ASC",
+        `SELECT s.*, (
+           SELECT COUNT(*) FROM session_events e WHERE e.session_id = s.id AND e.state = 'pending'
+         ) AS pending_event_count
+         FROM sessions s WHERE s.bot_id = ? ORDER BY s.created_at ASC, s.id ASC`,
       )
       .all(botId);
     return rows.map(mapSessionRow);
+  }
+
+  enqueueSessionEvent(input: NewSessionEvent): SessionEvent {
+    return this.database.inTransaction((db) => enqueueSessionEvent(db, input, this.nowUtc()));
+  }
+
+  listPendingSessionEvents(): SessionEvent[] {
+    return listPendingSessionEvents(this.database.db);
+  }
+
+  markSessionEventDelivered(eventId: string, runId: RunId): void {
+    markSessionEventDelivered(this.database.db, eventId, runId);
+  }
+
+  countPendingSessionEvents(sessionId: SessionId): number {
+    return countPendingSessionEvents(this.database.db, sessionId);
+  }
+
+  countEventChain(sessionId: SessionId): number {
+    return countEventChain(this.database.db, sessionId);
+  }
+
+  getActiveRun(sessionId: SessionId): Run | undefined {
+    return getActiveRun(this.database.db, sessionId);
   }
 
   createRoutine(input: CreateRoutineInput): Routine {

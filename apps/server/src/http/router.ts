@@ -45,7 +45,7 @@ import { handleRunEventsSse } from "./sse";
 const admitRunBodySchema = compileSchema(
   z.strictObject({
     botId: id.optional(),
-    origin: runOrigin.default("http"),
+    origin: runOrigin.exclude(["event"]).default("http"),
     engine: engineKind.optional(),
     input: z.object({
       parts: z.array(messagePart).min(1),

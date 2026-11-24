@@ -54,6 +54,7 @@ export type {
   RunEventInput,
   RunStore,
   RunStreamState,
+  SessionEventStore,
   SessionStore,
   Store,
 } from "./store";

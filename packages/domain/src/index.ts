@@ -39,6 +39,7 @@ export {
   type RunEventInput,
   type RunStore,
   type RunStreamState,
+  type SessionEventStore,
   type Sandbox,
   type ScriptEnd,
   type ScriptExecution,

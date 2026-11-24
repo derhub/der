@@ -32,6 +32,7 @@ import type {
   TerminalRunStatus,
 } from "../schemas/run";
 import type { CreateSessionInput, Session } from "../schemas/session";
+import type { NewSessionEvent, SessionEvent } from "../schemas/session-event";
 import type { UtcTimestamp } from "../protocol/timestamp";
 
 export type MaybePromise<T> = T | Promise<T>;
@@ -55,6 +56,15 @@ export interface SessionStore {
   getSession(sessionId: SessionId): MaybePromise<Session | undefined>;
   listSessions(botId: BotId): MaybePromise<Session[]>;
   listMessages(sessionId: SessionId, options?: MessagePage): MaybePromise<Message[]>;
+}
+
+export interface SessionEventStore {
+  enqueueSessionEvent(input: NewSessionEvent): SessionEvent;
+  listPendingSessionEvents(): SessionEvent[];
+  markSessionEventDelivered(eventId: string, runId: RunId): void;
+  countPendingSessionEvents(sessionId: SessionId): number;
+  countEventChain(sessionId: SessionId): number;
+  getActiveRun(sessionId: SessionId): Run | undefined;
 }
 
 export interface RunEventInput {

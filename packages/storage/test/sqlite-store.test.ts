@@ -120,6 +120,7 @@ describe("configure SQLite WAL, foreign keys, busy timeout, and migration seam",
         "008-engine-sessions",
         "009-script-steps",
         "010-bot-policy",
+        "011-session-events",
       ]);
     } finally {
       store.close();
@@ -146,6 +147,7 @@ describe("configure SQLite WAL, foreign keys, busy timeout, and migration seam",
         "008-engine-sessions",
         "009-script-steps",
         "010-bot-policy",
+        "011-session-events",
       ]);
     } finally {
       reopened.close();

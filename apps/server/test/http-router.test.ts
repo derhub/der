@@ -526,12 +526,16 @@ describe("serve Hono HTTP router on narrow domain ports", () => {
     }
   });
 
-  it("rejects telegram or invalid run origins and channelIntake on POST /api/sessions/:sessionId/runs with RFC 9457 Problem Details", async () => {
+  it("rejects telegram, event or invalid run origins and channelIntake on POST /api/sessions/:sessionId/runs with RFC 9457 Problem Details", async () => {
     const app = createHttpApp(createMinimalDeps());
     const invalidPayloads = [
       {
         origin: "telegram",
         input: { parts: [{ type: "text", text: "removed telegram origin" }] },
+      },
+      {
+        origin: "event",
+        input: { parts: [{ type: "text", text: "host-only event origin" }] },
       },
       {
         origin: "legacy-channel",

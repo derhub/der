@@ -99,6 +99,7 @@ import { createFixtureCapabilities } from "./capabilities/fixture";
 import { createExecuteTool } from "./code-mode/execute";
 import { codeModeInstructions } from "./code-mode/instructions";
 import { createCatalogSearchCapability, createSearchTool } from "./code-mode/search";
+import { createEventDelivery, type DeliverEvents } from "./events/event-delivery";
 import { ScriptDriver } from "./scripts/script-driver";
 
 export interface SeededFixtureRecords {
@@ -770,7 +771,9 @@ export async function startServer(options: CreateServerOptions = {}): Promise<Ru
     const engines = new Map<EngineKind, Engine>(options.engines);
     const clockNow = options.now ?? (() => store.database.now());
     const scriptRunStore = openSqliteScriptStore({ database: store.database });
+    let deliverEvents: DeliverEvents | undefined;
     const scriptDriver = new ScriptDriver({
+      deliverEvents: () => deliverEvents?.() ?? Promise.resolve(),
       store,
       scripts: scriptRunStore,
       bots: store,
@@ -790,6 +793,11 @@ export async function startServer(options: CreateServerOptions = {}): Promise<Ru
     });
     closeScriptDriver = () => scriptDriver.close();
 
+    const finishRun = async (run: Run): Promise<void> => {
+      await scriptDriver.cancelRun(run.id);
+      await deliverEvents?.();
+    };
+
     let coordinator: RunCoordinator;
     let routineSchedule: RoutineScheduleClient;
     const scriptRoutines = (): ScriptRoutineDeps => ({ routines, scriptRunStore, scriptDriver });
@@ -805,7 +813,7 @@ export async function startServer(options: CreateServerOptions = {}): Promise<Ru
         driver: directDriver,
         approvalTimeoutMs: config.approvalTimeoutMs,
         now: clockNow,
-        onRunFinished: (run) => scriptDriver.cancelRun(run.id),
+        onRunFinished: finishRun,
         scriptRoutines,
       });
       directDriver.setRunner(async (runId) => {
@@ -853,7 +861,7 @@ export async function startServer(options: CreateServerOptions = {}): Promise<Ru
         driver: restateDriver,
         approvalTimeoutMs: config.approvalTimeoutMs,
         now: clockNow,
-        onRunFinished: (run) => scriptDriver.cancelRun(run.id),
+        onRunFinished: finishRun,
         scriptRoutines,
       });
       routineSchedule = createRoutineScheduleClient(config.restateIngressUrl);
@@ -878,6 +886,13 @@ export async function startServer(options: CreateServerOptions = {}): Promise<Ru
         fetch: (request) => restateFetchHandler(request),
       });
     }
+
+    deliverEvents = createEventDelivery({
+      store,
+      bots: store,
+      admit: (request) => coordinator.admit(request),
+      logError: (error) => console.error("Event delivery error", error),
+    });
 
     const loadRunInput = createContextLoader({
       store,

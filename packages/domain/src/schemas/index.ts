@@ -143,5 +143,13 @@ export {
   type ScriptRunStatus,
   type TerminalScriptRunStatus,
 } from "./script-run";
+export {
+  newSessionEvent,
+  sessionEvent,
+  sessionEventKind,
+  type NewSessionEvent,
+  type SessionEvent,
+  type SessionEventKind,
+} from "./session-event";
 export { createSessionInput, session, type CreateSessionInput, type Session } from "./session";
 export { skill, skillFrontmatter, type Skill, type SkillFrontmatter } from "./skill";

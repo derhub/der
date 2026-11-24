@@ -26,6 +26,7 @@ export interface ScriptDriverDeps extends ScriptExecutionDeps {
     listPendingScriptApprovalsPastDeadline(at: UtcTimestamp): MaybePromise<readonly Approval[]>;
   };
   readonly sweepIntervalMs: number;
+  readonly deliverEvents?: () => Promise<void>;
   readonly logError?: (error: unknown) => void;
 }
 
@@ -171,6 +172,7 @@ export class ScriptDriver {
         this.#background(this.kick(id));
       }
     }
+    await this.deps.deliverEvents?.();
   }
 
   async #drive(id: string, changes: EventTarget): Promise<void> {

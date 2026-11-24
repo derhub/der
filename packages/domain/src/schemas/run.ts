@@ -3,10 +3,10 @@ import { utcTimestamp } from "../protocol/timestamp";
 import { id, jsonValue, runEngineKind } from "./common";
 import { message, messagePart } from "./message";
 
-export const runOrigin = z.enum(["http", "web", "routine"]);
+export const runOrigin = z.enum(["http", "web", "routine", "event"]);
 export type RunOrigin = z.infer<typeof runOrigin>;
 
-export const persistedRunOrigin = z.enum(["http", "web", "telegram", "routine"]);
+export const persistedRunOrigin = z.enum(["http", "web", "telegram", "routine", "event"]);
 export type PersistedRunOrigin = z.infer<typeof persistedRunOrigin>;
 
 export const runStatus = z.enum([
