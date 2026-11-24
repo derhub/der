@@ -697,11 +697,12 @@ export function ChatWorkspace({
   const handleApprovalSignal = useCallback(
     (eventName: string, _payload: unknown, runId: string) => {
       void refreshRunState(runId);
+      onRunActivity?.();
       if (eventName === "approval.requested") {
         onAnnounce(`Approval required for run ${runId}.`);
       }
     },
-    [onAnnounce, refreshRunState],
+    [onAnnounce, onRunActivity, refreshRunState],
   );
 
   const handleRunSettled = useCallback(

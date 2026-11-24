@@ -521,59 +521,6 @@ function sessionOf(botId: string, id: string, title: string, pendingEventCount: 
   };
 }
 
-/**
- * The fixture server with a second bot. The first session list of each bot is answered at once;
- * later ones of the fixture bot wait in `held` until the test answers them, and later ones of the
- * other bot are never answered, so only the answers the test gives can change the list.
- */
-function createHeldSessionsFetch() {
-  const server = createFakeServerFetch();
-  const held: ((pendingEventCount: number) => void)[] = [];
-  let fixtureListings = 0;
-  let otherListings = 0;
-  const fetcher: typeof fetch = async (input, init) => {
-    const rawUrl =
-      typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
-    const url = new URL(rawUrl, "http://127.0.0.1:5173");
-    if (url.pathname === "/api/bots") {
-      const { bots } = (await (await server.fetcher(input, init)).json()) as { bots: object[] };
-      return Response.json({
-        bots: [...bots, { ...bots[0], id: "bot-other", name: "Other Bot" }],
-      });
-    }
-    if (url.pathname === "/api/bots/bot-other/sessions") {
-      otherListings += 1;
-      if (otherListings > 1) {
-        return new Promise<Response>(() => {});
-      }
-      return Response.json({
-        sessions: [sessionOf("bot-other", "sess-other", "Other Session", 0)],
-      });
-    }
-    if (url.pathname === "/api/bots/bot-fixture/sessions") {
-      fixtureListings += 1;
-      if (fixtureListings === 1) {
-        return Response.json({
-          sessions: [sessionOf("bot-fixture", "sess-fixture", "Fixture Session", 0)],
-        });
-      }
-      return new Promise<Response>((resolve) => {
-        held.push((pendingEventCount) =>
-          resolve(
-            Response.json({
-              sessions: [
-                sessionOf("bot-fixture", "sess-fixture", "Fixture Session", pendingEventCount),
-              ],
-            }),
-          ),
-        );
-      });
-    }
-    return server.fetcher(input, init);
-  };
-  return { fetcher, held, otherListings: () => otherListings };
-}
-
 type ListedSession = ReturnType<typeof sessionOf>;
 
 /**
@@ -585,7 +532,7 @@ type ListedSession = ReturnType<typeof sessionOf>;
  */
 function createSessionListsFetch(
   respond: (botId: string, listing: number) => ListedSession[] | undefined,
-  options: { readonly holdRunEvents?: boolean } = {},
+  options: { readonly holdRunEvents?: boolean; readonly ignoreAbort?: boolean } = {},
 ) {
   const server = createFakeServerFetch();
   const listings = new Map<string, number>();
@@ -632,9 +579,11 @@ function createSessionListsFetch(
         return answered(sessions).response;
       }
       return new Promise<Response>((resolve, reject) => {
-        init?.signal?.addEventListener("abort", () =>
-          reject(new DOMException("The operation was aborted.", "AbortError")),
-        );
+        if (!options.ignoreAbort) {
+          init?.signal?.addEventListener("abort", () =>
+            reject(new DOMException("The operation was aborted.", "AbortError")),
+          );
+        }
         held.push({
           botId,
           listing,
@@ -727,16 +676,29 @@ describe("keep the session list current", () => {
 
   it("drops a session list that arrives after its bot is no longer selected", async () => {
     const user = userEvent.setup();
-    const server = createHeldSessionsFetch();
+    const server = createSessionListsFetch(
+      (botId, listing) => {
+        if (botId === "bot-other") {
+          return listing === 1 ? [sessionOf(botId, "sess-other", "Other Session", 0)] : undefined;
+        }
+        return listing === 1 ? [sessionOf(botId, "sess-fixture", "Fixture Session", 0)] : undefined;
+      },
+      { ignoreAbort: true },
+    );
     render(<App fetcher={server.fetcher} sessionRefreshMs={20} />);
 
     await screen.findAllByText("Fixture Session");
-    await waitFor(() => expect(server.held.length).toBeGreaterThan(0));
+    await waitFor(() =>
+      expect(server.held.some((entry) => entry.botId === "bot-fixture")).toBe(true),
+    );
     await user.click(screen.getByRole("button", { name: /^Other Bot/ }));
     await screen.findAllByText("Other Session");
-    const listed = server.otherListings();
-    for (const answer of server.held.splice(0)) answer(1);
-    await waitFor(() => expect(server.otherListings()).toBeGreaterThan(listed));
+    const fixtureHeld = server.held.filter((entry) => entry.botId === "bot-fixture");
+    await Promise.all(
+      fixtureHeld.map((entry) =>
+        settled(entry.answer([sessionOf("bot-fixture", "sess-fixture", "Fixture Session", 1)])),
+      ),
+    );
 
     expect({
       fixture: screen.queryAllByText("Fixture Session").length,
@@ -765,15 +727,31 @@ describe("keep the session list current", () => {
   });
 
   it("drops an older listing of the same bot that answers after a newer one", async () => {
-    const server = createSessionListsFetch((botId, listing) =>
-      listing === 2 ? [sessionOf(botId, "sess-fixture", "Fixture Session", 2)] : undefined,
+    const user = userEvent.setup();
+    const server = createSessionListsFetch(
+      (botId, listing) => {
+        if (botId !== "bot-fixture") {
+          return [sessionOf(botId, "sess-other", "Other Session", 0)];
+        }
+        if (listing === 1) {
+          return [sessionOf(botId, "sess-fixture", "Fixture Session", 0)];
+        }
+        if (listing === 3) {
+          return [sessionOf(botId, "sess-fixture", "Fixture Session", 2)];
+        }
+        return undefined;
+      },
+      { ignoreAbort: true },
     );
     render(<App fetcher={server.fetcher} sessionRefreshMs={20} />);
 
+    await screen.findAllByText("Fixture Session");
+    await waitFor(() => expect(server.held.some((entry) => entry.listing === 2)).toBe(true));
+    await user.click(screen.getByRole("button", { name: "Refresh" }));
     await screen.findByText("2 waiting");
     await settled(
       server.held
-        .find((entry) => entry.listing === 1)!
+        .find((entry) => entry.listing === 2)!
         .answer([sessionOf("bot-fixture", "sess-fixture", "Fixture Session", 1)]),
     );
 
