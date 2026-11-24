@@ -104,6 +104,7 @@ export {
 } from "./routine";
 export {
   channelIntakeMetadata,
+  contextMode,
   persistedRunOrigin,
   run,
   runAdmission,
@@ -111,8 +112,10 @@ export {
   runOrigin,
   runRequest,
   runStatus,
+  runUsage,
   terminalRunStatus,
   type ChannelIntakeMetadata,
+  type ContextMode,
   type PersistedRunOrigin,
   type Run,
   type RunAdmission,
@@ -120,6 +123,7 @@ export {
   type RunOrigin,
   type RunRequest,
   type RunStatus,
+  type RunUsage,
   type TerminalRunStatus,
 } from "./run";
 export {

@@ -30,7 +30,12 @@ import {
   type Skill,
 } from "@der/domain";
 import { createMcpIntegration } from "@der/mcp";
-import { buildRunContext, createSkillCatalog, type SkillCatalog } from "@der/runtime/context";
+import {
+  buildRunContext,
+  createSkillCatalog,
+  type RunContextCaps,
+  type SkillCatalog,
+} from "@der/runtime/context";
 import {
   createAntigravityEngine,
   createClaudeCodeEngine,
@@ -359,6 +364,7 @@ function createContextLoader(input: {
   readonly skills: SkillCatalog;
   readonly coordinator: RunCoordinator;
   readonly maxTokens: number;
+  readonly caps: RunContextCaps;
   readonly codeMode: {
     readonly catalog: Catalog;
     readonly scriptRunStore: SqliteScriptRuns;
@@ -378,6 +384,8 @@ function createContextLoader(input: {
       bot: bot ?? { id: run.botId, name: run.botId, persona: "" },
       ...(memoryRecord !== undefined ? { memory: memoryRecord } : {}),
       skills: skillList,
+      caps: input.caps,
+      codeModeInstructions: codeModeInstructions(input.codeMode.catalog),
       messages,
       compaction: {
         maxTokens: input.maxTokens,
@@ -390,7 +398,7 @@ function createContextLoader(input: {
     const codeMode = input.codeMode;
     return {
       messages: [...built.messages],
-      systemPrompts: [...built.systemPrompts, codeModeInstructions(codeMode.catalog)],
+      systemPrompts: [...built.systemPrompts],
       tools: [
         createSearchTool({ catalog: codeMode.catalog, maxResultBytes: codeMode.maxResultBytes }),
         createExecuteTool({
@@ -780,6 +788,10 @@ export async function startServer(options: CreateServerOptions = {}): Promise<Ru
       skills,
       coordinator,
       maxTokens: config.contextMaxTokens,
+      caps: {
+        memoryMaxBytes: config.memoryPromptMaxBytes,
+        skillCatalogMaxBytes: config.skillCatalogMaxBytes,
+      },
       codeMode: {
         catalog,
         scriptRunStore,

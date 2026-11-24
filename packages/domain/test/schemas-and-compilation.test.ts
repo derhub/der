@@ -87,6 +87,8 @@ const fixtures = {
     status: "running" as const,
     routineId: null,
     checkpoint: null,
+    usage: null,
+    contextMode: null,
     createdAt: "2026-11-22T15:00:00Z",
     updatedAt: "2026-11-22T15:00:00Z",
     finishedAt: null,
@@ -376,6 +378,7 @@ describe("keep Memory schema and capability entry points distinct", () => {
         };
       },
       getRun: () => fixtures.run,
+      listSessionRuns: () => [fixtures.run],
       markRunRunning: async () => fixtures.run,
       appendRunEvents: async () => [fixtures.runEvent],
       getRunStreamState: () => ({

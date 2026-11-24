@@ -612,6 +612,22 @@ function createRunRoutes(deps: {
     return jsonResponse(admission, 202);
   });
 
+  routes.get("/api/sessions/:sessionId/runs", async (c) => {
+    const pathname = new URL(c.req.url).pathname;
+    const sessionId = c.req.param("sessionId");
+    if (!(await deps.sessions.getSession(sessionId))) {
+      return problemResponse({
+        type: "https://der.invalid/problems/session-not-found",
+        title: "Session not found",
+        status: 404,
+        detail: `Session ${sessionId} does not exist.`,
+        instance: pathname,
+        code: "session.not_found",
+      });
+    }
+    return jsonResponse({ runs: await deps.runs.listSessionRuns(sessionId) });
+  });
+
   routes.get("/api/runs/:runId/events", (c) => {
     const runId = c.req.param("runId");
     return handleRunEventsSse(c, runId, {

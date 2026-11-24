@@ -19,6 +19,7 @@ import {
   type RunId,
   type RunRequest,
   type RunStore,
+  type RunUsage,
   type UtcTimestamp,
   type Workflow,
 } from "@der/domain";
@@ -70,6 +71,7 @@ export type RunStageResult =
   | {
       readonly kind: "completed";
       readonly finalMessageParts?: readonly MessagePart[];
+      readonly usage?: RunUsage;
     }
   | {
       readonly kind: "interrupted";
@@ -211,6 +213,7 @@ export async function executeEngineStage(deps: WorkflowDeps, run: Run): Promise<
         return {
           kind: "completed",
           ...(event.finalMessage ? { finalMessageParts: event.finalMessage.parts } : {}),
+          ...(event.usage !== undefined ? { usage: event.usage } : {}),
         };
       }
 
@@ -413,6 +416,7 @@ export async function finalizeDirectRunStep(
       ...(input.outcome.finalMessageParts !== undefined
         ? { finalMessageParts: input.outcome.finalMessageParts }
         : {}),
+      ...(input.outcome.usage !== undefined ? { usage: input.outcome.usage } : {}),
     });
     return finished.run;
   }

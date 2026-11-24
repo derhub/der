@@ -1,4 +1,4 @@
-import type { EngineEvent, EngineReadiness, JsonValue, Run } from "@der/domain";
+import type { EngineEvent, EngineReadiness, JsonValue, Run, RunUsage } from "@der/domain";
 import { compiledParsers } from "@der/domain/compiled";
 import type { AnyTool, ModelMessage, StreamChunk } from "@tanstack/ai";
 import type { ApprovalBridge, ApprovalBroker } from "./approval-bridge";
@@ -68,6 +68,33 @@ export function checkRunReadinessGate(
   }
 
   return undefined;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+function countOrNull(value: unknown): number | null {
+  return typeof value === "number" ? value : null;
+}
+
+function readRunUsage(finished: Record<string, unknown>): RunUsage | undefined {
+  const usage = finished["usage"];
+  if (
+    !isRecord(usage) ||
+    typeof usage["promptTokens"] !== "number" ||
+    typeof usage["completionTokens"] !== "number"
+  ) {
+    return undefined;
+  }
+  const details = isRecord(usage["promptTokensDetails"]) ? usage["promptTokensDetails"] : {};
+  return {
+    inputTokens: usage["promptTokens"],
+    cachedInputTokens: countOrNull(details["cachedTokens"]),
+    cacheWriteTokens: countOrNull(details["cacheWriteTokens"]),
+    outputTokens: usage["completionTokens"],
+    reportedCostUsd: countOrNull(usage["cost"]),
+  };
 }
 
 function isTransportLossMessage(message: string): boolean {
@@ -225,8 +252,10 @@ export async function* bridgeAdapterStream(options: {
           chunk: normalizedChunk,
           isTerminal: true,
         });
+        const usage = readRunUsage(chunk);
         yield compiledParsers.engineEvent.parse({
           type: "completed",
+          ...(usage !== undefined ? { usage } : {}),
           ...(assistantText.length > 0
             ? { finalMessage: { parts: [{ type: "text", text: assistantText }] } }
             : {}),
