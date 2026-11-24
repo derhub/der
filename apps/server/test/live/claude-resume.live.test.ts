@@ -80,5 +80,9 @@ describe.skipIf(!LIVE)("hold one long Claude Code session at a steady cache cost
     expect(runs.map((run) => run.status)).toEqual(Array(TURNS).fill("completed"));
     expect(afterFirst.every((tokens) => tokens !== null && tokens < 1_000)).toBe(true);
     expect(cacheWrites[TURNS - 1]!).toBeLessThanOrEqual(cacheWrites[1]!);
+    expect(runs.slice(1).map((run) => run.contextMode)).toEqual(Array(TURNS - 1).fill("resumed"));
+    expect(runs[TURNS - 1]!.usage?.cachedInputTokens ?? 0).toBeGreaterThan(
+      runs[1]!.usage?.cachedInputTokens ?? 0,
+    );
   }, 2_400_000);
 });

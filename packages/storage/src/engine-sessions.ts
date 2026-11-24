@@ -1,3 +1,4 @@
+import type { Database } from "bun:sqlite";
 import type { EngineKind, EngineSession, RunId, SessionId } from "@der/domain";
 import type { SqliteDatabase } from "./database";
 
@@ -49,13 +50,12 @@ export function markEngineSessionPending(
 }
 
 export function saveEngineSession(
-  database: SqliteDatabase,
+  db: Database,
   row: Omit<EngineSession, "pendingRunId" | "updatedAt">,
   updatedAt: string,
 ): void {
-  database.db
-    .query(
-      `INSERT INTO engine_sessions
+  db.query(
+    `INSERT INTO engine_sessions
          (session_id, engine, vendor_session_id, base_hash, context_hash, last_ordinal, pending_run_id, updated_at)
        VALUES (?, ?, ?, ?, ?, ?, NULL, ?)
        ON CONFLICT (session_id, engine) DO UPDATE SET
@@ -64,17 +64,17 @@ export function saveEngineSession(
          context_hash = excluded.context_hash,
          last_ordinal = excluded.last_ordinal,
          pending_run_id = NULL,
-         updated_at = excluded.updated_at`,
-    )
-    .run(
-      row.sessionId,
-      row.engine,
-      row.vendorSessionId,
-      row.baseHash,
-      row.contextHash,
-      row.lastOrdinal,
-      updatedAt,
-    );
+         updated_at = excluded.updated_at
+       WHERE excluded.last_ordinal > engine_sessions.last_ordinal`,
+  ).run(
+    row.sessionId,
+    row.engine,
+    row.vendorSessionId,
+    row.baseHash,
+    row.contextHash,
+    row.lastOrdinal,
+    updatedAt,
+  );
 }
 
 export function dropEngineSession(

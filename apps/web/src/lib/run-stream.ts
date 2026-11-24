@@ -352,6 +352,11 @@ function extractLatestUserText(
   return "";
 }
 
+/** Written by the server when a replayed engine step abandons an attempt and starts over. */
+const ATTEMPT_RESET_EVENT = "der.attempt-reset";
+
+type ConversationBeforeRun = Parameters<ConnectConnectionAdapter["connect"]>[0];
+
 export function createDerChatConnection(
   options: DerChatConnectionOptions,
 ): ConnectConnectionAdapter {
@@ -359,6 +364,7 @@ export function createDerChatConnection(
     runId: RunId,
     initialCursor: number,
     abortSignal?: AbortSignal,
+    conversationBeforeRun?: ConversationBeforeRun,
   ): AsyncIterable<StreamChunk> {
     try {
       for await (const item of streamRunEvents({
@@ -372,6 +378,18 @@ export function createDerChatConnection(
         onStatusChange: (status) => options.onStreamStatus?.(runId, status),
       })) {
         const record = item.chunk as unknown as Record<string, unknown>;
+        if (record["type"] === "CUSTOM" && record["name"] === ATTEMPT_RESET_EVENT) {
+          // A snapshot of the conversation as it stood when the Run was sent drops the abandoned
+          // attempt's text and tool calls and resets the processor's per-message stream state.
+          // TanStack takes UI messages in a snapshot as they are.
+          if (conversationBeforeRun !== undefined) {
+            yield {
+              type: "MESSAGES_SNAPSHOT",
+              messages: [...conversationBeforeRun],
+            } as unknown as StreamChunk;
+          }
+          continue;
+        }
         if (record["type"] === "CUSTOM" && typeof record["name"] === "string") {
           const eventName = record["name"];
           if (eventName.startsWith("approval.")) {
@@ -426,7 +444,7 @@ export function createDerChatConnection(
       options.onRunAdmitted?.(admission);
       const startCursor = options.getInitialCursor?.(admission.run.id) ?? 0;
 
-      for await (const chunk of tailRun(admission.run.id, startCursor, abortSignal)) {
+      for await (const chunk of tailRun(admission.run.id, startCursor, abortSignal, messages)) {
         yield chunk;
       }
     },

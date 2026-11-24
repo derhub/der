@@ -14,6 +14,7 @@ import {
   type MessagePart,
   type Routine,
   type RoutineId,
+  type Run,
   type RunAdmission,
   type RunId,
   type RunOrigin,
@@ -39,6 +40,7 @@ import {
   runAdmissionResponseSchema,
   runDetailResponseSchema,
   sessionResponseSchema,
+  sessionRunsResponseSchema,
   sessionsResponseSchema,
   skillDetailResponseSchema,
   skillsCatalogResponseSchema,
@@ -125,6 +127,7 @@ export interface OperatorApi {
     idempotencyKey: string,
     signal?: AbortSignal,
   ): Promise<RunAdmission>;
+  listSessionRuns(sessionId: SessionId, signal?: AbortSignal): Promise<Run[]>;
   getRun(runId: RunId, signal?: AbortSignal): Promise<RunDetailResponse>;
   decideApproval(
     approvalId: ApprovalId,
@@ -299,6 +302,14 @@ export function createOperatorApi(options: OperatorApiOptions = {}): OperatorApi
           ...(signal !== undefined ? { signal } : {}),
         },
       );
+    },
+    async listSessionRuns(sessionId, signal) {
+      const data = await requestJson(
+        `/api/sessions/${encodeURIComponent(sessionId)}/runs`,
+        sessionRunsResponseSchema,
+        signalOpt(signal),
+      );
+      return data.runs;
     },
     getRun(runId, signal) {
       return requestJson(

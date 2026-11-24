@@ -45,6 +45,10 @@ export const messagesResponseSchema = z.object({
   messages: z.array(message),
 });
 
+export const sessionRunsResponseSchema = z.object({
+  runs: z.array(run),
+});
+
 export const runDetailResponseSchema = z.object({
   run,
   approval: approval.nullable(),

@@ -41,6 +41,7 @@ export {
   checkRunReadinessGate,
   extractCheckpointSessionId,
   linkAbortSignal,
+  readRunUsage,
   readSessionIdChunk,
   type EngineResumeTraits,
   type EngineRunInput,

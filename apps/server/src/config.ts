@@ -129,8 +129,9 @@ const serverConfigSchema = z
     skillsRootDir: z.string().min(1).default("./data/skills"),
     workspaceRootDir: z.string().min(1).default("./data/workspaces"),
     contextMaxTokens: z.number().int().positive().default(32_000),
-    memoryPromptMaxBytes: z.number().int().positive().default(24_000),
-    skillCatalogMaxBytes: z.number().int().positive().default(8_000),
+    // Below 1,024 bytes the truncation pointer alone can exceed the cap.
+    memoryPromptMaxBytes: z.number().int().min(1024).default(24_000),
+    skillCatalogMaxBytes: z.number().int().min(1024).default(8_000),
     engineCompactTokens: z.number().int().positive().default(100_000),
     allowedOrigins: z
       .array(originString)

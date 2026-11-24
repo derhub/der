@@ -150,6 +150,10 @@ function createFakeServerFetch(options: { readonly scriptRoutine?: boolean } = {
       return Response.json({ messages });
     }
 
+    if (method === "GET" && /^\/api\/sessions\/[^/]+\/runs$/.test(url.pathname)) {
+      return Response.json({ runs: [] });
+    }
+
     if (method === "POST" && url.pathname === "/api/sessions/sess-fixture/runs") {
       const key = headers.get("idempotency-key") ?? "";
       admittedKeys.push(key);

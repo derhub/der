@@ -11,6 +11,7 @@ import {
   type ChannelBindingId,
   type ChannelIntakeMetadata,
   type ChannelIntegration,
+  type ContextMode,
   type CreateBotInput,
   type CreateRoutineInput,
   type CreateSessionInput,
@@ -96,6 +97,7 @@ import {
   getRunStreamState as getRunStreamStateQuery,
   listSessionRuns as listSessionRunsQuery,
   markRunRunning as markRunRunningCommand,
+  setRunContextMode as setRunContextModeCommand,
   readRunEventsAfter as readRunEventsAfterQuery,
   type FinishRunInput,
   type FinishRunOutcome,
@@ -425,7 +427,7 @@ export class SqliteStore
   }
 
   saveEngineSession(row: Omit<EngineSession, "pendingRunId" | "updatedAt">): void {
-    saveEngineSessionCommand(this.database, row, this.nowUtc());
+    saveEngineSessionCommand(this.database.db, row, this.nowUtc());
   }
 
   dropEngineSession(sessionId: SessionId, engine: EngineKind): void {
@@ -434,6 +436,11 @@ export class SqliteStore
 
   listSessionRuns(sessionId: SessionId): Run[] {
     return listSessionRunsQuery(this.database, sessionId);
+  }
+
+  /** Records how the engine step delivered the Run's context, before the engine call. */
+  setRunContextMode(runId: RunId, contextMode: ContextMode): void {
+    setRunContextModeCommand(this.database, runId, contextMode);
   }
 
   markRunRunning(runId: RunId, checkpoint?: JsonValue | null): Promise<Run> {

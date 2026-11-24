@@ -19,6 +19,7 @@ import {
   type MessagePart,
   type Run,
   type RunAdmission,
+  type RunEvent,
   type RunId,
   type RunRequest,
   type RunStore,
@@ -26,7 +27,7 @@ import {
   type UtcTimestamp,
   type Workflow,
 } from "@der/domain";
-import { readSessionIdChunk } from "@der/runtime/engines";
+import { readRunUsage, readSessionIdChunk } from "@der/runtime/engines";
 import type { ScriptRoutineDeps } from "./script-routine-stage";
 
 export interface AwaitApprovalInput {
@@ -118,6 +119,7 @@ export interface ApprovalDecisionPayload {
 }
 
 const DEFAULT_EVENT_BATCH_SIZE = 8;
+const ATTEMPT_RESET_EVENT = "der.attempt-reset";
 
 function isToolCallEnd(chunk: JsonValue): boolean {
   return (
@@ -125,6 +127,19 @@ function isToolCallEnd(chunk: JsonValue): boolean {
     chunk !== null &&
     !Array.isArray(chunk) &&
     chunk["type"] === "TOOL_CALL_END"
+  );
+}
+
+function isAssistantContent(chunk: JsonValue): boolean {
+  if (typeof chunk !== "object" || chunk === null || Array.isArray(chunk)) {
+    return false;
+  }
+  const type = chunk["type"];
+  return (
+    typeof type === "string" &&
+    ["TEXT_MESSAGE_", "TOOL_CALL_", "REASONING_", "THINKING_"].some((prefix) =>
+      type.startsWith(prefix),
+    )
   );
 }
 
@@ -172,13 +187,27 @@ export async function executeEngineStage(deps: WorkflowDeps, run: Run): Promise<
     };
   }
 
+  const earlier = await readEarlierExecution(deps, run);
+  if (earlier.outcome !== undefined) {
+    return earlier.outcome;
+  }
+  if (earlier.keySuffix !== "") {
+    // Tells stream readers to drop the abandoned attempt's output before the new attempt's.
+    await deps.store.appendRunEvents(run.id, [
+      {
+        chunkKey: `${run.id}:attempt-reset${earlier.keySuffix}`,
+        chunk: { type: "CUSTOM", name: ATTEMPT_RESET_EVENT },
+      },
+    ]);
+  }
+
   try {
-    const first = await runEngineAttempt(deps, run, engine, kind);
+    const first = await runEngineAttempt(deps, run, engine, kind, earlier.keySuffix);
     if (first.kind !== "resume-rejected") {
       return first;
     }
     deps.store.dropEngineSession(run.sessionId, kind);
-    const rebuilt = await runEngineAttempt(deps, run, engine, kind);
+    const rebuilt = await runEngineAttempt(deps, run, engine, kind, earlier.keySuffix);
     return rebuilt.kind === "resume-rejected"
       ? { kind: "failed", code: rebuilt.code, detail: rebuilt.detail }
       : rebuilt;
@@ -187,11 +216,78 @@ export async function executeEngineStage(deps: WorkflowDeps, run: Run): Promise<
   }
 }
 
+/**
+ * What an earlier execution of this Run's engine step left in the run events. A persisted
+ * terminal chunk means the engine already answered: its outcome is replayed instead of calling
+ * the engine again. Otherwise a non-empty log gets a key suffix so the new attempt's chunks never
+ * dedupe against the abandoned attempt's.
+ */
+async function readEarlierExecution(
+  deps: WorkflowDeps,
+  run: Run,
+): Promise<{ readonly outcome?: RunStageResult; readonly keySuffix: string }> {
+  const events: RunEvent[] = [];
+  for await (const event of deps.store.replay(run.id, 0)) {
+    events.push(event);
+  }
+  const last = events.at(-1);
+  if (last === undefined) {
+    return { keySuffix: "" };
+  }
+  const terminal = events.find((event) => event.isTerminal === true);
+  if (terminal === undefined) {
+    return { keySuffix: `:replay-${last.sequence}` };
+  }
+
+  const chunk = isJsonRecord(terminal.chunk) ? terminal.chunk : {};
+  if (chunk["type"] !== "RUN_FINISHED") {
+    return {
+      keySuffix: "",
+      outcome: {
+        kind: "failed",
+        code: typeof chunk["code"] === "string" ? chunk["code"] : "engine.run_error",
+        detail: typeof chunk["message"] === "string" ? chunk["message"] : "Engine run failed.",
+      },
+    };
+  }
+  const suffix = attemptKeySuffix(run.id, terminal.chunkKey);
+  const text = events
+    .filter((event) => attemptKeySuffix(run.id, event.chunkKey) === suffix)
+    .flatMap((event) =>
+      isJsonRecord(event.chunk) &&
+      event.chunk["type"] === "TEXT_MESSAGE_CONTENT" &&
+      typeof event.chunk["delta"] === "string"
+        ? [event.chunk["delta"]]
+        : [],
+    )
+    .join("");
+  const usage = readRunUsage(chunk);
+  return {
+    keySuffix: "",
+    outcome: {
+      kind: "completed",
+      ...(text.length > 0 ? { finalMessageParts: [{ type: "text", text }] } : {}),
+      ...(usage !== undefined ? { usage } : {}),
+    },
+  };
+}
+
+function isJsonRecord(value: JsonValue): value is { readonly [key: string]: JsonValue } {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+/** Engine chunk keys are `<runId>:<seq>:<TYPE><suffix>`; the suffix names the attempt. */
+function attemptKeySuffix(runId: RunId, chunkKey: string): string | undefined {
+  const match = /^\d+:[A-Z_]+(.*)$/.exec(chunkKey.slice(runId.length + 1));
+  return match?.[1];
+}
+
 async function runEngineAttempt(
   deps: WorkflowDeps,
   run: Run,
   engine: Engine,
   kind: EngineKind,
+  keySuffix: string,
 ): Promise<EngineAttempt> {
   const batchSize = deps.eventBatchSize ?? DEFAULT_EVENT_BATCH_SIZE;
   const pendingChunks: {
@@ -200,6 +296,7 @@ async function runEngineAttempt(
     readonly isTerminal?: boolean;
   }[] = [];
   let observedSessionId: string | undefined;
+  let sawContent = false;
 
   const turnOutcome = (): TurnOutcome | undefined => {
     const turn = deps.turns?.get(run.id);
@@ -223,11 +320,12 @@ async function runEngineAttempt(
     };
   };
 
-  // A resumed attempt buffers its chunks until the vendor confirms the session, so a rejected
-  // resume leaves nothing in the run events and the rebuild's chunks do not collide with them.
+  // A resumed attempt buffers its chunks until the vendor confirms the session and the first
+  // assistant content arrives: Antigravity echoes an unknown id and rejects only the prompt. A
+  // rejected resume leaves nothing in the run events and the rebuild's chunks do not collide.
   const isAwaitingResumeConfirmation = (): boolean => {
     const resumedFrom = deps.turns?.get(run.id)?.resumedFrom;
-    return resumedFrom !== undefined && observedSessionId !== resumedFrom;
+    return resumedFrom !== undefined && (observedSessionId !== resumedFrom || !sawContent);
   };
 
   const readInterruptedStage = async (
@@ -275,8 +373,9 @@ async function runEngineAttempt(
 
       if (event.type === "chunk") {
         observedSessionId = readSessionIdChunk(event.chunk) ?? observedSessionId;
+        sawContent ||= isAssistantContent(event.chunk);
         pendingChunks.push({
-          chunkKey: event.chunkKey,
+          chunkKey: `${event.chunkKey}${keySuffix}`,
           chunk: event.chunk,
           ...(event.isTerminal !== undefined ? { isTerminal: event.isTerminal } : {}),
         });
@@ -514,13 +613,8 @@ export async function finalizeDirectRunStep(
         : {}),
       ...(input.outcome.usage !== undefined ? { usage: input.outcome.usage } : {}),
       ...(input.outcome.turn !== undefined ? { contextMode: input.outcome.turn.contextMode } : {}),
+      ...(input.outcome.turn?.save !== undefined ? { engineSession: input.outcome.turn.save } : {}),
     });
-    if (input.outcome.turn?.save !== undefined) {
-      deps.store.saveEngineSession({
-        ...input.outcome.turn.save,
-        lastOrdinal: finished.finalMessage?.ordinal ?? input.outcome.turn.save.lastOrdinal,
-      });
-    }
     return finished.run;
   }
 
