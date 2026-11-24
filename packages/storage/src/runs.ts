@@ -1,4 +1,5 @@
 import {
+  fingerprintJson,
   formatUtcTimestamp,
   isTerminalChunk,
   terminalChunkKey,
@@ -13,7 +14,6 @@ import {
   type SessionId,
 } from "@der/domain";
 import { compiledParsers } from "@der/domain/compiled";
-import { fingerprintJson } from "./canonical";
 import type { SqliteDatabase } from "./database";
 import { conflictError, notFoundError, validationError } from "./errors";
 import {

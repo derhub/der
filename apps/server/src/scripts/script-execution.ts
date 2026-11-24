@@ -1,5 +1,6 @@
 import {
   DomainError,
+  fingerprintJson,
   formatUtcTimestamp,
   type Approval,
   type ApprovalEffectStore,
@@ -28,7 +29,6 @@ import {
   type StepRequest,
   type StepResult,
 } from "@der/runtime";
-import { fingerprintJson } from "@der/storage";
 import { UNKNOWN_OUTCOME } from "../code-mode/result-boundary";
 import { approvalRequestedEvent } from "../workflows/run-steps";
 

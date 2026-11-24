@@ -1,4 +1,3 @@
-export { canonicalizeJson, fingerprintJson } from "./canonical";
 export { isSqliteBusyError, SqliteDatabase, type SqliteDatabaseOptions } from "./database";
 export {
   applyMigrations,

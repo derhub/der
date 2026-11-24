@@ -1,7 +1,12 @@
 import { describe, expect, it } from "bun:test";
 import * as z from "zod";
-import { defineCapability, formatUtcTimestamp, type NewStep, type StepOutcome } from "@der/domain";
-import { fingerprintJson } from "@der/storage";
+import {
+  defineCapability,
+  fingerprintJson,
+  formatUtcTimestamp,
+  type NewStep,
+  type StepOutcome,
+} from "@der/domain";
 import { openScriptFixture } from "./fixtures/script-host";
 
 const source = `

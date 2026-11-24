@@ -4,7 +4,9 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "bun:test";
 import {
+  canonicalizeJson,
   DomainError,
+  fingerprintJson,
   streamChunk,
   type FinishRunInput,
   type JsonValue,
@@ -13,10 +15,8 @@ import {
 } from "@der/domain";
 import {
   applyMigrations,
-  canonicalizeJson,
   CAPABILITY_OPERATION_KIND_MIGRATION,
   CORE_MIGRATION,
-  fingerprintJson,
   openSqliteStore,
   OUTBOX_DESTINATIONS_MIGRATION,
   SCRIPT_ROUTINES_MIGRATION,

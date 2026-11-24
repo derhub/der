@@ -1,6 +1,7 @@
 import {
   CLOUD_EVENT_SPEC_VERSION,
   CLOUD_EVENT_TYPES,
+  canonicalizeJson,
   formatUtcTimestamp,
   type Approval,
   type ApprovalId,
@@ -18,7 +19,6 @@ import {
   type UtcTimestamp,
 } from "@der/domain";
 import { compiledParsers } from "@der/domain/compiled";
-import { canonicalizeJson } from "./canonical";
 import { insertOutboxForBindings } from "./channel-outbox";
 import { recordApprovalDecided, recordApprovalRequested } from "./run-lifecycle";
 import type { SqliteDatabase } from "./database";

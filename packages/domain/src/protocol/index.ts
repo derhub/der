@@ -1,3 +1,4 @@
+export { canonicalizeJson, fingerprintJson } from "./canonical";
 export {
   CLOUD_EVENT_SPEC_VERSION,
   CLOUD_EVENT_TYPES,
