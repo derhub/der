@@ -141,7 +141,7 @@ export async function openScriptFixture() {
   const openDriver = (
     databaseStore = store,
     limits?: Partial<ScriptDriverDeps["limits"]>,
-    options: Pick<ScriptDriverDeps, "writeCancelGraceMs"> = {},
+    options: Pick<ScriptDriverDeps, "writeCancelGraceMs" | "onRunFinished" | "deliverEvents"> = {},
   ) => {
     const scripts = openSqliteScriptStore({ database: databaseStore.database });
     const driver = new ScriptDriver({

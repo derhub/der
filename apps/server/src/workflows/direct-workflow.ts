@@ -5,7 +5,53 @@ import {
   type CoordinatorDriver,
   type RunCoordinator,
 } from "./coordinator";
-import type { ApprovalDecisionPayload, WorkflowDeps } from "./run-steps";
+import { finishRunAndNotify, type ApprovalDecisionPayload, type WorkflowDeps } from "./run-steps";
+
+export const ENGINE_EXECUTION_FAILED_CODE = "engine.execution_failed";
+
+function failureDetail(error: unknown): string {
+  if (error instanceof Error && error.message.length > 0) {
+    return error.message;
+  }
+  if (typeof error === "string" && error.length > 0) {
+    return error;
+  }
+  return "Engine execution failed.";
+}
+
+export async function runDirectRun(
+  deps: Pick<WorkflowDeps, "store" | "onRunFinished">,
+  coordinator: Pick<RunCoordinator, "executeRun">,
+  driver: CoordinatorDriver,
+  runId: RunId,
+  options?: {
+    readonly signal?: AbortSignal;
+    readonly logError?: (runId: RunId, error: unknown) => void;
+  },
+): Promise<void> {
+  try {
+    await coordinator.executeRun(runId, driver);
+  } catch (error) {
+    if (options?.signal?.aborted) {
+      return;
+    }
+    options?.logError?.(runId, error);
+    try {
+      await finishRunAndNotify(deps, {
+        runId,
+        end: {
+          kind: "fail",
+          code: ENGINE_EXECUTION_FAILED_CODE,
+          detail: failureDetail(error),
+        },
+      });
+    } catch (finishError) {
+      if (!options?.signal?.aborted) {
+        options?.logError?.(runId, finishError);
+      }
+    }
+  }
+}
 
 interface PendingAwakeable {
   readonly resolve: (payload: ApprovalDecisionPayload) => void;
@@ -137,7 +183,7 @@ export function createDirectWorkflow(
     ...deps,
     driver,
   });
-  driver.setRunner((runId) => coordinator.executeRun(runId, driver));
+  driver.setRunner((runId) => runDirectRun(deps, coordinator, driver, runId));
 
   return {
     ...coordinator,

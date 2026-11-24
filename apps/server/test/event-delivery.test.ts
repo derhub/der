@@ -1,8 +1,9 @@
 import { afterEach, describe, expect, it } from "bun:test";
-import { formatUtcTimestamp, type JsonValue, type RunRequest } from "@der/domain";
+import { formatUtcTimestamp, type Engine, type JsonValue, type RunRequest } from "@der/domain";
 import { openSqliteStore, type SqliteStore } from "@der/storage";
 import { createEventDelivery } from "#events/event-delivery";
 import { seedFixtureRecords, startServer, type RunningServer } from "#main";
+import { ENGINE_EXECUTION_FAILED_CODE } from "#workflows/index";
 import { createTempDatabase, waitUntil } from "./fixtures/restate-harness";
 
 const cleanups: (() => Promise<void> | void)[] = [];
@@ -492,6 +493,239 @@ describe("recover an event Run admitted before a crash", () => {
         run: "interrupted",
         terminal: [{ type: "RUN_ERROR", code: "run.server_restarted" }],
         eventRuns: 2,
+      });
+    },
+    30_000,
+  );
+
+  it.each([
+    { origin: "http" as const, status: "queued" as const, expectedStatus: "completed" as const },
+    { origin: "http" as const, status: "running" as const, expectedStatus: "interrupted" as const },
+    {
+      origin: "web" as const,
+      status: "waiting_approval" as const,
+      expectedStatus: "interrupted" as const,
+    },
+    {
+      origin: "telegram" as const,
+      status: "running" as const,
+      expectedStatus: "interrupted" as const,
+    },
+    {
+      origin: "routine" as const,
+      status: "waiting_approval" as const,
+      expectedStatus: "interrupted" as const,
+    },
+  ])(
+    "recovers a $origin Run left $status at direct startup to $expectedStatus and delivers the next event",
+    async ({ origin, status, expectedStatus }) => {
+      const tempDb = createTempDatabase("der-origin-recovery-");
+      const before = openSqliteStore({ filename: tempDb.dbPath });
+      const { bot, session } = seedFixtureRecords(before);
+      const { run } = await before.admit({
+        botId: bot.id,
+        sessionId: session.id,
+        origin: origin === "telegram" ? "http" : origin,
+        idempotencyKey: `origin-${origin}-${status}`,
+        input: { parts: [{ type: "text", text: "direct:ok" }] },
+      });
+      if (origin === "telegram") {
+        before.database.db.query("UPDATE runs SET origin = 'telegram' WHERE id = ?").run(run.id);
+      }
+      if (status !== "queued") {
+        await before.markRunRunning(run.id);
+      }
+      if (status === "waiting_approval") {
+        await before.requestApproval({
+          botId: bot.id,
+          sessionId: session.id,
+          runId: run.id,
+          effect: {
+            runId: run.id,
+            operationKind: "capability",
+            operationId: "notes.publish",
+            canonicalArguments: { text: "engine" },
+            attemptId: `${run.id}:engine`,
+          },
+          prompt: "Publish?",
+          awakeable: `direct_awk_${run.id}`,
+          deadline: "2099-01-01T00:00:00Z",
+        });
+      }
+      before.enqueueSessionEvent({
+        id: "evt-after",
+        botId: bot.id,
+        sessionId: session.id,
+        kind: "script.finished",
+        payload: { n: 1 },
+      });
+      before.close();
+
+      const server = await startServer({
+        config: {
+          host: "127.0.0.1",
+          port: 0,
+          restateMode: "direct",
+          databasePath: tempDb.dbPath,
+          memoryProjectionDir: `${tempDb.dir}/memory`,
+          skillsRootDir: `${tempDb.dir}/skills`,
+          workspaceRootDir: `${tempDb.dir}/workspaces`,
+          enabledEngines: ["fixture"],
+          scriptSweepIntervalMs: 60_000,
+          seedFixture: true,
+        },
+        engines: new Map([
+          [
+            "fixture",
+            {
+              kind: "fixture",
+              async *run(activeRun) {
+                yield {
+                  type: "chunk",
+                  chunkKey: `${activeRun.id}:started`,
+                  chunk: {
+                    type: "RUN_STARTED",
+                    runId: activeRun.id,
+                    threadId: activeRun.sessionId,
+                  },
+                };
+                yield {
+                  type: "completed",
+                  finalMessage: { parts: [{ type: "text", text: "ok" }] },
+                };
+              },
+            },
+          ],
+        ]),
+      });
+      cleanups.push(async () => {
+        await server.close();
+        tempDb.cleanup();
+      });
+
+      await waitUntil(
+        () =>
+          server.store.getRun(run.id)?.status === expectedStatus &&
+          server.store.listPendingSessionEvents().length === 0,
+        { timeoutMs: 3_000, label: `${origin} Run recovered and next event delivered` },
+      );
+
+      const terminal = server.store
+        .readRunEventsAfter(run.id, 0, 100)
+        .filter((event) => event.isTerminal)
+        .map((event) => {
+          const chunk = event.chunk as { type: string; code?: string };
+          return { type: chunk.type, ...(chunk.code !== undefined ? { code: chunk.code } : {}) };
+        });
+      expect({
+        status: server.store.getRun(run.id)?.status,
+        terminal,
+        pending: server.store.listPendingSessionEvents(),
+      }).toEqual({
+        status: expectedStatus,
+        terminal:
+          expectedStatus === "completed"
+            ? [{ type: "RUN_FINISHED" }]
+            : [{ type: "RUN_ERROR", code: "run.server_restarted" }],
+        pending: [],
+      });
+    },
+    30_000,
+  );
+
+  it.each(["throw-sync", "reject-mid-stream"] as const)(
+    "ends a direct Run as failed with engine.execution_failed and delivers the next event when the engine fails (%s)",
+    async (mode) => {
+      const tempDb = createTempDatabase("der-engine-throw-");
+      let firstRunId: string | undefined;
+      const engine: Engine = {
+        kind: "fixture",
+        run(activeRun) {
+          if (firstRunId === undefined || firstRunId === activeRun.id) {
+            firstRunId = activeRun.id;
+            if (mode === "throw-sync") {
+              throw new Error("boom sync");
+            }
+            return (async function* () {
+              yield {
+                type: "chunk",
+                chunkKey: `${activeRun.id}:started`,
+                chunk: { type: "RUN_STARTED", runId: activeRun.id, threadId: activeRun.sessionId },
+              };
+              throw new Error("boom mid-stream");
+            })();
+          }
+          return (async function* () {
+            yield {
+              type: "chunk",
+              chunkKey: `${activeRun.id}:started`,
+              chunk: { type: "RUN_STARTED", runId: activeRun.id, threadId: activeRun.sessionId },
+            };
+            yield { type: "completed", finalMessage: { parts: [{ type: "text", text: "ok" }] } };
+          })();
+        },
+      };
+      const server = await startServer({
+        config: {
+          host: "127.0.0.1",
+          port: 0,
+          restateMode: "direct",
+          databasePath: tempDb.dbPath,
+          memoryProjectionDir: `${tempDb.dir}/memory`,
+          skillsRootDir: `${tempDb.dir}/skills`,
+          workspaceRootDir: `${tempDb.dir}/workspaces`,
+          enabledEngines: ["fixture"],
+          scriptSweepIntervalMs: 60_000,
+          seedFixture: true,
+        },
+        engines: new Map([["fixture", engine]]),
+      });
+      cleanups.push(async () => {
+        await server.close();
+        tempDb.cleanup();
+      });
+
+      const { bot, session } = server.seededFixture!;
+      server.store.enqueueSessionEvent({
+        id: "evt-next",
+        botId: bot.id,
+        sessionId: session.id,
+        kind: "script.finished",
+        payload: { n: 2 },
+      });
+      const { run } = await server.commands.admitRun({
+        botId: bot.id,
+        sessionId: session.id,
+        origin: "http",
+        idempotencyKey: `throw-${mode}`,
+        input: { parts: [{ type: "text", text: "go" }] },
+      });
+
+      await waitUntil(
+        () =>
+          server.store.getRun(run.id)?.status === "failed" &&
+          server.store.listPendingSessionEvents().length === 0,
+        { timeoutMs: 3_000, label: "throwing engine ended Run and delivered next event" },
+      );
+
+      const terminal = server.store
+        .readRunEventsAfter(run.id, 0, 100)
+        .filter((event) => event.isTerminal)
+        .map((event) => event.chunk as { type: string; code: string; message: string });
+      expect({
+        status: server.store.getRun(run.id)?.status,
+        terminal: terminal.map(({ type, code, message }) => ({ type, code, message })),
+        pending: server.store.listPendingSessionEvents(),
+      }).toEqual({
+        status: "failed",
+        terminal: [
+          {
+            type: "RUN_ERROR",
+            code: ENGINE_EXECUTION_FAILED_CODE,
+            message: mode === "throw-sync" ? "boom sync" : "boom mid-stream",
+          },
+        ],
+        pending: [],
       });
     },
     30_000,

@@ -532,7 +532,11 @@ describe("end a Run once when an in-doubt interruption meets its normal finish",
     async ({ order, terminal }) => {
       const fixture = await openScriptFixture();
       const store = finishInOrder(fixture.store, order);
-      const { scripts, driver, acquire } = fixture.openDriver(store);
+      const finishedHooks: string[] = [];
+      const onRunFinished = async (ended: { readonly id: string; readonly status: string }) => {
+        finishedHooks.push(`${ended.id}:${ended.status}`);
+      };
+      const { scripts, driver, acquire } = fixture.openDriver(store, undefined, { onRunFinished });
       cleanups.push(async () => {
         await driver.close();
         fixture.store.close();
@@ -550,7 +554,7 @@ describe("end a Run once when an in-doubt interruption meets its normal finish",
       const [, finished] = await Promise.all([
         driver.kick(id),
         finalizeDirectRunStep(
-          { store, engines: new Map(), approvalTimeoutMs: 5_000 },
+          { store, engines: new Map(), approvalTimeoutMs: 5_000, onRunFinished },
           { run, outcome: { kind: "completed" } },
         ),
       ]);
@@ -566,11 +570,13 @@ describe("end a Run once when an in-doubt interruption meets its normal finish",
         run: fixture.store.getRun(run.id)?.status,
         finalized: finished.status,
         terminal: chunks,
+        finishedHooks,
       }).toEqual({
         execution: "in_doubt",
         run: order[0],
         finalized: order[0],
         terminal: [terminal],
+        finishedHooks: [`${run.id}:${order[0]}`],
       });
     },
   );
@@ -632,4 +638,57 @@ describe("end a Run once when an in-doubt interruption meets its normal finish",
       ],
     });
   });
+
+  it.each(["attached", "detached"] as const)(
+    "runs onRunFinished once without deadlocking when an %s Script interrupts its owning Run",
+    async (mode) => {
+      const fixture = await openScriptFixture();
+      let deliverCalls = 0;
+      const hookCalls: string[] = [];
+      let driverRef: ReturnType<typeof fixture.openDriver>["driver"] | undefined;
+      const { scripts, driver, acquire } = fixture.openDriver(fixture.store, undefined, {
+        onRunFinished: async (ended) => {
+          hookCalls.push(`${ended.id}:${ended.status}`);
+          await driverRef?.cancelRun(ended.id);
+          deliverCalls += 1;
+        },
+      });
+      driverRef = driver;
+      cleanups.push(async () => {
+        await driver.close();
+        fixture.store.close();
+        fixture.database.cleanup();
+      });
+
+      const attached = acquire(PUBLISH);
+      await driver.kick(attached.id);
+      const failing = acquire('await step.run("notes.append", { text: "entry" }); return 1;');
+      if (mode === "detached") {
+        scripts.detach(failing.id);
+      }
+      fixture.store.database.db.run(
+        "CREATE TRIGGER refuse_updates BEFORE UPDATE ON effects BEGIN SELECT RAISE(ABORT, 'disk full'); END",
+      );
+      await driver.kick(failing.id).catch(() => undefined);
+      fixture.store.database.db.run("DROP TRIGGER refuse_updates");
+
+      if (mode === "attached") {
+        await driver.wait(failing.id, AbortSignal.timeout(3_000));
+      } else {
+        await driver.kick(failing.id);
+      }
+
+      expect({
+        run: fixture.store.getRun(fixture.run.id)?.status,
+        attachedStatus: scripts.load(attached.id).execution.status,
+        hookCalls,
+        deliverCalls,
+      }).toEqual({
+        run: "interrupted",
+        attachedStatus: "cancelled",
+        hookCalls: [`${fixture.run.id}:interrupted`],
+        deliverCalls: 1,
+      });
+    },
+  );
 });

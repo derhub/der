@@ -7,6 +7,7 @@ import {
   type ChannelIntakeMetadata,
   type ExecuteResult,
   type JsonValue,
+  type Run,
   type RunId,
   type ScriptExecution,
   type StoredStep,
@@ -28,6 +29,7 @@ export interface ScriptDriverDeps extends ScriptExecutionDeps {
     listPendingScriptApprovalsPastDeadline(at: UtcTimestamp): MaybePromise<readonly Approval[]>;
   };
   readonly sweepIntervalMs: number;
+  readonly onRunFinished?: (run: Run) => Promise<void>;
   readonly deliverEvents?: () => Promise<void>;
   readonly logError?: (error: unknown) => void;
 }
@@ -134,7 +136,12 @@ export class ScriptDriver {
       return;
     }
     await finalizeInterruptedUncertainStep(
-      { store },
+      {
+        store,
+        ...(this.deps.onRunFinished !== undefined
+          ? { onRunFinished: this.deps.onRunFinished }
+          : {}),
+      },
       { run, effectId: effect.id, detail: result.error.message },
     );
   }
@@ -146,7 +153,12 @@ export class ScriptDriver {
     ]);
     await Promise.all(
       [...ids]
-        .filter((id) => this.deps.scripts.load(id).execution.runId === runId)
+        .filter((id) => {
+          const { execution } = this.deps.scripts.load(id);
+          return (
+            execution.runId === runId && execution.detachedAt === null && execution.result === null
+          );
+        })
         .map((id) => this.kick(id)),
     );
   }

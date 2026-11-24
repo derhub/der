@@ -21,10 +21,12 @@ import {
   type Message,
   type OutboxEvent,
   type OutboxSink,
+  type PersistedRunOrigin,
   type Routine,
   type RoutineId,
   type Run,
   type RunAdmission,
+  type RunEngineKind,
   type RunId,
   type RunRequest,
   type Session,
@@ -87,6 +89,8 @@ import {
   createRoutineScheduleClient,
   createRoutineScheduleObject,
   createRunCoordinator,
+  finishRunAndNotify,
+  runDirectRun,
   type AnyRestateService,
   type ConfigureRoutineInput,
   type ConfigureRoutineResult,
@@ -108,21 +112,48 @@ import { ScriptDriver } from "./scripts/script-driver";
 type Recovery = "start" | "end";
 
 /** A Script Run is resumable: its execution is durable and its driver picks it up again. */
-const SCRIPT_RUN_RECOVERY = {
+const RESUMABLE_RECOVERY = {
   queued: "start",
   running: "start",
   waiting_approval: "start",
 } as const satisfies Record<ActiveRunStatus, Recovery>;
 
 /**
- * Direct mode keeps no engine state across a restart, so an event Run an engine already started
- * is ended; left active, it would hold its session's next event for ever.
+ * Direct mode keeps no engine state across a restart, so a non-Script Run an engine already
+ * started is ended for every origin; left active, it has no driver and holds its session.
  */
-const EVENT_RUN_RECOVERY = {
+const EPHEMERAL_RECOVERY = {
   queued: "start",
   running: "end",
   waiting_approval: "end",
 } as const satisfies Record<ActiveRunStatus, Recovery>;
+
+const EPHEMERAL_ORIGINS = {
+  http: EPHEMERAL_RECOVERY,
+  web: EPHEMERAL_RECOVERY,
+  telegram: EPHEMERAL_RECOVERY,
+  routine: EPHEMERAL_RECOVERY,
+  event: EPHEMERAL_RECOVERY,
+} as const satisfies Record<PersistedRunOrigin, Record<ActiveRunStatus, Recovery>>;
+
+const RESUMABLE_ORIGINS = {
+  http: RESUMABLE_RECOVERY,
+  web: RESUMABLE_RECOVERY,
+  telegram: RESUMABLE_RECOVERY,
+  routine: RESUMABLE_RECOVERY,
+  event: RESUMABLE_RECOVERY,
+} as const satisfies Record<PersistedRunOrigin, Record<ActiveRunStatus, Recovery>>;
+
+const DIRECT_RUN_RECOVERY = {
+  codex: EPHEMERAL_ORIGINS,
+  "claude-code": EPHEMERAL_ORIGINS,
+  antigravity: EPHEMERAL_ORIGINS,
+  fixture: EPHEMERAL_ORIGINS,
+  script: RESUMABLE_ORIGINS,
+} as const satisfies Record<
+  RunEngineKind,
+  Record<PersistedRunOrigin, Record<ActiveRunStatus, Recovery>>
+>;
 
 export interface SeededFixtureRecords {
   readonly bot: Bot;
@@ -798,6 +829,7 @@ export async function startServer(options: CreateServerOptions = {}): Promise<Ru
     let deliverEvents: DeliverEvents | undefined;
     const scriptDriver = new ScriptDriver({
       deliverEvents: () => deliverEvents?.() ?? Promise.resolve(),
+      onRunFinished: (run) => finishRun(run),
       store,
       scripts: scriptRunStore,
       bots: store,
@@ -841,33 +873,38 @@ export async function startServer(options: CreateServerOptions = {}): Promise<Ru
         onRunFinished: finishRun,
         scriptRoutines,
       });
-      directDriver.setRunner(async (runId) => {
-        try {
-          await coordinator.executeRun(runId, directDriver);
-        } catch (error) {
-          if (!closing.signal.aborted) {
-            console.error(`Direct Run ${runId} failed`, error);
-          }
-        }
-      });
+      directDriver.setRunner((runId) =>
+        runDirectRun({ store, onRunFinished: finishRun }, coordinator, directDriver, runId, {
+          signal: closing.signal,
+          logError: (id, error) => console.error(`Direct Run ${id} failed`, error),
+        }),
+      );
       resumeDirectRuns = async () => {
         const active = store.database.db
-          .query<{ id: RunId; engine: string; status: ActiveRunStatus }, ActiveRunStatus[]>(
-            `SELECT id, engine, status FROM runs
-             WHERE (engine = 'script' OR origin = 'event') AND status IN (${activeRunStatus.options.map(() => "?").join(", ")})
+          .query<
+            {
+              id: RunId;
+              origin: PersistedRunOrigin;
+              engine: RunEngineKind;
+              status: ActiveRunStatus;
+            },
+            ActiveRunStatus[]
+          >(
+            `SELECT id, origin, engine, status FROM runs
+             WHERE status IN (${activeRunStatus.options.map(() => "?").join(", ")})
              ORDER BY created_at, id`,
           )
           .all(...activeRunStatus.options);
-        for (const { id, engine, status } of active) {
-          const recovery = (engine === "script" ? SCRIPT_RUN_RECOVERY : EVENT_RUN_RECOVERY)[status];
+        for (const { id, origin, engine, status } of active) {
+          const recovery = DIRECT_RUN_RECOVERY[engine][origin][status];
           if (recovery === "start") {
             await directDriver.start?.(id);
             continue;
           }
-          const finished = await store.finishRun({ runId: id, end: { kind: "server_restarted" } });
-          if (finished.won) {
-            await finishRun(finished.run);
-          }
+          await finishRunAndNotify(
+            { store, onRunFinished: finishRun },
+            { runId: id, end: { kind: "server_restarted" } },
+          );
         }
       };
       closeDirectDriver = () => directDriver.close();

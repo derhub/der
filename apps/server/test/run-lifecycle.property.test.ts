@@ -199,10 +199,10 @@ async function restartDirect(dbPath: string, dir: string): Promise<void> {
       () =>
         server.store.database.db
           .query<{ n: number }, []>(
-            "SELECT COUNT(*) AS n FROM runs WHERE origin = 'event' AND status IN ('queued', 'running')",
+            "SELECT COUNT(*) AS n FROM runs WHERE status IN ('queued', 'running', 'waiting_approval')",
           )
           .get()!.n === 0,
-      { timeoutMs: 2_000, label: "recovered event Runs settled" },
+      { timeoutMs: 2_000, label: "recovered Runs settled" },
     ).catch(() => undefined);
   } finally {
     await server.close();

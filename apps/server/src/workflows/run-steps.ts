@@ -76,7 +76,7 @@ type RunFinishDeps = Pick<WorkflowDeps, "onRunFinished"> & {
 };
 
 /** Only the finish that ended the Run notifies; a later one returns the stored Run unchanged. */
-async function finishRunAndNotify(
+export async function finishRunAndNotify(
   deps: Pick<RunFinishDeps, "store" | "onRunFinished">,
   input: FinishRunInput,
 ): Promise<FinishRunOutcome> {
