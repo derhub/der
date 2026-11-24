@@ -8,6 +8,7 @@ export {
   OUTBOX_DESTINATIONS_MIGRATION,
   SCRIPT_ROUTINES_MIGRATION,
   SCRIPT_RUNS_MIGRATION,
+  SCRIPT_STEPS_MIGRATION,
   type StorageMigration,
 } from "./migrations";
 export {
@@ -20,6 +21,11 @@ export {
   type AcquireScriptRunOutcome,
   type SqliteScriptRunsOptions,
 } from "./script-runs";
+export {
+  openSqliteScriptStore,
+  SqliteScriptStore,
+  type SqliteScriptStoreOptions,
+} from "./script-store";
 export {
   openSqliteStore,
   SqliteStore,

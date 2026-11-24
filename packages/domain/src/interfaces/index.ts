@@ -19,6 +19,21 @@ export {
 export type { Memory } from "./memory";
 export type { Sandbox } from "./sandbox";
 export type {
+  AcquireScript,
+  DeliveryMark,
+  FinishResult,
+  NewStep,
+  ScriptEnd,
+  ScriptExecution,
+  ScriptRunId,
+  ScriptStore,
+  StepDecision,
+  StepEffect,
+  StepOutcome,
+  StepStatus,
+  StoredStep,
+} from "./script-store";
+export type {
   ApprovalEffectStore,
   BeginEffectOutcome,
   BotStore,

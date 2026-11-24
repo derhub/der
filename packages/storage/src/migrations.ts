@@ -34,6 +34,8 @@ const engineSessionsMigrationPath = resolve(
   "../migrations/008-engine-sessions.sql",
 );
 
+const scriptStepsMigrationPath = resolve(import.meta.dirname, "../migrations/009-script-steps.sql");
+
 export const CORE_MIGRATION: StorageMigration = {
   version: "001-core",
   sql: readFileSync(coreMigrationPath, "utf8"),
@@ -72,6 +74,12 @@ export const ENGINE_SESSIONS_MIGRATION: StorageMigration = {
   sql: readFileSync(engineSessionsMigrationPath, "utf8"),
 };
 
+export const SCRIPT_STEPS_MIGRATION: StorageMigration = {
+  version: "009-script-steps",
+  sql: readFileSync(scriptStepsMigrationPath, "utf8"),
+  disableForeignKeys: true,
+};
+
 export const CORE_MIGRATIONS: readonly StorageMigration[] = [
   CORE_MIGRATION,
   OUTBOX_DESTINATIONS_MIGRATION,
@@ -80,6 +88,7 @@ export const CORE_MIGRATIONS: readonly StorageMigration[] = [
   SCRIPT_ROUTINES_MIGRATION,
   RUN_USAGE_MIGRATION,
   ENGINE_SESSIONS_MIGRATION,
+  SCRIPT_STEPS_MIGRATION,
 ];
 
 export function applyMigrations(

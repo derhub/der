@@ -9,10 +9,17 @@ export const scriptRunStatus = z.enum([
   "failed",
   "cancelled",
   "interrupted",
+  "in_doubt",
 ]);
 export type ScriptRunStatus = z.infer<typeof scriptRunStatus>;
 
-export const terminalScriptRunStatus = z.enum(["completed", "failed", "cancelled", "interrupted"]);
+export const terminalScriptRunStatus = z.enum([
+  "completed",
+  "failed",
+  "cancelled",
+  "interrupted",
+  "in_doubt",
+]);
 export type TerminalScriptRunStatus = z.infer<typeof terminalScriptRunStatus>;
 
 export const executeErrorKind = z.enum([
