@@ -7,9 +7,14 @@ import {
   type ChannelIntakeMetadata,
   type ExecuteResult,
   type RunId,
+  type ScriptExecution,
+  type StoredStep,
 } from "@der/domain";
+import { finalizeInterruptedUncertainStep } from "../workflows/run-steps";
 import {
+  effectOf,
   executeScriptRun,
+  RUN_ENDED,
   scriptApprovalOwner,
   type ScriptExecutionDeps,
 } from "./script-execution";
@@ -72,12 +77,34 @@ export class ScriptDriver {
     for (;;) {
       signal.throwIfAborted();
       this.#closing.signal.throwIfAborted();
-      const { execution } = this.deps.scripts.load(id);
+      const { execution, steps } = this.deps.scripts.load(id);
       if (execution.result !== null) {
+        if (execution.status === "in_doubt") {
+          await this.#interruptRun(execution, steps, execution.result);
+        }
         return execution.result;
       }
       await Bun.sleep(25);
     }
+  }
+
+  async #interruptRun(
+    execution: ScriptExecution,
+    steps: readonly StoredStep[],
+    result: ExecuteResult,
+  ): Promise<void> {
+    const { store, now } = this.deps;
+    const doubtful = steps.find((step) => step.status === "unknown");
+    const run = await store.getRun(execution.runId);
+    const effect =
+      doubtful === undefined ? undefined : await store.getEffect(effectOf(execution, doubtful));
+    if (run === undefined || RUN_ENDED.has(run.status) || effect === undefined || result.ok) {
+      return;
+    }
+    await finalizeInterruptedUncertainStep(
+      { store, now },
+      { run, effectId: effect.id, detail: result.error.message },
+    );
   }
 
   async cancelRun(runId: RunId): Promise<void> {

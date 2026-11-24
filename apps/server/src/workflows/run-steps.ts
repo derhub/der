@@ -70,8 +70,12 @@ export interface WorkflowDeps {
   readonly scriptRoutines?: () => ScriptRoutineDeps;
 }
 
+type RunFinishDeps = Pick<WorkflowDeps, "now" | "onRunFinished"> & {
+  readonly store: Pick<RunStore, "finishRun">;
+};
+
 async function finishRunAndNotify(
-  deps: Pick<WorkflowDeps, "store" | "onRunFinished">,
+  deps: Pick<RunFinishDeps, "store" | "onRunFinished">,
   input: FinishRunInput,
 ): Promise<FinishRunOutcome> {
   const finished = await deps.store.finishRun(input);
@@ -448,7 +452,7 @@ export async function reconcileApprovalExpiryStep(
 }
 
 export async function finalizeInterruptedUncertainStep(
-  deps: Pick<WorkflowDeps, "store" | "now" | "onRunFinished">,
+  deps: RunFinishDeps,
   input: {
     readonly run: Run;
     readonly effectId: EffectId;

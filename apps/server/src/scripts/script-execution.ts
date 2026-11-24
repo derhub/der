@@ -32,7 +32,7 @@ import { fingerprintJson } from "@der/storage";
 import { approvalRequestedEvent } from "../workflows/run-steps";
 
 export interface ScriptExecutionDeps {
-  readonly store: ApprovalEffectStore & Pick<RunStore, "getRun" | "appendRunEvents">;
+  readonly store: ApprovalEffectStore & Pick<RunStore, "getRun" | "appendRunEvents" | "finishRun">;
   readonly scripts: ScriptStore;
   readonly bots: Pick<BotStore, "getBot">;
   readonly catalog: Catalog;
@@ -45,7 +45,12 @@ export interface ScriptExecutionDeps {
   readonly now: () => Date;
 }
 
-const RUN_ENDED = new Set<Run["status"]>(["completed", "failed", "cancelled", "interrupted"]);
+export const RUN_ENDED = new Set<Run["status"]>([
+  "completed",
+  "failed",
+  "cancelled",
+  "interrupted",
+]);
 const WRITE_CANCEL_GRACE_MS = 10_000;
 const RESULT_DEPTH = 256;
 
@@ -70,7 +75,7 @@ function messageOf(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
-function effectOf(head: ScriptExecution, step: StoredStep): EffectIdentity {
+export function effectOf(head: ScriptExecution, step: StoredStep): EffectIdentity {
   return {
     runId: head.runId,
     operationKind: "capability",
