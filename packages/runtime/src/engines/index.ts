@@ -1,5 +1,4 @@
 export {
-  antigravityResume,
   buildAntigravityAcpCommand,
   createAntigravityEngine,
   type AntigravityEngineConfig,
@@ -14,12 +13,8 @@ export {
   type ApprovalRequestInput,
   type CallbackContinuityState,
 } from "./approval-bridge";
-export {
-  claudeCodeResume,
-  createClaudeCodeEngine,
-  type ClaudeCodeEngineConfig,
-} from "./claude-code";
-export { codexResume, createCodexEngine, type CodexEngineConfig } from "./codex";
+export { createClaudeCodeEngine, type ClaudeCodeEngineConfig } from "./claude-code";
+export { createCodexEngine, type CodexEngineConfig } from "./codex";
 export {
   assertUnattendedEligible,
   DEFAULT_CLI_PINS,
@@ -39,11 +34,8 @@ export { digestJson, normalizeToJsonValue, redactDiagnostics } from "./redaction
 export {
   bridgeAdapterStream,
   checkRunReadinessGate,
-  extractCheckpointSessionId,
   linkAbortSignal,
   readRunUsage,
-  readSessionIdChunk,
-  type EngineResumeTraits,
   type EngineRunInput,
   type LoadEngineRunInput,
 } from "./stream-bridge";

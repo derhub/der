@@ -3,8 +3,7 @@ import {
   CLOUD_EVENT_TYPES,
   formatUtcTimestamp,
   type CloudEvent,
-  type ContextMode,
-  type EngineSession,
+  type EngineSessionInput,
   type JsonValue,
   type Message,
   type MessagePart,
@@ -23,7 +22,7 @@ import { compiledParsers } from "@der/domain/compiled";
 import { fingerprintJson } from "./canonical";
 import { insertOutboxForBindings } from "./channel-outbox";
 import type { SqliteDatabase } from "./database";
-import { saveEngineSession } from "./engine-sessions";
+import { handOverEngineSession } from "./engine-sessions";
 import { conflictError, notFoundError, validationError } from "./errors";
 import {
   mapBotRow,
@@ -54,9 +53,8 @@ export interface FinishRunInput {
   readonly detail?: string;
   readonly checkpoint?: JsonValue | null;
   readonly usage?: RunUsage;
-  readonly contextMode?: ContextMode;
-  /** Saved in the finish transaction at the reply's ordinal when there is one. */
-  readonly engineSession?: Omit<EngineSession, "pendingRunId" | "updatedAt">;
+  /** Stored at the reply's ordinal, only by the finish that first makes the Run terminal. */
+  readonly engineSession?: EngineSessionInput;
 }
 
 export interface FinishRunOutcome {
@@ -305,14 +303,6 @@ export function listSessionRuns(database: SqliteDatabase, sessionId: SessionId):
     .map(mapRunRow);
 }
 
-export function setRunContextMode(
-  database: SqliteDatabase,
-  runId: RunId,
-  contextMode: ContextMode,
-): void {
-  database.db.query("UPDATE runs SET context_mode = ? WHERE id = ?").run(contextMode, runId);
-}
-
 export async function markRunRunning(
   database: SqliteDatabase,
   runId: RunId,
@@ -545,8 +535,7 @@ export async function finishRun(
            cached_input_tokens = COALESCE(?, cached_input_tokens),
            cache_write_tokens = COALESCE(?, cache_write_tokens),
            output_tokens = COALESCE(?, output_tokens),
-           reported_cost_usd = COALESCE(?, reported_cost_usd),
-           context_mode = COALESCE(?, context_mode)
+           reported_cost_usd = COALESCE(?, reported_cost_usd)
        WHERE id = ?`,
     ).run(
       input.status,
@@ -558,7 +547,6 @@ export async function finishRun(
       input.usage?.cacheWriteTokens ?? null,
       input.usage?.outputTokens ?? null,
       input.usage?.reportedCostUsd ?? null,
-      input.contextMode ?? null,
       input.runId,
     );
 
@@ -662,10 +650,13 @@ export async function finishRun(
       outboxEvents.push(...insertOutboxForBindings(db, botBindings, routineEnvelope, now));
     }
 
-    if (input.engineSession !== undefined) {
-      saveEngineSession(
+    // Only the write that ends an active Run hands over: no successor exists yet whose row this
+    // could replace.
+    if (["queued", "running", "waiting_approval"].includes(runRow.status)) {
+      handOverEngineSession(
         db,
-        {
+        runRow.session_id,
+        input.engineSession && {
           ...input.engineSession,
           lastOrdinal: finalMessage?.ordinal ?? input.engineSession.lastOrdinal,
         },

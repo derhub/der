@@ -6,7 +6,7 @@ Self-hosted personal coworker platform built on [Bun](https://bun.sh), [SQLite](
 
 - `packages/domain` (`@der/domain`): Zod 4.6.7 schemas, compiled boundary parsers, W3C and open-format protocol modules (CloudEvents v1.0, RFC 9457 Problem Details, RFC 3339 UTC timestamps, W3C SSE), narrow storage ports, `WorkflowDriver` / `RunCoordinator` interfaces, and `defineCapability` / `defineIntegration` / `IntegrationRegistry` / `Catalog` / `OutboxSink` contracts.
 - `packages/storage` (`@der/storage`): SQLite WAL store implementing the domain storage ports, migrations, replay log, effect ledger, Script run records (`packages/storage/src/script-runs.ts`), Memory Markdown projection, Routine slots, and transactional CloudEvents outbox.
-- `packages/runtime` (`@der/runtime`): Hardened rootless Docker launcher, the Docker-hosted Wasmer sandbox behind `sandbox.wasmer`, the Script runner (`quickjs-emscripten` in a Bun Worker), TanStack AI official BYO engine harnesses (`@tanstack/ai-codex`, `@tanstack/ai-claude-code`, `@tanstack/ai-acp` for Codex, Claude Code, and Antigravity ACP) with live subprocess approval callbacks, doctor probes, context compaction, and Agent Skills catalog.
+- `packages/runtime` (`@der/runtime`): Hardened rootless Docker launcher, the Docker-hosted Wasmer sandbox behind `sandbox.wasmer`, the Script runner (`quickjs-emscripten` in a Bun Worker), TanStack AI official BYO engine harnesses (`@tanstack/ai-codex`, `@tanstack/ai-claude-code`, `@tanstack/ai-acp` for Codex, Claude Code, and Antigravity ACP) with live subprocess approval callbacks, doctor probes, context compaction, engine session resume, and Agent Skills catalog.
 - `integrations/mcp` (`@der/mcp`): Allowlisted MCP integration exported via `defineIntegration`; each remote MCP tool becomes an `mcp.<server>.<tool>` capability.
 - `apps/server` (`@der/server`): Singleton Bun server hosting the Hono HTTP/SSE operator API, unified `RunCoordinator`, Restate and direct `WorkflowDriver` implementations, the host capabilities and the `search` / `execute` tools, the `ScriptWorkflow` Restate workflow, `RoutineSchedule` Virtual Object, and `OutboxSender`.
 - `apps/web` (`@der/web`): Optional React 19 operator Web console built on `@astryxdesign/core`, `@astryxdesign/theme-neutral`, and `@stylexjs/stylex`.
@@ -94,6 +94,20 @@ Each `execute` call creates a `ScriptRun` bound to the calling Run (`packages/st
 
 A Routine carries either a `prompt` or a `script` (`packages/domain/src/schemas/routine.ts`). Create one with `POST /api/bots/:botId/routines` and a `script` field instead of `prompt`, or update it with `PATCH /api/routines/:routineId`; the `routines.create` and `routines.update` capabilities take the same fields. A script routine fires a Run with engine `script`: the Script runs as above, no engine adapter starts, and no unattended-terms check applies. The Script's result becomes the assistant message (`Script result: <json>`), and a failed Script fails the Run with code `script.<kind>`. Writes that need approval ask for an Approval on every firing. The `script` engine cannot be chosen on the chat and run routes; only a Routine firing selects it.
 
+### Session resume
+
+On Claude Code and Antigravity a Run resumes the vendor CLI's session instead of sending the whole conversation again. Codex does not resume yet; every Codex Run rebuilds its context from the stored messages. `Run.contextMode` reports `resumed` or `rebuilt`.
+
+A Run rebuilds when:
+
+- it runs on Codex, or on a different engine than the previous Run of the Session;
+- the previous Run did not complete, or was a Script Run;
+- the Bot's persona, a system message or the engine model changed;
+- more than 200 messages arrived since the previous Run, or any of them is not plain user text;
+- the vendor refuses the stored session. The Run then retries once as a rebuild.
+
+A memory or skill edit reaches a resumed session with the next user message. A resumed Claude Code session keeps its original system prompt until it rebuilds.
+
 ### RunCoordinator and workflow drivers
 
 `apps/server/src/workflows/coordinator.ts` provides a single `RunCoordinator` that owns run admission, engine execution, live approval waits, effect ledger transitions, and terminal finalization. Execution runs behind the `WorkflowDriver` seam (`packages/domain/src/interfaces/workflow.ts`):
@@ -133,6 +147,10 @@ Key base settings:
 - `DER_RESTATE_MODE`: `restate` (default) for durable Restate workflows or `direct` for in-process execution.
 - `DER_OUTBOX_POLL_INTERVAL_MS`, `DER_OUTBOX_INITIAL_BACKOFF_MS`, `DER_OUTBOX_MAX_BACKOFF_MS`: Outbox polling interval and exponential backoff bounds.
 - `DER_SCRIPT_MAX_CALLS`, `DER_SCRIPT_ACTIVE_MS`, `DER_SCRIPT_MEMORY_BYTES`, `DER_SCRIPT_OUTPUT_BYTES`, `DER_SCRIPT_RESULT_BYTES`, `DER_APPROVAL_TIMEOUT_MS`: Script limits and Approval wait; defaults are under [Code mode](#code-mode-search-and-execute).
+- `DER_MEMORY_PROMPT_MAX_BYTES`: Size cap of the memory text in the system prompt (default `24000`, minimum `1024`). Longer text ends with a `[truncated: the rest is available through the memory capability]` line.
+- `DER_SKILL_CATALOG_MAX_BYTES`: Same cap for the skill catalog (default `8000`, minimum `1024`).
+- `DER_CONTEXT_MAX_TOKENS`: Token budget a rebuilt conversation is compacted to (default `32000`).
+- `DER_ENGINE_COMPACT_TOKENS`: Auto-compact window passed to Claude Code and Codex (default `100000`). Antigravity has none.
 - `DER_MCP_SERVERS_JSON`: JSON array of remote MCP servers whose tools become `mcp.<server>.<tool>` capabilities.
 
 ## Configure dedicated rootless Docker daemon and shadow-home logins

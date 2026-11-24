@@ -8,13 +8,7 @@ export {
   type RunContextCaps,
   type RunContextCompactionOptions,
 } from "./compaction";
-export {
-  baseHashWithModel,
-  composeResumeText,
-  planTurn,
-  type PlanTurnInput,
-  type TurnPlan,
-} from "./resume-plan";
+export { composeResumeText, planTurn, type PlanTurnInput, type TurnPlan } from "./resume-plan";
 export {
   createSkillCatalog,
   SkillCatalog,

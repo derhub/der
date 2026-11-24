@@ -1,5 +1,12 @@
 import type { Database } from "bun:sqlite";
-import type { EngineKind, EngineSession, RunId, SessionId } from "@der/domain";
+import type {
+  ContextMode,
+  EngineKind,
+  EngineSession,
+  EngineSessionInput,
+  RunId,
+  SessionId,
+} from "@der/domain";
 import type { SqliteDatabase } from "./database";
 
 interface EngineSessionRow {
@@ -9,16 +16,15 @@ interface EngineSessionRow {
   readonly base_hash: string;
   readonly context_hash: string;
   readonly last_ordinal: number;
-  readonly pending_run_id: string | null;
   readonly updated_at: string;
 }
 
 export function getEngineSession(
-  database: SqliteDatabase,
+  db: Database,
   sessionId: SessionId,
   engine: EngineKind,
 ): EngineSession | null {
-  const row = database.db
+  const row = db
     .query<EngineSessionRow, [string, string]>(
       "SELECT * FROM engine_sessions WHERE session_id = ? AND engine = ?",
     )
@@ -33,39 +39,48 @@ export function getEngineSession(
     baseHash: row.base_hash,
     contextHash: row.context_hash,
     lastOrdinal: row.last_ordinal,
-    pendingRunId: row.pending_run_id,
     updatedAt: row.updated_at as EngineSession["updatedAt"],
   };
 }
 
-export function markEngineSessionPending(
+export function takeEngineSession<T extends { readonly contextMode: ContextMode }>(
   database: SqliteDatabase,
-  sessionId: SessionId,
-  engine: EngineKind,
   runId: RunId,
-): void {
-  database.db
-    .query("UPDATE engine_sessions SET pending_run_id = ? WHERE session_id = ? AND engine = ?")
-    .run(runId, sessionId, engine);
+  plan: (stored: EngineSession | null) => T,
+): T | undefined {
+  return database.inTransaction((db) => {
+    const run = db
+      .query<{ session_id: string; engine: string }, [string]>(
+        `SELECT session_id, engine FROM runs
+         WHERE id = ? AND status IN ('queued', 'running', 'waiting_approval')`,
+      )
+      .get(runId);
+    if (!run) {
+      return undefined;
+    }
+    const stored = getEngineSession(db, run.session_id, run.engine as EngineKind);
+    db.query("DELETE FROM engine_sessions WHERE session_id = ?").run(run.session_id);
+    const planned = plan(stored);
+    db.query("UPDATE runs SET context_mode = ? WHERE id = ?").run(planned.contextMode, runId);
+    return planned;
+  });
 }
 
-export function saveEngineSession(
+/** Replaces the session's engine sessions with `row`, or with none. */
+export function handOverEngineSession(
   db: Database,
-  row: Omit<EngineSession, "pendingRunId" | "updatedAt">,
+  sessionId: SessionId,
+  row: EngineSessionInput | undefined,
   updatedAt: string,
 ): void {
+  db.query("DELETE FROM engine_sessions WHERE session_id = ?").run(sessionId);
+  if (row === undefined) {
+    return;
+  }
   db.query(
     `INSERT INTO engine_sessions
-         (session_id, engine, vendor_session_id, base_hash, context_hash, last_ordinal, pending_run_id, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?, NULL, ?)
-       ON CONFLICT (session_id, engine) DO UPDATE SET
-         vendor_session_id = excluded.vendor_session_id,
-         base_hash = excluded.base_hash,
-         context_hash = excluded.context_hash,
-         last_ordinal = excluded.last_ordinal,
-         pending_run_id = NULL,
-         updated_at = excluded.updated_at
-       WHERE excluded.last_ordinal > engine_sessions.last_ordinal`,
+       (session_id, engine, vendor_session_id, base_hash, context_hash, last_ordinal, updated_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?)`,
   ).run(
     row.sessionId,
     row.engine,
@@ -75,14 +90,4 @@ export function saveEngineSession(
     row.lastOrdinal,
     updatedAt,
   );
-}
-
-export function dropEngineSession(
-  database: SqliteDatabase,
-  sessionId: SessionId,
-  engine: EngineKind,
-): void {
-  database.db
-    .query("DELETE FROM engine_sessions WHERE session_id = ? AND engine = ?")
-    .run(sessionId, engine);
 }

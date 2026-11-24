@@ -11,17 +11,9 @@ import { DEFAULT_ENGINE_SHADOW_HOMES } from "../sandbox/docker-policy";
 import {
   bridgeAdapterStream,
   checkRunReadinessGate,
-  extractCheckpointSessionId,
   linkAbortSignal,
-  isBroadResumeFailureMessage,
-  type EngineResumeTraits,
   type LoadEngineRunInput,
 } from "./stream-bridge";
-
-export const codexResume: EngineResumeTraits = {
-  resumable: false,
-  isResumeFailure: isBroadResumeFailureMessage,
-};
 
 export interface CodexEngineConfig {
   readonly model: CodexModel;
@@ -53,7 +45,7 @@ export function createCodexEngine(config: CodexEngineConfig): Engine {
       }
 
       const input = await config.loadRunInput(run);
-      const resumeSessionId = input.resumeSessionId ?? extractCheckpointSessionId(run);
+      const resumeSessionId = input.resumeSessionId;
       const { controller, release } = linkAbortSignal(input.signal);
 
       // Keep authMode="api-key" without host API keys so @tanstack/ai-codex never reads host ~/.codex
@@ -109,9 +101,7 @@ export function createCodexEngine(config: CodexEngineConfig): Engine {
           ...(input.signal !== undefined ? { signal: input.signal } : {}),
           abortController: controller,
           sessionIdEventName: "codex.session-id",
-          isResumeFailure: codexResume.isResumeFailure,
-          ...(resumeSessionId !== undefined ? { expectedResumeSessionId: resumeSessionId } : {}),
-          ...(input.requireResume !== undefined ? { requireResume: input.requireResume } : {}),
+          ...(resumeSessionId !== undefined ? { resumeSessionId } : {}),
         });
       } finally {
         release();

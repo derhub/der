@@ -18,6 +18,8 @@ export const engineEvent = z.discriminatedUnion("type", [
       })
       .optional(),
     usage: runUsage.optional(),
+    /** The vendor session the turn ended on. */
+    vendorSessionId: z.string().min(1).optional(),
   }),
   z.object({
     type: z.literal("failed"),

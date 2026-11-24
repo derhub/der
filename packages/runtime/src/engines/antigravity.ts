@@ -1,28 +1,24 @@
 import type { Engine, EngineEvent, EngineReadiness, Run } from "@der/domain";
 import { chat } from "@tanstack/ai";
-import { acpCompatible } from "@tanstack/ai-acp";
+import { acpCompatible, buildAcpPrompt } from "@tanstack/ai-acp";
 import { defineSandbox, withSandbox, type SandboxProvider } from "@tanstack/ai-sandbox";
 import { DEFAULT_ENGINE_SHADOW_HOMES } from "../sandbox/docker-policy";
 import { createApprovalBridge, type CallbackContinuityState } from "./approval-bridge";
 import {
   bridgeAdapterStream,
   checkRunReadinessGate,
-  extractCheckpointSessionId,
   linkAbortSignal,
-  type EngineResumeTraits,
   type LoadEngineRunInput,
 } from "./stream-bridge";
 
-const UNKNOWN_TRAJECTORY_MESSAGE = /trajectory not found/i;
-
 /**
  * `agy acp` answers `session/load` for an unknown id with that same id, then fails the first
- * prompt with "not_found: trajectory not found: <id>".
+ * prompt with "not_found: trajectory not found: <id>". When `session/load` itself fails, the ACP
+ * adapter opens a fresh session and asks `buildPrompt` for a prompt without a session id; that
+ * call throws `FRESH_FALLBACK_REFUSED`, which the adapter reports before sending any prompt.
  */
-export const antigravityResume: EngineResumeTraits = {
-  resumable: true,
-  isResumeFailure: (message) => UNKNOWN_TRAJECTORY_MESSAGE.test(message),
-};
+const FRESH_FALLBACK_REFUSED = "session/load failed; refused the fresh-session fallback";
+const RESUME_REFUSAL_MESSAGE = /trajectory not found|refused the fresh-session fallback/i;
 
 export interface AntigravityEngineConfig {
   readonly model: string;
@@ -56,6 +52,7 @@ export function buildAntigravityAcpCommand(config: {
 export function createAntigravityEngine(config: AntigravityEngineConfig): Engine {
   return {
     kind: "antigravity",
+    resumable: true,
 
     async diagnose(): Promise<EngineReadiness> {
       return config.diagnose();
@@ -70,7 +67,7 @@ export function createAntigravityEngine(config: AntigravityEngineConfig): Engine
       }
 
       const input = await config.loadRunInput(run);
-      const resumeSessionId = input.resumeSessionId ?? extractCheckpointSessionId(run);
+      const resumeSessionId = input.resumeSessionId;
       const { controller, release } = linkAbortSignal(input.signal);
 
       const approvalBridge = createApprovalBridge({
@@ -99,6 +96,12 @@ export function createAntigravityEngine(config: AntigravityEngineConfig): Engine
           ...config.env,
         },
         onPermissionRequest: (request) => approvalBridge.mediateAcpPermission(request),
+        buildPrompt: (messages, sessionId) => {
+          if (resumeSessionId !== undefined && sessionId === undefined) {
+            throw new Error(FRESH_FALLBACK_REFUSED);
+          }
+          return buildAcpPrompt(messages, sessionId, "antigravity");
+        },
       });
 
       const sandbox = defineSandbox({
@@ -121,30 +124,16 @@ export function createAntigravityEngine(config: AntigravityEngineConfig): Engine
           middleware: [withSandbox(sandbox)],
         });
 
-        const events = bridgeAdapterStream({
+        yield* bridgeAdapterStream({
           run,
           stream,
           ...(input.signal !== undefined ? { signal: input.signal } : {}),
           abortController: controller,
           approvalBridge,
           sessionIdEventName: "antigravity.session-id",
-          isResumeFailure: antigravityResume.isResumeFailure,
-          ...(resumeSessionId !== undefined ? { expectedResumeSessionId: resumeSessionId } : {}),
-          ...(input.requireResume !== undefined ? { requireResume: input.requireResume } : {}),
+          isResumeFailure: (message) => RESUME_REFUSAL_MESSAGE.test(message),
+          ...(resumeSessionId !== undefined ? { resumeSessionId } : {}),
         });
-        for await (const event of events) {
-          yield input.requireResume === true &&
-          resumeSessionId !== undefined &&
-          event.type === "failed" &&
-          event.code !== "engine.resume_unavailable" &&
-          antigravityResume.isResumeFailure(event.detail)
-            ? {
-                type: "failed",
-                code: "engine.resume_unavailable",
-                detail: `Unable to resume session "${resumeSessionId}": ${event.detail}`,
-              }
-            : event;
-        }
       } finally {
         release();
       }

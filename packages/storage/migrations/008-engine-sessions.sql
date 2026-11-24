@@ -5,7 +5,6 @@ CREATE TABLE engine_sessions (
   base_hash TEXT NOT NULL,
   context_hash TEXT NOT NULL,
   last_ordinal INTEGER NOT NULL CHECK (last_ordinal >= 0),
-  pending_run_id TEXT,
   updated_at TEXT NOT NULL,
   PRIMARY KEY (session_id, engine)
 );

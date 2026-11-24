@@ -25,19 +25,12 @@ import {
 import {
   bridgeAdapterStream,
   checkRunReadinessGate,
-  extractCheckpointSessionId,
   linkAbortSignal,
-  type EngineResumeTraits,
   type LoadEngineRunInput,
 } from "./stream-bridge";
 
-const UNKNOWN_SESSION_MESSAGE = /No conversation found with session ID/i;
-
 /** `claude --resume <unknown id> -p` exits 1 with "No conversation found with session ID: <id>" on stderr. */
-export const claudeCodeResume: EngineResumeTraits = {
-  resumable: true,
-  isResumeFailure: (message) => UNKNOWN_SESSION_MESSAGE.test(message),
-};
+const UNKNOWN_SESSION_MESSAGE = /No conversation found with session ID/i;
 
 export interface ClaudeCodeEngineConfig {
   readonly model: ClaudeCodeModel;
@@ -70,6 +63,7 @@ function withToolBridgeProvisioner(provisioner: ToolBridgeProvisioner) {
 export function createClaudeCodeEngine(config: ClaudeCodeEngineConfig): Engine {
   return {
     kind: "claude-code",
+    resumable: true,
 
     async diagnose(): Promise<EngineReadiness> {
       return config.diagnose();
@@ -84,7 +78,7 @@ export function createClaudeCodeEngine(config: ClaudeCodeEngineConfig): Engine {
       }
 
       const input = await config.loadRunInput(run);
-      const resumeSessionId = input.resumeSessionId ?? extractCheckpointSessionId(run);
+      const resumeSessionId = input.resumeSessionId;
       const { controller, release } = linkAbortSignal(input.signal);
 
       const approvalBridge = createApprovalBridge({
@@ -149,9 +143,8 @@ export function createClaudeCodeEngine(config: ClaudeCodeEngineConfig): Engine {
           abortController: controller,
           approvalBridge,
           sessionIdEventName: "claude-code.session-id",
-          isResumeFailure: claudeCodeResume.isResumeFailure,
-          ...(resumeSessionId !== undefined ? { expectedResumeSessionId: resumeSessionId } : {}),
-          ...(input.requireResume !== undefined ? { requireResume: input.requireResume } : {}),
+          isResumeFailure: (message) => UNKNOWN_SESSION_MESSAGE.test(message),
+          ...(resumeSessionId !== undefined ? { resumeSessionId } : {}),
         });
       } finally {
         release();

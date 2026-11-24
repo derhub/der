@@ -71,9 +71,12 @@ export interface FinishRunInput {
   readonly detail?: string;
   readonly checkpoint?: JsonValue | null;
   readonly usage?: RunUsage;
-  readonly contextMode?: ContextMode;
-  /** Saved in the finish transaction at the reply's ordinal when there is one. */
-  readonly engineSession?: Omit<EngineSession, "pendingRunId" | "updatedAt">;
+  /**
+   * The finish that first makes the Run terminal replaces the session's engine sessions with this
+   * one, at the reply's ordinal when there is one, or with none when absent. A finish of a Run
+   * that is already terminal writes nothing.
+   */
+  readonly engineSession?: EngineSessionInput;
 }
 
 export interface FinishRunOutcome {
@@ -177,21 +180,23 @@ export interface EngineSession {
   readonly contextHash: string;
   /** Highest message ordinal the vendor session has seen. */
   readonly lastOrdinal: number;
-  /** Run whose engine call is in flight; null once the call finished. */
-  readonly pendingRunId: RunId | null;
   readonly updatedAt: UtcTimestamp;
 }
 
+/** An engine session as a finished turn hands it to `finishRun`, which stamps `updatedAt`. */
+export type EngineSessionInput = Omit<EngineSession, "updatedAt">;
+
 export interface EngineSessionStore {
   getEngineSession(sessionId: SessionId, engine: EngineKind): EngineSession | null;
-  /** No-op when the session has no row for the engine. */
-  markEngineSessionPending(sessionId: SessionId, engine: EngineKind, runId: RunId): void;
   /**
-   * Upsert; clears `pendingRunId` and stamps `updatedAt`. Replaces a stored row only when the
-   * incoming `lastOrdinal` is greater, so a replayed older finish is a no-op.
+   * In one transaction, while the Run is still active: deletes every engine session of its session,
+   * hands its engine's row to `plan` and stores the returned `contextMode` on the Run. Returns
+   * `plan`'s result, or `undefined` with nothing changed once the Run is terminal.
    */
-  saveEngineSession(row: Omit<EngineSession, "pendingRunId" | "updatedAt">): void;
-  dropEngineSession(sessionId: SessionId, engine: EngineKind): void;
+  takeEngineSession<T extends { readonly contextMode: ContextMode }>(
+    runId: RunId,
+    plan: (stored: EngineSession | null) => T,
+  ): T | undefined;
 }
 
 export interface Store
