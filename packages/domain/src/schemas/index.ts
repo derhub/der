@@ -20,10 +20,15 @@ export {
 } from "./approval";
 export {
   bot,
+  capabilityPolicy,
   createBotInput,
+  DEFAULT_EVENT_CHAIN_LIMIT,
+  policyDecision,
   updateBotInput,
   type Bot,
+  type CapabilityPolicy,
   type CreateBotInput,
+  type PolicyDecision,
   type UpdateBotInput,
 } from "./bot";
 export {

@@ -4,6 +4,7 @@ export {
   defineIntegration,
   IntegrationRegistry,
   renderDeclaration,
+  resolvePolicy,
   type AcquireScript,
   type ApprovalEffectStore,
   type BeginEffectOutcome,

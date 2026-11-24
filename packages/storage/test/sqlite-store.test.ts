@@ -12,7 +12,9 @@ import {
   fingerprintJson,
   openSqliteStore,
   OUTBOX_DESTINATIONS_MIGRATION,
+  SCRIPT_ROUTINES_MIGRATION,
   SCRIPT_RUNS_MIGRATION,
+  SCRIPT_STEPS_MIGRATION,
   type SqliteStore,
   type StorageMigration,
 } from "@der/storage";
@@ -117,6 +119,7 @@ describe("configure SQLite WAL, foreign keys, busy timeout, and migration seam",
         "007-run-usage",
         "008-engine-sessions",
         "009-script-steps",
+        "010-bot-policy",
       ]);
     } finally {
       store.close();
@@ -142,6 +145,7 @@ describe("configure SQLite WAL, foreign keys, busy timeout, and migration seam",
         "007-run-usage",
         "008-engine-sessions",
         "009-script-steps",
+        "010-bot-policy",
       ]);
     } finally {
       reopened.close();
@@ -1072,6 +1076,95 @@ describe("persist approvals, transactional outbox rows, and exact-operation effe
       expect(legacyEffect?.id).toBe("eff-legacy-1");
       expect(legacyEffect?.identity.operationKind).toBe("legacy");
       expect(legacyEffect?.identity.operationId).toBe("light.turn_on");
+    } finally {
+      store.close();
+    }
+  });
+});
+
+describe("bot policy", () => {
+  const ts = "2026-11-22T15:00:00.000Z";
+
+  it("reads a bot created before migration 008 with an empty policy and a chain limit of 3", () => {
+    const dbPath = createTempDbPath();
+    const legacyDb = new Database(dbPath, { create: true, strict: true });
+    legacyDb.exec("PRAGMA foreign_keys = ON;");
+    applyMigrations(legacyDb, [
+      CORE_MIGRATION,
+      OUTBOX_DESTINATIONS_MIGRATION,
+      CAPABILITY_OPERATION_KIND_MIGRATION,
+      SCRIPT_RUNS_MIGRATION,
+      SCRIPT_ROUTINES_MIGRATION,
+      SCRIPT_STEPS_MIGRATION,
+    ]);
+    legacyDb
+      .query(
+        `INSERT INTO bots (id, name, persona, default_engine, allowed_engines_json, workspace_path, created_at, updated_at)
+         VALUES ('bot-old', 'Old Bot', 'Concise', 'fixture', '["fixture"]', NULL, ?, ?)`,
+      )
+      .run(ts, ts);
+    legacyDb.close();
+
+    const store = openSqliteStore({ filename: dbPath });
+    try {
+      expect(store.getBot("bot-old")).toMatchObject({
+        id: "bot-old",
+        capabilityPolicy: {},
+        eventChainLimit: 3,
+      });
+    } finally {
+      store.close();
+    }
+  });
+
+  it("stores the policy and chain limit on create and keeps them across an unrelated update", () => {
+    const store = openSqliteStore({ filename: createTempDbPath() });
+    try {
+      const created = store.createBot({
+        id: "bot-p",
+        name: "P",
+        persona: "",
+        defaultEngine: "fixture",
+        allowedEngines: ["fixture"],
+        capabilityPolicy: { "mcp.github": "deny", "notes.publish": "allow" },
+        eventChainLimit: 5,
+      });
+      expect(created).toMatchObject({
+        capabilityPolicy: { "mcp.github": "deny", "notes.publish": "allow" },
+        eventChainLimit: 5,
+      });
+
+      const renamed = store.updateBot("bot-p", { name: "Q" });
+      expect(renamed).toMatchObject({
+        name: "Q",
+        capabilityPolicy: { "mcp.github": "deny", "notes.publish": "allow" },
+        eventChainLimit: 5,
+      });
+
+      const replaced = store.updateBot("bot-p", {
+        capabilityPolicy: { notes: "ask" },
+        eventChainLimit: 0,
+      });
+      expect(store.getBot("bot-p")).toEqual(replaced);
+      expect(replaced).toMatchObject({ capabilityPolicy: { notes: "ask" }, eventChainLimit: 0 });
+    } finally {
+      store.close();
+    }
+  });
+
+  it("rejects a policy key that is not a capability id or namespace", () => {
+    const store = openSqliteStore({ filename: createTempDbPath() });
+    try {
+      expect(() =>
+        store.createBot({
+          name: "P",
+          persona: "",
+          defaultEngine: "fixture",
+          allowedEngines: ["fixture"],
+          capabilityPolicy: { "notes.": "allow" },
+          eventChainLimit: 3,
+        }),
+      ).toThrow("policy key must be a capability id or a dotted namespace");
     } finally {
       store.close();
     }

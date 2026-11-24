@@ -44,6 +44,8 @@ function createFakeServerFetch(
   const approvalDecisions: Array<{ approvalId: string; body: Record<string, unknown> }> = [];
   const memoryWrites: Array<Record<string, unknown>> = [];
   const routinePatches: Array<Record<string, unknown>> = [];
+  const botPatches: Array<Record<string, unknown>> = [];
+  let botPolicy: Record<string, string> = {};
 
   let runPostCount = 0;
   let approvalStatus: "pending" | "approved" | "denied" = "pending";
@@ -121,20 +123,27 @@ function createFakeServerFetch(
       });
     }
 
+    const fixtureBot = () => ({
+      id: "bot-fixture",
+      name: "Fixture Bot",
+      persona: "Credential-free deterministic coworker.",
+      defaultEngine: "fixture",
+      allowedEngines: ["fixture", "codex"],
+      capabilityPolicy: botPolicy,
+      eventChainLimit: 3,
+      createdAt: "2026-01-01T00:00:00.000Z",
+      updatedAt: "2026-01-01T00:00:00.000Z",
+    });
+
     if (method === "GET" && url.pathname === "/api/bots") {
-      return Response.json({
-        bots: [
-          {
-            id: "bot-fixture",
-            name: "Fixture Bot",
-            persona: "Credential-free deterministic coworker.",
-            defaultEngine: "fixture",
-            allowedEngines: ["fixture", "codex"],
-            createdAt: "2026-01-01T00:00:00.000Z",
-            updatedAt: "2026-01-01T00:00:00.000Z",
-          },
-        ],
-      });
+      return Response.json({ bots: [fixtureBot()] });
+    }
+
+    if (method === "PATCH" && url.pathname === "/api/bots/bot-fixture") {
+      const body = parseJsonRequestBody(init);
+      botPatches.push(body);
+      botPolicy = body["capabilityPolicy"] as Record<string, string>;
+      return Response.json(fixtureBot());
     }
 
     if (method === "GET" && url.pathname === "/api/bots/bot-fixture/sessions") {
@@ -495,6 +504,7 @@ function createFakeServerFetch(
     approvalDecisions,
     memoryWrites,
     routinePatches,
+    botPatches,
   };
 }
 
@@ -561,6 +571,33 @@ describe("operate der through the Web operator console", () => {
     });
     expect(screen.getByRole("status", { name: "Operator status" }).textContent).toContain(
       "Recorded approved decision",
+    );
+  });
+
+  it("saves a policy rule from the bot dialog and shows it again on reopen", async () => {
+    const user = userEvent.setup();
+    const server = createFakeServerFetch();
+    render(<App fetcher={server.fetcher} />);
+
+    await screen.findByText("Fixture session ready.");
+    await user.click(screen.getByRole("button", { name: "Edit bot Fixture Bot" }));
+    await user.click(screen.getByRole("button", { name: "Add policy rule" }));
+    await user.type(screen.getByLabelText("Policy selector 1"), "mcp.github");
+    await user.click(screen.getByRole("combobox", { name: /Policy decision 1/ }));
+    await user.keyboard("{ArrowDown}{Enter}");
+    await user.click(screen.getByRole("button", { name: "Save changes" }));
+
+    await waitFor(() => {
+      expect(server.botPatches).toHaveLength(1);
+    });
+    expect(server.botPatches[0]?.["capabilityPolicy"]).toEqual({ "mcp.github": "deny" });
+
+    await user.click(await screen.findByRole("button", { name: "Edit bot Fixture Bot" }));
+    expect((screen.getByLabelText("Policy selector 1") as HTMLInputElement).value).toBe(
+      "mcp.github",
+    );
+    expect(screen.getByRole("combobox", { name: /Policy decision 1/ }).textContent).toContain(
+      "deny",
     );
   });
 

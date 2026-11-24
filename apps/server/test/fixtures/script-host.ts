@@ -143,6 +143,7 @@ export async function openScriptFixture() {
     const driver = new ScriptDriver({
       store: databaseStore,
       scripts,
+      bots: databaseStore,
       catalog: host.catalog,
       limits: {
         memoryBytes: 64 * 1024 * 1024,

@@ -23,12 +23,38 @@ import {
   typographyVars,
 } from "@astryxdesign/core/theme/tokens.stylex";
 import * as stylex from "@stylexjs/stylex";
-import { BotIcon, MessageSquareIcon, PencilIcon, PlusIcon } from "lucide-react";
-import { useState, type FormEvent } from "react";
-import type { Bot, EngineKind, ProblemDetails, Session } from "@der/domain";
+import { BotIcon, MessageSquareIcon, PencilIcon, PlusIcon, Trash2Icon } from "lucide-react";
+import { useRef, useState, type FormEvent } from "react";
+import type {
+  Bot,
+  CapabilityPolicy,
+  EngineKind,
+  PolicyDecision,
+  ProblemDetails,
+  Session,
+} from "@der/domain";
 import { ProblemAlert } from "@/components/problem-alert";
 import type { OperatorApi } from "@/lib/operator-api";
 import { toOperatorProblem } from "@/lib/schemas";
+
+interface PolicyRow {
+  readonly id: number;
+  readonly selector: string;
+  readonly decision: PolicyDecision;
+}
+
+const POLICY_DECISION_OPTIONS = [
+  { value: "allow", label: "allow" },
+  { value: "ask", label: "ask" },
+  { value: "deny", label: "deny" },
+];
+
+function policyFromRows(rows: readonly PolicyRow[]): CapabilityPolicy {
+  const entries = rows
+    .map(({ selector, decision }) => [selector.trim(), decision] as const)
+    .filter(([selector]) => selector.length > 0);
+  return Object.fromEntries(entries);
+}
 
 const styles = stylex.create({
   sidebar: {
@@ -253,6 +279,11 @@ const styles = stylex.create({
     flexWrap: "wrap",
     gap: spacingVars["--spacing-3"],
   },
+  policyRow: {
+    display: "flex",
+    alignItems: "center",
+    gap: spacingVars["--spacing-2"],
+  },
   monoControl: {
     fontFamily: typographyVars["--font-family-code"],
     fontSize: textSizeVars["--font-size-sm"],
@@ -302,6 +333,8 @@ export function OperatorSidebar({
   const [botDefaultEngine, setBotDefaultEngine] = useState<EngineKind>("fixture");
   const [botAllowedEngines, setBotAllowedEngines] = useState<EngineKind[]>(["fixture"]);
   const [botWorkspacePath, setBotWorkspacePath] = useState("");
+  const [policyRows, setPolicyRows] = useState<PolicyRow[]>([]);
+  const nextPolicyRowId = useRef(0);
   const [botSaving, setBotSaving] = useState(false);
   const [botProblem, setBotProblem] = useState<ProblemDetails | null>(null);
 
@@ -320,8 +353,18 @@ export function OperatorSidebar({
     setBotDefaultEngine("fixture");
     setBotAllowedEngines(["fixture"]);
     setBotWorkspacePath("");
+    setPolicyRows([]);
     setBotProblem(null);
     setBotDialogOpen(true);
+  }
+
+  function addPolicyRow(selector = "", decision: PolicyDecision = "ask"): PolicyRow {
+    nextPolicyRowId.current += 1;
+    return { id: nextPolicyRowId.current, selector, decision };
+  }
+
+  function updatePolicyRow(id: number, change: Partial<Omit<PolicyRow, "id">>) {
+    setPolicyRows((rows) => rows.map((row) => (row.id === id ? { ...row, ...change } : row)));
   }
 
   function openEditBot(target: Bot) {
@@ -331,6 +374,11 @@ export function OperatorSidebar({
     setBotDefaultEngine(target.defaultEngine);
     setBotAllowedEngines([...target.allowedEngines]);
     setBotWorkspacePath(target.workspacePath ?? "");
+    setPolicyRows(
+      Object.entries(target.capabilityPolicy).map(([selector, decision]) =>
+        addPolicyRow(selector, decision),
+      ),
+    );
     setBotProblem(null);
     setBotDialogOpen(true);
   }
@@ -363,12 +411,14 @@ export function OperatorSidebar({
         ? botAllowedEngines
         : [...botAllowedEngines, botDefaultEngine];
       const trimmedWorkspace = botWorkspacePath.trim();
+      const capabilityPolicy = policyFromRows(policyRows);
       const saved = editingBot
         ? await api.updateBot(editingBot.id, {
             name: botName.trim(),
             persona: botPersona,
             defaultEngine: botDefaultEngine,
             allowedEngines: allowed,
+            capabilityPolicy,
             ...(trimmedWorkspace.length > 0 ? { workspacePath: trimmedWorkspace } : {}),
           })
         : await api.createBot({
@@ -376,6 +426,7 @@ export function OperatorSidebar({
             persona: botPersona,
             defaultEngine: botDefaultEngine,
             allowedEngines: allowed,
+            capabilityPolicy,
             ...(trimmedWorkspace.length > 0 ? { workspacePath: trimmedWorkspace } : {}),
           });
       onBotSaved(saved);
@@ -633,6 +684,54 @@ export function OperatorSidebar({
                     width="100%"
                     controlXstyle={styles.monoControl}
                   />
+
+                  <fieldset {...stylex.props(styles.fieldset)}>
+                    <legend {...stylex.props(styles.legend)}>Capability policy</legend>
+                    <Text type="supporting" as="p">
+                      Set allow, ask or deny for a capability id or a namespace such as mcp.github.
+                      The most specific rule wins; no rule keeps the capability's own approval
+                      setting.
+                    </Text>
+                    {policyRows.map((row, index) => (
+                      <div key={row.id} {...stylex.props(styles.policyRow)}>
+                        <TextInput
+                          label={`Policy selector ${index + 1}`}
+                          isLabelHidden
+                          value={row.selector}
+                          onChange={(value) => updatePolicyRow(row.id, { selector: value })}
+                          placeholder="notes.publish or mcp.github"
+                          width="100%"
+                          controlXstyle={styles.monoControl}
+                        />
+                        <Selector
+                          label={`Policy decision ${index + 1}`}
+                          isLabelHidden
+                          value={row.decision}
+                          options={POLICY_DECISION_OPTIONS}
+                          onChange={(value) =>
+                            updatePolicyRow(row.id, { decision: value as PolicyDecision })
+                          }
+                          width="7rem"
+                        />
+                        <IconButton
+                          label={`Remove policy rule ${index + 1}`}
+                          icon={<Trash2Icon {...stylex.props(styles.iconSm)} aria-hidden="true" />}
+                          variant="ghost"
+                          size="sm"
+                          onClick={() =>
+                            setPolicyRows((rows) => rows.filter((r) => r.id !== row.id))
+                          }
+                        />
+                      </div>
+                    ))}
+                    <div>
+                      <Button
+                        variant="secondary"
+                        label="Add policy rule"
+                        onClick={() => setPolicyRows((rows) => [...rows, addPolicyRow()])}
+                      />
+                    </div>
+                  </fieldset>
                 </div>
               </LayoutContent>
             }

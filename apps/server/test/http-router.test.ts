@@ -47,6 +47,8 @@ function createMinimalDeps(overrides: Partial<HttpRouterDeps> = {}): HttpRouterD
     persona: "Concise",
     defaultEngine: "fixture",
     allowedEngines: ["fixture"],
+    capabilityPolicy: {},
+    eventChainLimit: 3,
     createdAt: FIXED_TS,
     updatedAt: FIXED_TS,
   };
@@ -658,5 +660,64 @@ describe("serve Hono HTTP router on narrow domain ports", () => {
     const customRes = await app.fetch(new Request("http://localhost/custom"));
     expect(customRes.status).toBe(200);
     expect(await customRes.text()).toBe("custom-ok");
+  });
+});
+
+describe("edit a bot's capability policy over HTTP", () => {
+  function openApp() {
+    const store = openSqliteStore({ filename: ":memory:" });
+    store.createBot({
+      id: "bot-policy",
+      name: "Policy Bot",
+      persona: "",
+      defaultEngine: "fixture",
+      allowedEngines: ["fixture"],
+    });
+    return { store, app: createHttpApp({ ...createMinimalDeps(), bots: store }) };
+  }
+
+  const patch = (app: ReturnType<typeof createHttpApp>, body: unknown) =>
+    app.fetch(
+      new Request("http://localhost/api/bots/bot-policy", {
+        method: "PATCH",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(body),
+      }),
+    );
+
+  it("saves a policy and chain limit and lists them again", async () => {
+    const { store, app } = openApp();
+    try {
+      const res = await patch(app, {
+        capabilityPolicy: { "mcp.github": "deny", "notes.publish": "ask" },
+        eventChainLimit: 2,
+      });
+      expect(res.status).toBe(200);
+
+      const listed = (await (await app.fetch(new Request("http://localhost/api/bots"))).json()) as {
+        bots: { capabilityPolicy: unknown; eventChainLimit: number }[];
+      };
+      expect(
+        listed.bots.map(({ capabilityPolicy, eventChainLimit }) => ({
+          capabilityPolicy,
+          eventChainLimit,
+        })),
+      ).toEqual([
+        { capabilityPolicy: { "mcp.github": "deny", "notes.publish": "ask" }, eventChainLimit: 2 },
+      ]);
+    } finally {
+      store.close();
+    }
+  });
+
+  it("rejects a decision that is not allow, ask or deny", async () => {
+    const { store, app } = openApp();
+    try {
+      const res = await patch(app, { capabilityPolicy: { notes: "sometimes" } });
+      expect(res.status).toBe(400);
+      expect(store.getBot("bot-policy")?.capabilityPolicy).toEqual({});
+    } finally {
+      store.close();
+    }
   });
 });

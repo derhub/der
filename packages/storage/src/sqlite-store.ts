@@ -170,8 +170,8 @@ export class SqliteStore
 
     return this.database.inTransaction((db) => {
       db.query(
-        `INSERT INTO bots (id, name, persona, default_engine, allowed_engines_json, workspace_path, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+        `INSERT INTO bots (id, name, persona, default_engine, allowed_engines_json, workspace_path, capability_policy_json, event_chain_limit, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       ).run(
         botId,
         parsed.data.name,
@@ -179,6 +179,8 @@ export class SqliteStore
         parsed.data.defaultEngine,
         JSON.stringify(parsed.data.allowedEngines),
         parsed.data.workspacePath ?? null,
+        JSON.stringify(parsed.data.capabilityPolicy),
+        parsed.data.eventChainLimit,
         now,
         now,
       );
@@ -246,9 +248,13 @@ export class SqliteStore
           ? parsed.data.workspacePath
           : (existing.workspacePath ?? null);
 
+      const nextPolicy = parsed.data.capabilityPolicy ?? existing.capabilityPolicy;
+      const nextChainLimit = parsed.data.eventChainLimit ?? existing.eventChainLimit;
+
       db.query(
         `UPDATE bots
-         SET name = ?, persona = ?, default_engine = ?, allowed_engines_json = ?, workspace_path = ?, updated_at = ?
+         SET name = ?, persona = ?, default_engine = ?, allowed_engines_json = ?, workspace_path = ?,
+             capability_policy_json = ?, event_chain_limit = ?, updated_at = ?
          WHERE id = ?`,
       ).run(
         nextName,
@@ -256,6 +262,8 @@ export class SqliteStore
         nextDefault,
         JSON.stringify(nextAllowed),
         nextWorkspacePath,
+        JSON.stringify(nextPolicy),
+        nextChainLimit,
         now,
         botId,
       );

@@ -7,6 +7,7 @@ export {
   type CapabilityContext,
   type Catalog,
 } from "./capability";
+export { resolvePolicy } from "./capability-policy";
 export type { Engine } from "./engine";
 export {
   defineIntegration,

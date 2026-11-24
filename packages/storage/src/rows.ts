@@ -30,6 +30,8 @@ export interface BotRow {
   readonly default_engine: string;
   readonly allowed_engines_json: string;
   readonly workspace_path: string | null;
+  readonly capability_policy_json: string;
+  readonly event_chain_limit: number;
   readonly created_at: string;
   readonly updated_at: string;
 }
@@ -181,6 +183,8 @@ export function mapBotRow(row: BotRow): Bot {
     defaultEngine: row.default_engine,
     allowedEngines: JSON.parse(row.allowed_engines_json) as unknown,
     ...(row.workspace_path !== null ? { workspacePath: row.workspace_path } : {}),
+    capabilityPolicy: JSON.parse(row.capability_policy_json) as unknown,
+    eventChainLimit: row.event_chain_limit,
     createdAt: row.created_at,
     updatedAt: row.updated_at,
   });

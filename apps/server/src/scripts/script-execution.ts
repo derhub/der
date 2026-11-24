@@ -3,6 +3,8 @@ import {
   formatUtcTimestamp,
   type Approval,
   type ApprovalEffectStore,
+  type BotStore,
+  type CapabilityPolicy,
   type Catalog,
   type EffectIdentity,
   type EffectRecord,
@@ -16,6 +18,7 @@ import {
   type StepOutcome,
   type StoredStep,
   type TerminalScriptRunStatus,
+  resolvePolicy,
 } from "@der/domain";
 import {
   startScript,
@@ -31,6 +34,7 @@ import { approvalRequestedEvent } from "../workflows/run-steps";
 export interface ScriptExecutionDeps {
   readonly store: ApprovalEffectStore & Pick<RunStore, "getRun" | "appendRunEvents">;
   readonly scripts: ScriptStore;
+  readonly bots: Pick<BotStore, "getBot">;
   readonly catalog: Catalog;
   readonly limits: SessionLimits & {
     readonly maxSteps: number;
@@ -338,7 +342,11 @@ class ScriptPass {
     if (drain.requests.length === 0) {
       return;
     }
-    const requested = await Promise.all(drain.requests.map((request) => this.#prepare(request)));
+    const policy = (await this.deps.bots.getBot(this.head.botId))?.capabilityPolicy ?? {};
+    this.guard();
+    const requested = await Promise.all(
+      drain.requests.map((request) => this.#prepare(request, policy)),
+    );
     this.guard();
     const stored = this.deps.scripts.registerSteps(this.head.id, requested);
     for (const [index, row] of stored.entries()) {
@@ -349,7 +357,7 @@ class ScriptPass {
     this.#inFlight += drain.requests.length;
   }
 
-  async #prepare(request: StepRequest): Promise<NewStep> {
+  async #prepare(request: StepRequest, policy: CapabilityPolicy): Promise<NewStep> {
     const { position, id, input } = request;
     const inputHash = await fingerprintJson(input);
     const stored = this.#rows.get(position);
@@ -364,15 +372,16 @@ class ScriptPass {
     }
     try {
       this.deps.catalog.validateInput(id, input);
-      const ask = effect === "write" && this.deps.catalog.requiresApproval(id, input);
+      const declaredAsks = effect === "write" && this.deps.catalog.requiresApproval(id, input);
+      const decision = resolvePolicy(policy, id, effect, declaredAsks);
       return {
         position,
         capability: id,
         inputHash,
         input,
         effect,
-        decision: ask ? "ask" : "allow",
-        ...(ask ? { round: this.#round } : {}),
+        decision,
+        ...(decision === "ask" ? { round: this.#round } : {}),
       };
     } catch (error) {
       throw new ScriptRefused("capability", `Step ${position}: ${messageOf(error)}`, id);

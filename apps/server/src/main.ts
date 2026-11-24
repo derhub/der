@@ -773,6 +773,7 @@ export async function startServer(options: CreateServerOptions = {}): Promise<Ru
     const scriptDriver = new ScriptDriver({
       store,
       scripts: scriptRunStore,
+      bots: store,
       catalog,
       approvalTimeoutMs: config.approvalTimeoutMs,
       sweepIntervalMs: config.scriptSweepIntervalMs,
