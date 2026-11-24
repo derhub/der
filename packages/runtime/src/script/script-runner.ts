@@ -4,6 +4,9 @@ import type {
   ScriptWorkerInit,
   ScriptWorkerMessage,
   ScriptWorkerReply,
+  SessionDeliver,
+  SessionInit,
+  SessionOut,
 } from "./script-worker";
 
 export interface ScriptLimits {
@@ -364,4 +367,181 @@ export async function runScript(options: RunScriptOptions): Promise<ScriptResult
     throw outcome.hostError;
   }
   return outcome.verdict as ScriptResult;
+}
+
+export interface SessionLimits {
+  readonly memoryBytes: number;
+  readonly activeMs: number;
+  readonly maxAll: number;
+}
+
+export interface StartScriptOptions {
+  readonly seed: number;
+  readonly now: number;
+  readonly limits: SessionLimits;
+}
+
+export interface StepRequest {
+  readonly position: number;
+  readonly id: string;
+  readonly input: JsonValue;
+}
+
+export type StepResult =
+  | { readonly position: number; readonly ok: true; readonly value: JsonValue }
+  | {
+      readonly position: number;
+      readonly ok: false;
+      readonly error: { readonly kind: string; readonly message: string };
+    };
+
+export interface UnobservedStep {
+  readonly position: number;
+  readonly kind: string;
+  readonly message: string;
+}
+
+export interface ScriptDrainError {
+  readonly kind: string;
+  readonly message: string;
+  readonly position?: number;
+  readonly capability?: string;
+}
+
+export interface ScriptDrain {
+  readonly requests: readonly StepRequest[];
+  readonly returned?: JsonValue;
+  readonly error?: ScriptDrainError;
+  readonly unobserved: readonly UnobservedStep[];
+  readonly logs: readonly string[];
+}
+
+export interface ScriptSession {
+  readonly started: Promise<ScriptDrain>;
+  readonly deliver: (results: readonly StepResult[]) => Promise<ScriptDrain>;
+  readonly dispose: () => void;
+}
+
+type SessionEvent = { readonly message: SessionOut } | { readonly failure: ScriptRunnerError };
+
+function toDrain(message: SessionOut, limits: SessionLimits): ScriptDrain {
+  if (message.type === "dead") {
+    const error: ScriptDrainError =
+      message.limit === "time"
+        ? { kind: "limit", message: `active time limit of ${limits.activeMs} ms exceeded` }
+        : message.limit === "memory"
+          ? { kind: "limit", message: `memory limit of ${limits.memoryBytes} bytes exceeded` }
+          : { kind: "script", message: message.message ?? "script engine failed" };
+    return { requests: [], error, unobserved: [], logs: [] };
+  }
+  const base = {
+    requests: message.requests.map((request) => ({
+      position: request.position,
+      id: request.id,
+      input: JSON.parse(request.input) as JsonValue,
+    })),
+    unobserved: message.unobserved.map((step) => ({
+      position: step.n,
+      kind: step.kind,
+      message: step.message,
+    })),
+    logs: message.logs,
+  };
+  if (message.fatal !== undefined) {
+    const kind = message.fatal.kind === "late" ? "untracked-step" : message.fatal.kind;
+    return { ...base, error: { kind, message: message.fatal.message } };
+  }
+  const ended = message.ended;
+  if (ended === null) {
+    return base;
+  }
+  if (!ended.ok) {
+    const failure = ended.error;
+    return {
+      ...base,
+      error: {
+        kind: failure?.kind ?? "script",
+        message: failure?.message ?? "script failed",
+        ...(failure?.step === undefined ? {} : { position: failure.step }),
+        ...(failure?.capability === undefined ? {} : { capability: failure.capability }),
+      },
+    };
+  }
+  return { ...base, returned: JSON.parse(ended.text ?? "null") as JsonValue };
+}
+
+export function startScript(source: string, options: StartScriptOptions): ScriptSession {
+  const { limits } = options;
+  const stop = new SharedArrayBuffer(4);
+  const worker = new Worker(WORKER_URL, { env: {} });
+  const events: SessionEvent[] = [];
+  let waiter: ((event: SessionEvent) => void) | undefined;
+  let finished = false;
+  let disposed = false;
+
+  const push = (event: SessionEvent): void => {
+    if (waiter === undefined) {
+      events.push(event);
+    } else {
+      const resolve = waiter;
+      waiter = undefined;
+      resolve(event);
+    }
+  };
+  worker.onmessage = (event: MessageEvent<string>) => {
+    push({ message: JSON.parse(event.data) as SessionOut });
+  };
+  worker.onerror = (event: ErrorEvent) => {
+    push({ failure: new ScriptRunnerError("script.worker_failed", event.message) });
+  };
+
+  const nextDrain = async (): Promise<ScriptDrain> => {
+    const event =
+      events.shift() ?? (await new Promise<SessionEvent>((resolve) => (waiter = resolve)));
+    if ("failure" in event) {
+      finished = true;
+      throw event.failure;
+    }
+    const drain = toDrain(event.message, limits);
+    if (drain.error !== undefined) {
+      finished = true;
+    }
+    return drain;
+  };
+
+  const init: SessionInit = {
+    type: "session-init",
+    script: source,
+    seed: options.seed,
+    now: options.now,
+    memoryBytes: limits.memoryBytes,
+    activeMs: limits.activeMs,
+    maxAll: limits.maxAll,
+    stop,
+  };
+  worker.postMessage(init);
+  const started = nextDrain();
+  started.catch(() => undefined);
+
+  return {
+    started,
+    deliver: async (results) => {
+      if (disposed || finished) {
+        throw new ScriptRunnerError("script.session_finished", "the script session has ended");
+      }
+      const message: SessionDeliver = { type: "deliver", replies: results };
+      worker.postMessage(message);
+      return await nextDrain();
+    },
+    dispose: () => {
+      disposed = true;
+      Atomics.store(new Int32Array(stop), 0, STOP_REQUESTED);
+      worker.terminate();
+      if (waiter !== undefined) {
+        const resolve = waiter;
+        waiter = undefined;
+        resolve({ failure: new ScriptRunnerError("script.session_disposed", "session disposed") });
+      }
+    },
+  };
 }
