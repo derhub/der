@@ -15,6 +15,7 @@ afterEach(async () => {
 
 const INLINE_WAIT_MS = 300;
 const PUBLISH = `return await step.run("notes.publish", { text: "release" });`;
+const APPEND = `return await step.run("notes.append", { text: "a" });`;
 
 async function startHybridServer() {
   const tempDb = createTempDatabase("der-hybrid-execute-");
@@ -52,8 +53,10 @@ function executeToolFor(server: RunningServer, run: Run, inlineWaitMs = INLINE_W
     maxResultBytes: 65_536,
     inlineWaitMs,
   });
-  return (script: string): Promise<unknown> =>
-    tool.execute!({ script }, { signal: AbortSignal.timeout(30_000) }) as Promise<unknown>;
+  return (script: string, key?: string): Promise<unknown> =>
+    tool.execute!(key === undefined ? { script } : { script, key }, {
+      signal: AbortSignal.timeout(30_000),
+    }) as Promise<unknown>;
 }
 
 async function endOwningRun(server: RunningServer, owner: Owner) {
@@ -230,24 +233,51 @@ async function finishedExecution(server: RunningServer, owner: Owner, executionI
   });
 }
 
-describe("repeat an execute whose result was not received", () => {
-  it("returns the stored result once, applies the write once, and runs the Script again only after the result was returned", async () => {
+describe("repeat an execute with the same Script", () => {
+  it("returns the inline result on every identical repeat and applies the write once", async () => {
+    const { server, host } = await startHybridServer();
+    const owner = await admitOwningRun(server, "hybrid-inline-repeat");
+    const execute = executeToolFor(server, owner.run, 5_000);
+
+    const results = [await execute(APPEND), await execute(APPEND), await execute(APPEND)];
+
+    const appended = { ok: true, result: { count: 1 }, logs: [], truncated: false };
+    expect({ results, appended: host.appended }).toEqual({
+      results: [appended, appended, appended],
+      appended: ["a"],
+    });
+  }, 60_000);
+
+  it("runs the Script again for a new key and returns that run on a repeat of the key", async () => {
+    const { server, host } = await startHybridServer();
+    const owner = await admitOwningRun(server, "hybrid-new-key");
+    const execute = executeToolFor(server, owner.run, 5_000);
+
+    await execute(APPEND);
+    const keyed = await execute(APPEND, "second");
+    const keyedAgain = await execute(APPEND, "second");
+
+    const second = { ok: true, result: { count: 2 }, logs: [], truncated: false };
+    expect({ keyed, keyedAgain, appended: host.appended }).toEqual({
+      keyed: second,
+      keyedAgain: second,
+      appended: ["a", "a"],
+    });
+  }, 60_000);
+
+  it("returns the stored result of a detached execution on every repeat and applies the write once", async () => {
     const { server, host } = await startHybridServer();
     const owner = await admitOwningRun(server, "hybrid-result-once");
     const execute = executeToolFor(server, owner.run);
     const pending = (await execute(PUBLISH)) as { executionId: string };
     await finishedExecution(server, owner, pending.executionId);
 
-    const repeated = await execute(PUBLISH);
-    const publishedAfterRepeat = [...host.published];
-    const third = (await execute(PUBLISH)) as { status?: string; executionId?: string };
+    const repeats = [await execute(PUBLISH), await execute(PUBLISH)];
 
-    expect(repeated).toEqual(PUBLISHED);
-    expect(publishedAfterRepeat).toEqual(["release"]);
-    expect(third.status).toBe("pending");
-    expect(third.executionId).not.toBe(pending.executionId);
-    await finishedExecution(server, owner, third.executionId!);
-    expect(host.published).toEqual(["release", "release"]);
+    expect({ repeats, published: host.published }).toEqual({
+      repeats: [PUBLISHED, PUBLISHED],
+      published: ["release"],
+    });
   }, 60_000);
 
   it("returns the stored result of an execute whose first call was aborted before the Script finished", async () => {

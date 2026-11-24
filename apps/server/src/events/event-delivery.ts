@@ -22,13 +22,15 @@ export type DeliverEvents = () => Promise<void>;
 /**
  * Admits one event Run per idle session, oldest event first. An event waits while
  * its session has an active Run or its bot's chain limit is reached; the next
- * pass (sweep, or a Run finishing) releases it. Passes never overlap.
+ * pass (sweep, or a Run finishing) releases it. Passes never overlap; a pass that
+ * fails rejects only its own caller, and the next pass runs as usual.
  */
 export function createEventDelivery(deps: EventDeliveryDeps): DeliverEvents {
   let tail: Promise<void> = Promise.resolve();
   return () => {
-    tail = tail.then(() => deliverPass(deps));
-    return tail;
+    const pass = tail.then(() => deliverPass(deps));
+    tail = pass.catch(() => undefined);
+    return pass;
   };
 }
 
@@ -62,9 +64,27 @@ async function deliverPass(deps: EventDeliveryDeps): Promise<void> {
   }
 }
 
+function eventRequest(event: SessionEvent, maxResultBytes: number): RunRequest {
+  return {
+    botId: event.botId,
+    sessionId: event.sessionId,
+    origin: "event",
+    idempotencyKey: event.id,
+    input: { parts: [{ type: "text", text: eventText(event.payload, maxResultBytes) }] },
+  };
+}
+
+/**
+ * An event that already has a Run was admitted before a crash. A Run still queued never
+ * started; admitting the same request again starts it, as admission is idempotent per event.
+ */
 async function deliverOne(deps: EventDeliveryDeps, event: SessionEvent): Promise<void> {
   const { store } = deps;
   if (event.runId !== null) {
+    const active = store.getActiveRun(event.sessionId);
+    if (active?.id === event.runId && active.status === "queued") {
+      await deps.admit(eventRequest(event, deps.maxResultBytes));
+    }
     store.markSessionEventDelivered(event.id, event.runId);
     return;
   }
@@ -75,12 +95,6 @@ async function deliverOne(deps: EventDeliveryDeps, event: SessionEvent): Promise
   if (bot === undefined || store.countEventChain(event.sessionId) >= bot.eventChainLimit) {
     return;
   }
-  const admission = await deps.admit({
-    botId: event.botId,
-    sessionId: event.sessionId,
-    origin: "event",
-    idempotencyKey: event.id,
-    input: { parts: [{ type: "text", text: eventText(event.payload, deps.maxResultBytes) }] },
-  });
+  const admission = await deps.admit(eventRequest(event, deps.maxResultBytes));
   store.markSessionEventDelivered(event.id, admission.run.id);
 }

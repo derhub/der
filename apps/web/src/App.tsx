@@ -219,6 +219,15 @@ export function App({ api: providedApi, fetcher }: AppProps) {
     return () => controller.abort();
   }, [api, selectedBotId]);
 
+  const refreshSessions = useCallback(() => {
+    if (!selectedBotId) {
+      return;
+    }
+    api.listSessions(selectedBotId).then(setSessions, (error: unknown) => {
+      setBootstrapProblem(toOperatorProblem(error, `/api/bots/${selectedBotId}/sessions`));
+    });
+  }, [api, selectedBotId]);
+
   function handleActorChange(value: string) {
     setActor(value);
     try {
@@ -373,6 +382,7 @@ export function App({ api: providedApi, fetcher }: AppProps) {
                     session={selectedSession}
                     actor={actor}
                     onAnnounce={announce}
+                    onRunActivity={refreshSessions}
                   />
                 ) : (
                   <EmptyState

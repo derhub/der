@@ -327,6 +327,8 @@ export interface ChatWorkspaceProps {
   readonly session: Session;
   readonly actor: string;
   readonly onAnnounce: (message: string) => void;
+  /** Called when a Run of this session starts or settles, as either can change its waiting events. */
+  readonly onRunActivity?: () => void;
 }
 
 const USAGE_RETRY_DELAY_MS = 1_000;
@@ -595,6 +597,7 @@ export function ChatWorkspace({
   session,
   actor,
   onAnnounce,
+  onRunActivity,
 }: ChatWorkspaceProps) {
   const defaultEngine: EngineKind = session.engine ?? bot.defaultEngine;
   const [selectedEngine, setSelectedEngine] = useState<EngineKind>(defaultEngine);
@@ -673,8 +676,9 @@ export function ChatWorkspace({
           ? `Resumed existing run ${admission.run.id}.`
           : `Started run ${admission.run.id}.`,
       );
+      onRunActivity?.();
     },
-    [onAnnounce, session.id],
+    [onAnnounce, onRunActivity, session.id],
   );
 
   const handleCursorAdvance = useCallback(
@@ -726,8 +730,9 @@ export function ChatWorkspace({
         });
       };
       watchUsage(USAGE_RETRY_LIMIT);
+      onRunActivity?.();
     },
-    [refreshHistory, refreshRunState, refreshSessionRuns],
+    [onRunActivity, refreshHistory, refreshRunState, refreshSessionRuns],
   );
 
   const connection = useMemo(

@@ -220,7 +220,7 @@ describe("pick a script back up after the tool call was cut", () => {
       error: {
         kind: "cancelled",
         message:
-          "execute was aborted before the script finished; call execute with the same script to reattach if its execution is still unfinished",
+          "execute was aborted before the script finished; call execute with the same script and key to reattach",
       },
       logs: [],
     });
@@ -261,14 +261,14 @@ describe("run multiple Scripts in one Run", () => {
 });
 
 describe("repeat a script on purpose", () => {
-  it("runs the same script again after its result was returned, giving two script runs and two effects", async () => {
+  it("runs the same script again when given a new key, giving two script runs and two effects", async () => {
     const { server, host } = await startDirectServer();
     const owner = await admitOwningRun(server, "code-mode-repeat");
     const execute = executeToolFor(server, owner.run);
     const append = `return await step.run("notes.append", { text: "tick" });`;
 
     const first = await callTool(execute, { script: append });
-    const second = await callTool(execute, { script: append });
+    const second = await callTool(execute, { script: append, key: "again" });
 
     expect(first).toEqual({ ok: true, result: { count: 1 }, logs: [], truncated: false });
     expect(second).toEqual({ ok: true, result: { count: 2 }, logs: [], truncated: false });
@@ -430,6 +430,21 @@ describe("search the catalog", () => {
 });
 
 describe("cap what execute hands back", () => {
+  it("cuts an oversized error message to the byte budget and flags the cut", async () => {
+    const { server } = await startDirectServer();
+    const owner = await admitOwningRun(server, "code-mode-truncate-error");
+
+    const result = await callTool(executeToolFor(server, owner.run, 20), {
+      script: `throw new Error("y".repeat(100));`,
+    });
+
+    expect(result).toEqual({
+      ok: false,
+      error: { kind: "script", message: "Error: yyyyyyyyyyyyy [message truncated]" },
+      logs: [],
+    });
+  }, 60_000);
+
   it("cuts an oversized result to the byte budget and flags it truncated", async () => {
     const { server } = await startDirectServer();
     const owner = await admitOwningRun(server, "code-mode-truncate");
@@ -456,7 +471,12 @@ describe("describe the tools to the model", () => {
     expect(text).toContain("- notes: append, publish, read");
     expect(text).toContain("Write `await` in front of every `step.run`");
     expect(text).toContain("Modules, `import`, `eval`, `Function` and timers are not available.");
-    expect(text).toContain("`Date`, `Math.random` and `performance.now` return recorded values");
+    expect(text).toContain(
+      "`Date` and `Math.random` return recorded values and `performance.now` returns 0",
+    );
+    expect(text).toContain(
+      "Calling `execute` again with the same Script returns the same execution and never runs it twice. To run the same Script again on purpose, pass a new `key`.",
+    );
   }, 60_000);
 });
 

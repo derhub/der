@@ -213,6 +213,7 @@ export function startScript(source: string, options: StartScriptOptions): Script
     memoryBytes: limits.memoryBytes,
     activeMs: limits.activeMs,
     maxAll: limits.maxAll,
+    ...(limits.outputBytes === undefined ? {} : { outputBytes: limits.outputBytes }),
     stop,
   };
   worker.postMessage(init);

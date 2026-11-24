@@ -9,11 +9,11 @@ afterEach(async () => {
   for (const cleanup of cleanups.splice(0).reverse()) await cleanup();
 });
 
-async function setup(
-  limits?: Parameters<Awaited<ReturnType<typeof openScriptFixture>>["openDriver"]>[1],
-) {
+type OpenDriver = Awaited<ReturnType<typeof openScriptFixture>>["openDriver"];
+
+async function setup(limits?: Parameters<OpenDriver>[1], options?: Parameters<OpenDriver>[2]) {
   const fixture = await openScriptFixture();
-  const execution = fixture.openDriver(fixture.store, limits);
+  const execution = fixture.openDriver(fixture.store, limits, options);
   cleanups.push(async () => {
     await execution.driver.close();
     fixture.store.close();
@@ -341,6 +341,42 @@ describe("preserve effect safety when the host cannot continue", () => {
     });
   });
 
+  it("ends a cancelled execution after the grace period while its write never returns", async () => {
+    const { store, run, host, acquire, driver, scripts } = await setup(undefined, {
+      writeCancelGraceMs: 100,
+    });
+    const started = Promise.withResolvers<void>();
+    host.catalog.add(
+      defineCapability({
+        id: "notes.stuck",
+        description: "Write to a service that never answers.",
+        input: z.object({}),
+        output: z.literal(true),
+        effect: "write",
+        approval: "none",
+        execute() {
+          started.resolve();
+          return new Promise<true>(() => {});
+        },
+      }),
+    );
+    const { id } = acquire('await step.run("notes.stuck", {});');
+    const driving = driver.kick(id);
+    await started.promise;
+    await store.finishRun({
+      runId: run.id,
+      status: "cancelled",
+      terminalEvent: {
+        chunkKey: "cancelled",
+        chunk: { type: "RUN_ERROR", message: "cancelled", code: "run.cancelled" },
+      },
+    });
+
+    await Promise.all([driving, driver.cancelRun(run.id)]);
+
+    expect(scripts.load(id).execution.status).toBe("cancelled");
+  }, 3_000);
+
   it("records a write already in flight before cancelling the execution", async () => {
     const { store, run, host, acquire, driver, scripts } = await setup();
     const started = Promise.withResolvers<void>();
@@ -384,5 +420,51 @@ describe("preserve effect safety when the host cannot continue", () => {
       steps: [{ position: 1, status: "done", seq: null }],
     });
     expect(host.appended).toEqual([]);
+  });
+});
+
+describe("end a detached Script in doubt", () => {
+  async function inDoubtDetached(endRunFirst: boolean) {
+    const context = await setup();
+    const { store, run, acquire, driver, scripts } = context;
+    const { id } = acquire('await step.run("notes.append", { text: "entry" }); return 1;');
+    scripts.detach(id);
+    store.database.db.run(
+      "CREATE TRIGGER refuse_updates BEFORE UPDATE ON effects BEGIN SELECT RAISE(ABORT, 'disk full'); END",
+    );
+    await driver.kick(id).catch(() => undefined);
+    if (endRunFirst) {
+      await store.finishRun({
+        runId: run.id,
+        status: "completed",
+        terminalEvent: { chunkKey: `${run.id}:terminal`, chunk: { type: "RUN_FINISHED" } },
+      });
+    }
+    store.database.db.run("DROP TRIGGER refuse_updates");
+    await driver.kick(id);
+    const events = store.database.db
+      .query<{ kind: string }, []>("SELECT kind FROM session_events")
+      .all();
+    return {
+      execution: scripts.load(id).execution.status,
+      run: store.getRun(run.id)?.status,
+      events: events.map(({ kind }) => kind),
+    };
+  }
+
+  it("interrupts the owning Run that is still active", async () => {
+    expect(await inDoubtDetached(false)).toEqual({
+      execution: "in_doubt",
+      run: "interrupted",
+      events: ["script.finished"],
+    });
+  });
+
+  it("leaves an owning Run that already ended as it ended and carries the outcome in one event", async () => {
+    expect(await inDoubtDetached(true)).toEqual({
+      execution: "in_doubt",
+      run: "completed",
+      events: ["script.finished"],
+    });
   });
 });

@@ -158,6 +158,23 @@ describe("count the event chain of a session", () => {
     }
   });
 
+  it("keeps counting through a routine Run and resets only on a Run a human started", async () => {
+    const store = openSqliteStore({ filename: tempDbPath() });
+    try {
+      seed(store);
+      await runToEnd(store, "event", "e1");
+      await runToEnd(store, "event", "e2");
+      await runToEnd(store, "event", "e3");
+      await runToEnd(store, "routine", "r1");
+      const afterRoutine = store.countEventChain("sess-1");
+      await runToEnd(store, "http", "h1");
+
+      expect([afterRoutine, store.countEventChain("sess-1")]).toEqual([3, 0]);
+    } finally {
+      store.close();
+    }
+  });
+
   it("counts only the session's own Runs", async () => {
     const store = openSqliteStore({ filename: tempDbPath() });
     try {

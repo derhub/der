@@ -245,8 +245,12 @@ export class ScriptDriver {
       clearInterval(timer);
       scripts.releaseLease(id, this.#owner);
     }
-    const { execution } = scripts.load(id);
+    const { execution, steps } = scripts.load(id);
     if (execution.result !== null && execution.detachedAt !== null) {
+      // No `wait` observes a detached result, so the in-doubt interruption happens here.
+      if (execution.status === "in_doubt") {
+        await this.#interruptRun(execution, steps, execution.result);
+      }
       await this.deps.deliverEvents?.();
     }
   }

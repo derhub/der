@@ -25,6 +25,7 @@ interface ExecutionRow {
   readonly run_id: string;
   readonly bot_id: string;
   readonly digest: string;
+  readonly key: string;
   readonly occurrence: number;
   readonly source: string;
   readonly status: string;
@@ -71,6 +72,7 @@ function mapExecution(row: ExecutionRow): ScriptExecution {
     runId: parsed.runId,
     botId: parsed.botId,
     digest: parsed.digest,
+    key: row.key,
     occurrence: parsed.occurrence,
     source: parsed.source,
     status: parsed.status,
@@ -80,7 +82,6 @@ function mapExecution(row: ExecutionRow): ScriptExecution {
     leaseOwner: row.lease_owner,
     leaseUntil: row.lease_until as UtcTimestamp | null,
     detachedAt: row.detached_at as UtcTimestamp | null,
-    deliveredAt: parsed.deliveredAt,
   };
 }
 
@@ -118,40 +119,25 @@ export class SqliteScriptStore implements ScriptStore {
 
   acquire(input: AcquireScript): ScriptExecution {
     const digest = createHash("sha256").update(input.source).digest("hex");
+    const key = input.key ?? "";
     const now = formatUtcTimestamp(this.database.now());
     return this.database.inTransaction((db) => {
-      const open = db
-        .query<ExecutionRow, [string, string]>(
+      const existing = db
+        .query<ExecutionRow, [string, string, string]>(
           `SELECT * FROM script_runs
-           WHERE run_id = ? AND digest = ?
-             AND (status IN ${ACTIVE} OR delivered_at IS NULL)
+           WHERE run_id = ? AND digest = ? AND key = ?
            ORDER BY occurrence DESC LIMIT 1`,
         )
-        .get(input.runId, digest);
-      if (open) {
-        return mapExecution(open);
+        .get(input.runId, digest, key);
+      if (existing) {
+        return mapExecution(existing);
       }
-      const latest = db
-        .query<{ occurrence: number | null }, [string, string]>(
-          "SELECT MAX(occurrence) AS occurrence FROM script_runs WHERE run_id = ? AND digest = ?",
-        )
-        .get(input.runId, digest);
       const id = `sr_${crypto.randomUUID()}`;
       db.query(
         `INSERT INTO script_runs
-          (id, run_id, bot_id, digest, occurrence, source, status, seed, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, 'running', ?, ?, ?)`,
-      ).run(
-        id,
-        input.runId,
-        input.botId,
-        digest,
-        (latest?.occurrence ?? 0) + 1,
-        input.source,
-        input.seed,
-        now,
-        now,
-      );
+          (id, run_id, bot_id, digest, key, occurrence, source, status, seed, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, 1, ?, 'running', ?, ?, ?)`,
+      ).run(id, input.runId, input.botId, digest, key, input.source, input.seed, now, now);
       return this.#execution(db, id);
     });
   }
@@ -275,16 +261,6 @@ export class SqliteScriptStore implements ScriptStore {
       }
       return { execution, detached };
     });
-  }
-
-  markResultDelivered(id: ScriptRunId): void {
-    const now = formatUtcTimestamp(this.database.now());
-    this.database.db
-      .query(
-        `UPDATE script_runs SET delivered_at = ?
-         WHERE id = ? AND delivered_at IS NULL AND status NOT IN ${ACTIVE}`,
-      )
-      .run(now, id);
   }
 
   detach(id: ScriptRunId): boolean {

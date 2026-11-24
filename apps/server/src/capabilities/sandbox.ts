@@ -3,7 +3,7 @@ import { defineCapability, sandboxRequest, sandboxResult, type Sandbox } from "@
 export function sandboxCapability(kind: "docker" | "wasmer", sandbox: Sandbox) {
   return defineCapability({
     id: `sandbox.${kind}`,
-    description: `Run a bounded command inside the ${kind} sandbox. Always asks for approval.`,
+    description: `Run a bounded command inside the ${kind} sandbox. Asks for approval unless the bot's policy allows it.`,
     input: sandboxRequest,
     output: sandboxResult,
     effect: "write",

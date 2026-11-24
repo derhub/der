@@ -472,6 +472,75 @@ describe("recover Scripts from SQLite", () => {
     }
   });
 
+  it.each([
+    {
+      case: "a stored read whose capability now declares write",
+      capability: "notes.publish",
+      effect: "read",
+      detail: "step 1 (notes.publish) was recorded as a read and is now declared write",
+    },
+    {
+      case: "a stored write whose capability now declares read",
+      capability: "notes.read",
+      effect: "write",
+      detail: "step 1 (notes.read) was recorded as a write and is now declared read",
+    },
+    {
+      case: "a stored step whose capability no longer exists",
+      capability: "notes.removed",
+      effect: "read",
+      detail: "step 1 (notes.removed) was recorded but the capability no longer exists",
+    },
+  ] as const)("fails the re-run of $case before invoking anything", async (testCase) => {
+    const fixture = await openScriptFixture();
+    const first = fixture.openDriver();
+    const input = { text: "x", key: "x" };
+    const { id } = first.acquire(
+      `return await step.run(${JSON.stringify(testCase.capability)}, ${JSON.stringify(input)});`,
+    );
+    first.scripts.registerSteps(id, [
+      {
+        position: 1,
+        capability: testCase.capability,
+        effect: testCase.effect,
+        decision: "allow",
+        input,
+        inputHash: await fingerprintJson(input),
+      },
+    ]);
+    await first.driver.close();
+    fixture.store.close();
+
+    const reopened = fixture.open();
+    const second = fixture.openDriver(reopened);
+    try {
+      await second.driver.kick(id);
+
+      expect({
+        execution: second.scripts.load(id).execution.status,
+        result: second.scripts.load(id).execution.result,
+        invoked: [...fixture.host.reads, ...fixture.host.appended, ...fixture.host.published],
+        approvals: reopened.listPendingApprovalsForRun(fixture.run.id),
+      }).toEqual({
+        execution: "failed",
+        result: {
+          ok: false,
+          error: {
+            kind: "nondeterministic",
+            message: `the Script did not repeat itself: ${testCase.detail}. Already applied: nothing.`,
+          },
+          logs: [],
+        },
+        invoked: [],
+        approvals: [],
+      });
+    } finally {
+      await second.driver.close();
+      reopened.close();
+      fixture.database.cleanup();
+    }
+  });
+
   it("keeps the registered Approval decision when the capability predicate changes on restart", async () => {
     const fixture = await openScriptFixture();
     let asks = true;

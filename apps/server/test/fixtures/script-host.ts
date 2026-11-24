@@ -138,7 +138,11 @@ export async function openScriptFixture() {
     idempotencyKey: "script-driver",
     input: { parts: [{ type: "text", text: "script" }] },
   });
-  const openDriver = (databaseStore = store, limits?: Partial<ScriptDriverDeps["limits"]>) => {
+  const openDriver = (
+    databaseStore = store,
+    limits?: Partial<ScriptDriverDeps["limits"]>,
+    options: Pick<ScriptDriverDeps, "writeCancelGraceMs"> = {},
+  ) => {
     const scripts = openSqliteScriptStore({ database: databaseStore.database });
     const driver = new ScriptDriver({
       store: databaseStore,
@@ -157,6 +161,7 @@ export async function openScriptFixture() {
       approvalTimeoutMs: 5_000,
       sweepIntervalMs: 1000,
       now,
+      ...options,
     });
     const acquire = (source: string) =>
       scripts.acquire({ runId: run.id, botId: bot.id, source, seed: 1 });

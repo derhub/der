@@ -154,6 +154,7 @@ function createFakeServerFetch(
             botId: "bot-fixture",
             title: "Fixture Session",
             engine: "fixture",
+            pendingEventCount: runPostCount >= 2 ? 1 : 0,
             createdAt: "2026-01-01T00:00:00.000Z",
             updatedAt: "2026-01-01T00:00:00.000Z",
           },
@@ -572,6 +573,23 @@ describe("operate der through the Web operator console", () => {
     expect(screen.getByRole("status", { name: "Operator status" }).textContent).toContain(
       "Recorded approved decision",
     );
+  });
+
+  it("shows the waiting badge once a Run of the selected bot changes the pending count", async () => {
+    const user = userEvent.setup();
+    const server = createFakeServerFetch();
+    render(<App fetcher={server.fetcher} />);
+
+    await screen.findByText("Fixture session ready.");
+    const before = screen.queryByText("1 waiting");
+    await user.type(screen.getByPlaceholderText("Send an instruction to Fixture Bot..."), "lamp-1");
+    await user.click(screen.getByRole("button", { name: "Send" }));
+    await user.click(await screen.findByRole("button", { name: "Retry with same key" }));
+
+    expect([before, (await screen.findByText("1 waiting")).textContent]).toEqual([
+      null,
+      "1 waiting",
+    ]);
   });
 
   it("saves a policy rule from the bot dialog and shows it again on reopen", async () => {

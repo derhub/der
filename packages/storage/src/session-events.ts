@@ -71,6 +71,7 @@ export function countPendingSessionEvents(db: Database, sessionId: SessionId): n
   );
 }
 
+/** Event Runs since the session's latest Run a human started; a routine Run does not reset it. */
 export function countEventChain(db: Database, sessionId: SessionId): number {
   return (
     db
@@ -78,7 +79,8 @@ export function countEventChain(db: Database, sessionId: SessionId): number {
         `SELECT COUNT(*) AS n FROM runs
          WHERE session_id = ? AND origin = 'event'
            AND rowid > COALESCE(
-             (SELECT MAX(rowid) FROM runs WHERE session_id = ? AND origin <> 'event'), 0)`,
+             (SELECT MAX(rowid) FROM runs
+              WHERE session_id = ? AND origin IN ('http', 'web', 'telegram')), 0)`,
       )
       .get(sessionId, sessionId)?.n ?? 0
   );

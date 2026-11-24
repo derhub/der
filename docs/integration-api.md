@@ -69,7 +69,7 @@ An id is dot-separated, with at least two segments, and every segment matches `[
 
 - `effect: "read"` must have `approval: "none"`; `defineCapability` throws otherwise. A read's result is stored with its step and the read is not invoked again on a re-run; it leaves no Effect record.
 - `effect: "write"` is stored as a step and gets an Effect record before it runs. The recorded outcome is returned when the Script is re-run, so the call is applied once.
-- `approval: "always"` asks an operator for an exact-operation Approval on every call. The prompt shows the capability id and the first 400 characters of the input.
+- `approval: "always"` asks an operator for an exact-operation Approval on every call unless the bot's policy says otherwise (below). The prompt shows the capability id and the first 400 characters of the input.
 - `approval: (input) => boolean` is evaluated against the validated input, once, when the step is first stored. The answer is stored with the step, so a re-run does not evaluate it again.
 - `approval: "none"` on a `write` runs without an Approval but is still recorded as an Effect.
 

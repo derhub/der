@@ -42,6 +42,10 @@ const sessionEventsMigrationPath = resolve(
   import.meta.dirname,
   "../migrations/011-session-events.sql",
 );
+const scriptRunKeyMigrationPath = resolve(
+  import.meta.dirname,
+  "../migrations/012-script-run-key.sql",
+);
 
 export const CORE_MIGRATION: StorageMigration = {
   version: "001-core",
@@ -98,6 +102,12 @@ export const SESSION_EVENTS_MIGRATION: StorageMigration = {
   disableForeignKeys: true,
 };
 
+export const SCRIPT_RUN_KEY_MIGRATION: StorageMigration = {
+  version: "012-script-run-key",
+  sql: readFileSync(scriptRunKeyMigrationPath, "utf8"),
+  disableForeignKeys: true,
+};
+
 export const CORE_MIGRATIONS: readonly StorageMigration[] = [
   CORE_MIGRATION,
   OUTBOX_DESTINATIONS_MIGRATION,
@@ -109,6 +119,7 @@ export const CORE_MIGRATIONS: readonly StorageMigration[] = [
   SCRIPT_STEPS_MIGRATION,
   BOT_POLICY_MIGRATION,
   SESSION_EVENTS_MIGRATION,
+  SCRIPT_RUN_KEY_MIGRATION,
 ];
 
 export function applyMigrations(

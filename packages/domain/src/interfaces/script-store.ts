@@ -16,6 +16,8 @@ export interface AcquireScript {
   readonly runId: RunId;
   readonly botId: BotId;
   readonly source: string;
+  /** Names a deliberate repeat of the same source; absent and empty are the same key. */
+  readonly key?: string;
   readonly seed: number;
 }
 
@@ -24,6 +26,7 @@ export interface ScriptExecution {
   readonly runId: RunId;
   readonly botId: BotId;
   readonly digest: string;
+  readonly key: string;
   readonly occurrence: number;
   readonly source: string;
   readonly status: ScriptRunStatus;
@@ -33,7 +36,6 @@ export interface ScriptExecution {
   readonly leaseOwner: string | null;
   readonly leaseUntil: UtcTimestamp | null;
   readonly detachedAt: UtcTimestamp | null;
-  readonly deliveredAt: UtcTimestamp | null;
 }
 
 export interface NewStep {
@@ -85,8 +87,8 @@ export interface FinishResult {
 
 export interface ScriptStore {
   /**
-   * Returns the latest execution of this source in the Run while it is unfinished or finished
-   * with its result not yet handed over (`markResultDelivered`); otherwise starts the next occurrence.
+   * One execution per Run, source and key: returns it whether it runs or finished, and
+   * starts it only when none exists. A new key is the only way to run the same source again.
    */
   acquire(input: AcquireScript): ScriptExecution;
   load(id: ScriptRunId): { execution: ScriptExecution; steps: readonly StoredStep[] };
@@ -98,8 +100,6 @@ export interface ScriptStore {
   markDelivered(id: ScriptRunId, positions: readonly number[]): readonly DeliveryMark[];
   /** Sets the terminal status once; later calls leave the first status and result. A detached execution gets its `script.finished` event in the same unit. */
   finish(id: ScriptRunId, end: ScriptEnd): FinishResult;
-  /** Records that the finished result reached the agent; the first call sets it, later calls change nothing. A no-op while unfinished. */
-  markResultDelivered(id: ScriptRunId): void;
   /** Returns true only on the call that set it, and only while the execution is unfinished. */
   detach(id: ScriptRunId): boolean;
   /** Succeeds when no other owner holds an unexpired lease. */

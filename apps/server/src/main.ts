@@ -827,12 +827,15 @@ export async function startServer(options: CreateServerOptions = {}): Promise<Ru
           }
         }
       });
-      const unfinishedRoutines = store.database.db
+      // An event Run still queued was admitted and never started (a crash after admission).
+      const resumable = store.database.db
         .query<{ id: RunId }, []>(
-          "SELECT id FROM runs WHERE engine = 'script' AND status IN ('queued', 'running', 'waiting_approval')",
+          `SELECT id FROM runs
+           WHERE (engine = 'script' AND status IN ('queued', 'running', 'waiting_approval'))
+              OR (origin = 'event' AND status = 'queued')`,
         )
         .all();
-      for (const { id } of unfinishedRoutines) {
+      for (const { id } of resumable) {
         await directDriver.start?.(id);
       }
       closeDirectDriver = () => directDriver.close();

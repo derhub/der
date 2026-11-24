@@ -49,7 +49,7 @@ The `host` integration (`apps/server/src/main.ts`, `apps/server/src/capabilities
 An engine run receives exactly two tools (`apps/server/src/main.ts`), plus system instructions that describe them (`apps/server/src/code-mode/instructions.ts`):
 
 - `search({ query })` returns TypeScript declarations, a one-line summary and an example for the capabilities that match, best match first (`apps/server/src/code-mode/search.ts`). Input shapes come from these declarations; the agent does not guess them.
-- `execute({ script })` runs a Script (`apps/server/src/code-mode/execute.ts`). It waits up to `DER_SCRIPT_INLINE_WAIT_MS` for the Script to end. A Script that ends in time returns `{ ok: true, result, logs, truncated }` or `{ ok: false, error: { kind, message }, logs }`. A Script still running returns `{ status: "pending", executionId, proposedWrites }` and its result arrives later as an event (see [Pending Scripts and events](#pending-scripts-and-events)). `execute` never throws. `kind` is one of `script`, `denied`, `expired`, `limit`, `capability`, `cancelled`, `nondeterministic`.
+- `execute({ script, key? })` runs a Script (`apps/server/src/code-mode/execute.ts`). It waits up to `DER_SCRIPT_INLINE_WAIT_MS` for the Script to end. A Script that ends in time returns `{ ok: true, result, logs, truncated }` or `{ ok: false, error: { kind, message }, logs }`. A Script still running returns `{ status: "pending", executionId, proposedWrites }` and its result arrives later as an event (see [Pending Scripts and events](#pending-scripts-and-events)). `execute` never throws. `kind` is one of `script`, `denied`, `expired`, `limit`, `capability`, `cancelled`, `nondeterministic`.
 
 A Script is the body of an async function. It performs capabilities with `await step.run(id, input)` and gives its result back with `return`:
 
@@ -95,11 +95,11 @@ A Script's state lives behind the `ScriptStore` port (`packages/domain/src/inter
 - A write is stored, resolved against the bot's policy, and applied once through the effect ledger. Where policy says `ask`, an Approval for the exact capability and arguments is requested first. Writes waiting for an Approval at the same moment are requested together.
 - A denied or expired Approval rejects that step only. The rest of the Script carries on.
 - Resume is a re-run. After a restart or an Approval decision the execution runs the Script again from the top in a fresh sandbox, and each step returns its stored result in the order it was first delivered. Nothing is performed twice.
-- A re-run that asks for a different capability, input or position than the stored one ends as `failed` with kind `nondeterministic` and applies nothing further.
-- A write whose outcome is unknown (the server stopped after the request left and before the answer was stored, or the capability threw something other than a `DomainError`) is never repeated. The execution ends `in_doubt` with kind `capability`, and the owning Run is interrupted with `effect.outcome_uncertain`. A later write in that Run fails while the write is in doubt.
+- A re-run that asks for a different capability, input or position than the stored one, or reaches a stored step whose capability now declares a different effect class or no longer exists, ends as `failed` with kind `nondeterministic` and applies nothing further.
+- A write whose outcome is unknown (the server stopped after the request left and before the answer was stored, or the capability threw something other than a `DomainError`) is never repeated. The execution ends `in_doubt` with kind `capability`. If its owning Run is still active, that Run is interrupted with `effect.outcome_uncertain`, whether the result was returned inline or the Script had returned `pending`. If the owning Run already ended, it stays as it ended and the `script.finished` event carries the `in_doubt` outcome. A later write in that Run fails while the write is in doubt.
 - If a Run ends (finished, cancelled or interrupted) while its Script is unfinished and has not returned `pending`, the Script is cancelled. A step already running gets up to ten seconds to finish, pending Approvals expire, and the Script ends with kind `cancelled`. The `signal` a capability receives aborts when the server closes, not when a Script is cancelled. A Script that returned `pending` keeps running after its Run ends.
-- A repeated `execute` with the identical Script returns the same execution, or its stored result once it has finished, until that result was handed over. After that the same Script runs again, so repeating a Script on purpose works.
-- der does not change Codex's tool timeout, so Codex may end a long `execute` call; calling `execute` again with the same Script reattaches.
+- An execution is identified within its Run by the Script text and an optional `key` (absent and empty are the same key). Calling `execute` again with the same Script and key returns that execution, `pending` while it runs and its stored result once finished, however often it is called; it never runs the Script twice. To run the same Script again on purpose, pass a new `key`.
+- der does not change Codex's tool timeout, so Codex may end a long `execute` call; calling `execute` again with the same Script and key reattaches.
 
 ### Per-bot policy
 
@@ -118,8 +118,9 @@ Set it on create or with `PATCH /api/bots/:botId`, or in the bot editor of the w
 When `execute` returns `pending`, the Script keeps running. `proposedWrites` lists the writes now waiting for an Approval, each with `position`, `capability` and `input`. When the Script ends, the host stores a `script.finished` event (`event`, `executionId`, `status`, `result`) for the session. Events are delivered as Runs with origin `event` (`apps/server/src/events/event-delivery.ts`):
 
 - An event waits while its session has an active Run, and is delivered when the session is idle, oldest first.
-- At most `eventChainLimit` event Runs follow one non-event Run in a session. A Run from a human message or a routine resets the count. Further events stay queued until then. `eventChainLimit` is a bot setting (default `3`), changed with `PATCH /api/bots/:botId`.
-- The Run's message is the event as JSON, with the Script result cut to `DER_SCRIPT_RESULT_BYTES`.
+- At most `eventChainLimit` event Runs follow one Run a human started (origin `http`, `web` or `telegram`) in a session. Only such a Run resets the count; a routine Run does not. Further events stay queued until then. `eventChainLimit` is a bot setting (default `3`), changed with `PATCH /api/bots/:botId`.
+- The Run's message is the event as JSON, with the Script result cut to `DER_SCRIPT_RESULT_BYTES`; a failed result's error message is cut the same way and ends in `[message truncated]`.
+- An event whose Run was admitted but never started (the server stopped in between) is started by the next delivery pass, or at startup in direct mode.
 - An event Run has no human present and passes the same unattended gate as a routine Run.
 - Origin `event` cannot be posted through the HTTP API (`apps/server/src/http/router.ts`).
 

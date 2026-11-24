@@ -15,6 +15,7 @@ export interface SessionInit {
   readonly memoryBytes: number;
   readonly activeMs: number;
   readonly maxAll: number;
+  readonly outputBytes?: number;
   readonly stop: SharedArrayBuffer;
 }
 
@@ -140,9 +141,13 @@ async function startSession(init: SessionInit): Promise<void> {
   let activeSince: number | undefined;
   let timedOut = false;
   let dead = false;
+  // Log text lives outside the guest heap, so it is capped here, not only by the host.
+  const encoder = new TextEncoder();
+  let logBytes = 0;
+  let outputFull = false;
 
   runtime.setInterruptHandler(() => {
-    if (Atomics.load(stop, 0) === STOP_REQUESTED) {
+    if (Atomics.load(stop, 0) === STOP_REQUESTED || outputFull) {
       return true;
     }
     if (
@@ -170,6 +175,10 @@ async function startSession(init: SessionInit): Promise<void> {
       return;
     }
     dead = true;
+    if (outputFull) {
+      postSession({ type: "dead", limit: "output" });
+      return;
+    }
     if (timedOut) {
       postSession({ type: "dead", limit: "time" });
       return;
@@ -211,7 +220,16 @@ async function startSession(init: SessionInit): Promise<void> {
     fatal ??= { kind: vm.getString(kind), message: vm.getString(message) };
   });
   const log = vm.newFunction("log", (text) => {
-    logs.push(vm.getString(text));
+    if (outputFull) {
+      return;
+    }
+    const line = vm.getString(text);
+    logBytes += encoder.encode(line).byteLength;
+    if (init.outputBytes !== undefined && logBytes > init.outputBytes) {
+      outputFull = true;
+      return;
+    }
+    logs.push(line);
   });
 
   const drain = (): void => {
@@ -235,6 +253,9 @@ async function startSession(init: SessionInit): Promise<void> {
   };
 
   const report = (): void => {
+    if (outputFull) {
+      die(null);
+    }
     if (dead) {
       return;
     }

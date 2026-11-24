@@ -43,6 +43,8 @@ export interface ScriptExecutionDeps {
   };
   readonly approvalTimeoutMs: number;
   readonly now: () => Date;
+  /** How long cancellation waits for a write already in flight; defaults to 10 seconds. */
+  readonly writeCancelGraceMs?: number;
 }
 
 export const RUN_ENDED = new Set<Run["status"]>([
@@ -375,6 +377,17 @@ class ScriptPass {
     const stored = this.#rows.get(position);
     if (stored !== undefined) {
       this.#compare(stored, { position, capability: id, inputHash });
+      const declared = this.#descriptors.get(id);
+      if (declared === undefined) {
+        throw this.#mismatch(
+          `step ${position} (${id}) was recorded but the capability no longer exists`,
+        );
+      }
+      if (declared !== stored.effect) {
+        throw this.#mismatch(
+          `step ${position} (${id}) was recorded as a ${stored.effect} and is now declared ${declared}`,
+        );
+      }
       const { round, ...request } = stored;
       return { ...request, ...(round === null ? {} : { round }) };
     }
@@ -716,7 +729,7 @@ class ScriptPass {
         Promise.all(this.#work.values()),
         stopped.promise,
         new Promise<void>((resolve) => {
-          timer = setTimeout(resolve, WRITE_CANCEL_GRACE_MS);
+          timer = setTimeout(resolve, this.deps.writeCancelGraceMs ?? WRITE_CANCEL_GRACE_MS);
         }),
       ]);
       this.guard();
