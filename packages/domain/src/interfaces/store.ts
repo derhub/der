@@ -22,6 +22,7 @@ import type { Message, MessagePart } from "../schemas/message";
 import type { Routine, RoutineTarget } from "../schemas/routine";
 import type {
   ChannelIntakeMetadata,
+  ContextMode,
   Run,
   RunAdmission,
   RunEvent,
@@ -70,6 +71,7 @@ export interface FinishRunInput {
   readonly detail?: string;
   readonly checkpoint?: JsonValue | null;
   readonly usage?: RunUsage;
+  readonly contextMode?: ContextMode;
 }
 
 export interface FinishRunOutcome {

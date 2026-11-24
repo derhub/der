@@ -3,6 +3,7 @@ import {
   CLOUD_EVENT_TYPES,
   formatUtcTimestamp,
   type CloudEvent,
+  type ContextMode,
   type JsonValue,
   type Message,
   type MessagePart,
@@ -51,6 +52,7 @@ export interface FinishRunInput {
   readonly detail?: string;
   readonly checkpoint?: JsonValue | null;
   readonly usage?: RunUsage;
+  readonly contextMode?: ContextMode;
 }
 
 export interface FinishRunOutcome {
@@ -531,7 +533,8 @@ export async function finishRun(
            cached_input_tokens = COALESCE(?, cached_input_tokens),
            cache_write_tokens = COALESCE(?, cache_write_tokens),
            output_tokens = COALESCE(?, output_tokens),
-           reported_cost_usd = COALESCE(?, reported_cost_usd)
+           reported_cost_usd = COALESCE(?, reported_cost_usd),
+           context_mode = COALESCE(?, context_mode)
        WHERE id = ?`,
     ).run(
       input.status,
@@ -543,6 +546,7 @@ export async function finishRun(
       input.usage?.cacheWriteTokens ?? null,
       input.usage?.outputTokens ?? null,
       input.usage?.reportedCostUsd ?? null,
+      input.contextMode ?? null,
       input.runId,
     );
 
