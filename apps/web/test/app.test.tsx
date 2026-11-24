@@ -648,6 +648,19 @@ async function settled(read: Promise<unknown>) {
   await act(() => new Promise((resolve) => setTimeout(resolve, 0)));
 }
 
+function pendingEventCount(sessionTitle: string): number {
+  const sidebar = screen.getByRole("complementary", { name: "Bots and sessions" });
+  const heading = within(sidebar).getByRole("heading", { name: /^Sessions \(/ });
+  const section = heading.closest("section");
+  const button = section
+    ? within(section)
+        .queryAllByRole("button")
+        .find((candidate) => candidate.textContent?.includes(sessionTitle))
+    : undefined;
+  const badge = button?.querySelector("[data-pending-events]");
+  return badge ? Number(badge.getAttribute("data-pending-events")) : 0;
+}
+
 describe("keep the session list current", () => {
   it("shows the waiting badge after the pending count changes with no operator action", async () => {
     const server = createFakeServerFetch();
@@ -665,13 +678,11 @@ describe("keep the session list current", () => {
     render(<App fetcher={fetcher} sessionRefreshMs={20} />);
 
     await screen.findByText("Fixture session ready.");
-    const before = screen.queryByText("1 waiting");
+    const before = pendingEventCount("Fixture Session");
     pending = 1;
 
-    expect([before, (await screen.findByText("1 waiting")).textContent]).toEqual([
-      null,
-      "1 waiting",
-    ]);
+    await waitFor(() => expect(pendingEventCount("Fixture Session")).toBe(1));
+    expect(before).toBe(0);
   });
 
   it("drops a session list that arrives after its bot is no longer selected", async () => {
@@ -723,7 +734,7 @@ describe("keep the session list current", () => {
     await screen.findAllByText("Other Session");
     otherPending = 1;
 
-    expect((await screen.findByText("1 waiting")).textContent).toBe("1 waiting");
+    await waitFor(() => expect(pendingEventCount("Other Session")).toBe(1));
   });
 
   it("drops an older listing of the same bot that answers after a newer one", async () => {
@@ -748,17 +759,14 @@ describe("keep the session list current", () => {
     await screen.findAllByText("Fixture Session");
     await waitFor(() => expect(server.held.some((entry) => entry.listing === 2)).toBe(true));
     await user.click(screen.getByRole("button", { name: "Refresh" }));
-    await screen.findByText("2 waiting");
+    await waitFor(() => expect(pendingEventCount("Fixture Session")).toBe(2));
     await settled(
       server.held
         .find((entry) => entry.listing === 2)!
         .answer([sessionOf("bot-fixture", "sess-fixture", "Fixture Session", 1)]),
     );
 
-    expect({
-      newer: screen.queryByText("2 waiting")?.textContent,
-      older: screen.queryByText("1 waiting"),
-    }).toEqual({ newer: "2 waiting", older: null });
+    expect(pendingEventCount("Fixture Session")).toBe(2);
   });
 
   it("drops the session list a previous bot's Run asks for after another bot is selected", async () => {
@@ -804,8 +812,14 @@ describe("operate der through the Web operator console", () => {
 
     const first = await screen.findByText("Approve fixture.apply for lamp-1?");
     const second = await screen.findByText("Approve fixture.apply for lamp-2?");
-    expect(first.closest("[data-approval-id]")?.textContent).toContain('"target": "lamp-1"');
-    expect(second.closest("[data-approval-id]")?.textContent).toContain('"target": "lamp-2"');
+    const firstArgs = JSON.parse(
+      first.closest("[data-approval-id]")?.querySelector("pre")?.textContent ?? "null",
+    );
+    const secondArgs = JSON.parse(
+      second.closest("[data-approval-id]")?.querySelector("pre")?.textContent ?? "null",
+    );
+    expect(firstArgs).toMatchObject({ target: "lamp-1" });
+    expect(secondArgs).toMatchObject({ target: "lamp-2" });
     expect(screen.getAllByRole("button", { name: "Approve effect" })).toHaveLength(2);
   });
 
@@ -861,15 +875,13 @@ describe("operate der through the Web operator console", () => {
     render(<App fetcher={server.fetcher} />);
 
     await screen.findByText("Fixture session ready.");
-    const before = screen.queryByText("1 waiting");
+    const before = pendingEventCount("Fixture Session");
     await user.type(screen.getByPlaceholderText("Send an instruction to Fixture Bot..."), "lamp-1");
     await user.click(screen.getByRole("button", { name: "Send" }));
     await user.click(await screen.findByRole("button", { name: "Retry with same key" }));
 
-    expect([before, (await screen.findByText("1 waiting")).textContent]).toEqual([
-      null,
-      "1 waiting",
-    ]);
+    await waitFor(() => expect(pendingEventCount("Fixture Session")).toBe(1));
+    expect(before).toBe(0);
   });
 
   it("saves a policy rule from the bot dialog and shows it again on reopen", async () => {

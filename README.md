@@ -66,7 +66,7 @@ return { matches: hits.map((hit) => hit.id), memoryVersion: memory?.version ?? n
 
 Script state lives behind `ScriptStore` (SQLite adapter), driven under a lease by `ScriptDriver` so only one driver advances an execution at a time. Restate drives agent Runs and routines, not Scripts; `DER_RESTATE_MODE` does not change Script execution.
 
-- **No write twice:** every step is validated against the catalog and stored before running. Reads cache their result with the step and never re-run; writes apply once through the effect ledger. A write whose outcome is unknown (crash mid-call or unexpected host error) is never repeated: the execution ends `in_doubt`, an active owning Run is interrupted, and further writes in that Run are blocked while doubt remains.
+- **No write twice:** each step is validated against the catalog before it is stored and run. Completed reads cache their result with the step and replay it on resume (an interrupted read with no recorded result re-runs, so reads must have no side effects); writes apply once through the effect ledger. A write whose outcome is unknown (crash mid-call or unexpected host error) is never repeated: the execution ends `in_doubt`, an active owning Run is interrupted, and further writes in that Run are blocked while doubt remains.
 - **Same key, same execution:** within a Run, an execution is identified by Script text and optional `key` (absent and empty match). Calling `execute` again with the same Script and key reattaches while running and returns the stored result once finished, so reattaching after a vendor tool timeout (such as Codex's default timeout) never repeats writes. Pass a new `key` to run the same Script again intentionally.
 - **Resume is a re-run:** after a restart or Approval decision, the Script runs from the top in a fresh sandbox and replays stored step results in their original delivery order. Diverging from stored steps or hitting a changed or removed capability stops the execution without applying further writes.
 - **Denial stops one step:** writes waiting on Approval at the same point are requested together; denying or expiring one rejects only that step so independent work can proceed.
@@ -90,7 +90,7 @@ When `execute` returns `pending`, the Script keeps running and records a `script
 - **Chain budget resets on human messages:** a per-bot `eventChainLimit` caps consecutive event Runs so event chains cannot loop indefinitely. Only a human-started Run (`http`, `web`, or `telegram`) resets the count; routine Runs do not. Excess events stay queued until a human Run runs.
 - Event Run messages cross the same result-size boundary as inline `execute` results, preserving the outcome and accounting for unknown-outcome writes.
 - Event Runs cannot be posted through the HTTP API and pass the same unattended eligibility gate as routine Runs.
-- **Direct-mode recovery:** every active Run has a driver. Direct startup recovers active Runs from an exhaustive status-and-origin table: queued Runs start, Script Runs resume, and in-progress non-Script Runs (which hold no saved engine state in direct mode) end `interrupted` so the session's next event can deliver. An engine failure or stream rejection ends the Run as failed through the lifecycle owner and runs the same finish hook.
+- **Direct-mode recovery:** every active Run has a driver. Direct startup recovers active Runs from an exhaustive engine, origin, status, and attempt-outcome table: Script Runs resume, engine Runs that already persisted an attempt outcome settle from that outcome (completed or failed), unfinished queued engine Runs start, and unfinished started engine Runs (which hold no live engine state in direct mode) end `interrupted` so the session's next event can deliver. An engine failure or stream rejection ends the Run as failed through the lifecycle owner and runs the same finish hook.
 
 ### Script routines
 
@@ -148,7 +148,7 @@ Key base settings:
 - `DER_ALLOWED_ORIGINS`: Comma-separated canonical `http(s)` origins permitted for mutating JSON requests.
 - `DER_SKILLS_HOST_DIR`: Host directory mounted read-only to `/data/skills` (default `./docker/skills`).
 - `DER_SEED_FIXTURE`: Set to `true` only to seed the credential-free `fixture` Bot and Session.
-- `DER_RESTATE_MODE`: `restate` (default) for durable Restate workflows of agent Runs and routines, or `direct` for in-process execution. It does not change how a Script runs.
+- `DER_RESTATE_MODE`: `restate` for durable Restate workflows of agent Runs and routines, or `direct` for in-process execution (see `Config` in `apps/server`). It does not change how a Script runs.
 - `DER_OUTBOX_POLL_INTERVAL_MS`, `DER_OUTBOX_INITIAL_BACKOFF_MS`, `DER_OUTBOX_MAX_BACKOFF_MS`: Outbox polling interval and exponential backoff bounds.
 - Script execution limits, inline wait, sweep interval, result cap, and approval timeout: see `Config` in `apps/server` (`config.ts`).
 - `DER_MEMORY_PROMPT_MAX_BYTES`: Size cap of the memory text in the system prompt (default `24000`, minimum `1024`). Longer text ends with a `[truncated: the rest is available through the memory capability]` line.

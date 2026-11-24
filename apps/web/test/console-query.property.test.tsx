@@ -341,13 +341,8 @@ function createScheduledConsoleServer(options: ScheduledServerOptions) {
 function parseSessionButton(button: Element): { title: string; waiting: number } {
   const children = Array.from(button.children);
   const title = children[0]?.textContent?.trim() ?? "";
-  let waiting = 0;
-  for (const child of children.slice(1)) {
-    const match = /^(\d+)\s+waiting$/.exec(child.textContent?.trim() ?? "");
-    if (match) {
-      waiting = Number(match[1]);
-    }
-  }
+  const badge = button.querySelector("[data-pending-events]");
+  const waiting = badge ? Number(badge.getAttribute("data-pending-events")) : 0;
   return { title, waiting };
 }
 

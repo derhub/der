@@ -10,6 +10,7 @@ import {
 } from "@der/domain";
 import { openSqliteStore, type SqliteStore } from "@der/storage";
 import { createExecuteTool } from "#code-mode/execute";
+import { boundResult } from "#code-mode/result-boundary";
 import { createEventDelivery } from "#events/event-delivery";
 import { startServer, type RunningServer } from "#main";
 import { createTempDatabase } from "./fixtures/restate-harness";
@@ -28,7 +29,10 @@ const ERROR_KINDS = [
 ] as const;
 
 const encoder = new TextEncoder();
+const decoder = new TextDecoder();
 const bytes = (text: string) => encoder.encode(text).byteLength;
+const normalizeUtf8 = (value: string) => decoder.decode(encoder.encode(value));
+const TRUNCATION_FLAG = /truncat/i;
 
 const text = fc.oneof(
   fc.string({ maxLength: 40 }),
@@ -112,42 +116,244 @@ function unknownWrites(message: string): { listed: string[]; omitted: number } {
   const entries = message
     .slice(at + UNKNOWN_OUTCOME.length)
     .replace(/\.$/, "")
-    .split(", ");
+    .split(", ")
+    .filter((entry) => entry.length > 0);
   const count = /^(\d+) omitted$/.exec(entries.at(-1) ?? "");
   return count === null
     ? { listed: entries, omitted: 0 }
     : { listed: entries.slice(0, -1), omitted: Number(count[1]) };
 }
 
+function probeFailureSize(
+  kind: Extract<ExecuteResult, { ok: false }>["error"]["kind"],
+  message: string,
+  line: number | undefined,
+  logLines: readonly string[],
+  envelopeBytes: number,
+): number {
+  return (
+    envelopeBytes +
+    bytes(
+      JSON.stringify({
+        ok: false,
+        error: { kind, message, ...(line === undefined ? {} : { line }) },
+        logs: logLines,
+      }),
+    )
+  );
+}
+
+function logsCutHandled(
+  actual: Extract<ExecuteResult, { ok: false }>,
+  expectedLogs: readonly string[],
+  maxResultBytes: number,
+  envelopeBytes: number,
+): boolean {
+  const intact =
+    actual.logs.length === expectedLogs.length &&
+    actual.logs.every((line, index) => line === expectedLogs[index]);
+  if (intact) {
+    return true;
+  }
+  if (actual.logs.length > 0 && TRUNCATION_FLAG.test(actual.logs.at(-1)!)) {
+    const kept = actual.logs.slice(0, -1);
+    return (
+      kept.length <= expectedLogs.length &&
+      kept.every((line, index) => line === expectedLogs[index])
+    );
+  }
+  const isPrefix =
+    actual.logs.length <= expectedLogs.length &&
+    actual.logs.every((line, index) => line === expectedLogs[index]);
+  if (!isPrefix) {
+    return false;
+  }
+  return (
+    envelopeBytes +
+      bytes(JSON.stringify({ ...actual, logs: [...actual.logs, "[logs truncated]"] })) >
+    maxResultBytes
+  );
+}
+
+function successOutcomeOf(
+  actual: ExecuteResult,
+  expected: {
+    readonly value: JsonValue;
+    readonly logs: readonly string[];
+    readonly truncated: boolean;
+  },
+  maxResultBytes: number,
+  envelopeBytes: number,
+): JsonValue {
+  if (!actual.ok) {
+    return { ok: false };
+  }
+  const expectedJson = normalizeUtf8(JSON.stringify(expected.value) ?? "null");
+  const actualJson = normalizeUtf8(JSON.stringify(actual.result) ?? "null");
+  const valueIntact = actualJson === expectedJson;
+  const normalizedLogs = expected.logs.map(normalizeUtf8);
+  const logsIntact =
+    actual.logs.length === normalizedLogs.length &&
+    actual.logs.every((line, index) => line === normalizedLogs[index]);
+  const logsArePrefix =
+    actual.logs.length <= normalizedLogs.length &&
+    actual.logs.every((line, index) => line === normalizedLogs[index]);
+  const valuePreservedOrCut =
+    valueIntact ||
+    (typeof actual.result === "string" &&
+      actual.result.length > 0 &&
+      expectedJson.startsWith(actual.result));
+  const inputFits =
+    envelopeBytes +
+      bytes(
+        JSON.stringify({
+          ok: true,
+          result: expected.value,
+          logs: expected.logs,
+          truncated: expected.truncated,
+        }),
+      ) <=
+    maxResultBytes;
+  const cutFlagged = inputFits
+    ? valueIntact && logsIntact && actual.truncated === expected.truncated
+    : actual.truncated === true;
+  return {
+    ok: true,
+    valuePreservedOrCut,
+    logsArePrefix,
+    cutFlagged,
+  };
+}
+
+function unknownOutcomeOf(
+  actual: Extract<ExecuteResult, { ok: false }>,
+  unknown: readonly string[],
+  hadLogs: boolean,
+  maxResultBytes: number,
+  envelopeBytes: number,
+) {
+  const { listed, omitted } = unknownWrites(actual.error.message);
+  const reserveLogs = hadLogs ? ["[logs truncated]"] : [];
+  const allFit =
+    probeFailureSize(
+      actual.error.kind,
+      `[message truncated] ${UNKNOWN_OUTCOME}${unknown.join(", ")}.`,
+      actual.error.line,
+      reserveLogs,
+      envelopeBytes,
+    ) <= maxResultBytes;
+  const firstFits =
+    unknown.length > 0 &&
+    probeFailureSize(
+      actual.error.kind,
+      `[message truncated] ${UNKNOWN_OUTCOME}${unknown[0]}${unknown.length > 1 ? `, ${unknown.length - 1} omitted` : ""}.`,
+      actual.error.line,
+      reserveLogs,
+      envelopeBytes,
+    ) <= maxResultBytes;
+  return {
+    accounted: listed.length + omitted,
+    distinctNames: new Set(listed).size === listed.length,
+    listedAreUnknown: listed.every((name) => unknown.includes(name)),
+    keptAllThatFit: !allFit || omitted === 0,
+    keptFittingName: !firstFits || listed.length > 0,
+  };
+}
+
 /** What a reader must still learn from the bounded result. */
-function outcomeOf(result: ExecuteResult, unknown?: readonly string[]): JsonValue {
-  if (result.ok) {
-    return { ok: true };
+function outcomeOf(
+  actual: ExecuteResult,
+  input: ExecuteResult,
+  maxResultBytes: number,
+  envelopeBytes: number,
+  unknown?: readonly string[],
+): JsonValue {
+  if (actual.ok) {
+    if (!input.ok) {
+      return { ok: true };
+    }
+    return successOutcomeOf(
+      actual,
+      {
+        value: input.result,
+        logs: input.logs,
+        truncated: input.truncated,
+      },
+      maxResultBytes,
+      envelopeBytes,
+    );
   }
+  if (input.ok) {
+    return { ok: false, kind: actual.error.kind };
+  }
+  const normalizedLogs = input.logs.map(normalizeUtf8);
+  const messageIntact = actual.error.message === normalizeUtf8(input.error.message);
+  const reserveLogs = input.logs.length > 0 ? ["[logs truncated]"] : [];
+  const messageCutFlagged =
+    messageIntact ||
+    TRUNCATION_FLAG.test(actual.error.message) ||
+    (unknown !== undefined &&
+      probeFailureSize(
+        actual.error.kind,
+        `[message truncated] ${UNKNOWN_OUTCOME}${unknown.length} omitted.`,
+        actual.error.line,
+        reserveLogs,
+        envelopeBytes,
+      ) > maxResultBytes);
+  const callCutFlagged =
+    input.error.call === undefined ||
+    actual.error.call === normalizeUtf8(input.error.call) ||
+    actual.error.call === undefined ||
+    TRUNCATION_FLAG.test(actual.error.call);
+  const logsCutFlagged = logsCutHandled(actual, normalizedLogs, maxResultBytes, envelopeBytes);
   if (unknown === undefined) {
-    return { ok: false, kind: result.error.kind };
+    return {
+      ok: false,
+      kind: actual.error.kind,
+      messageCutFlagged,
+      logsCutFlagged,
+      callCutFlagged,
+    };
   }
-  const { listed, omitted } = unknownWrites(result.error.message);
   return {
     ok: false,
-    kind: result.error.kind,
-    accounted: listed.length + omitted,
-    listedAreUnknown: listed.every((name) => unknown.includes(name)),
+    kind: actual.error.kind,
+    messageCutFlagged,
+    logsCutFlagged,
+    callCutFlagged,
+    ...unknownOutcomeOf(actual, unknown, input.logs.length > 0, maxResultBytes, envelopeBytes),
   };
 }
 
 function expectedOutcome(testCase: Case): JsonValue {
   if (testCase.result.ok) {
-    return { ok: true };
+    return {
+      ok: true,
+      valuePreservedOrCut: true,
+      logsArePrefix: true,
+      cutFlagged: true,
+    };
   }
   if (testCase.status !== "in_doubt") {
-    return { ok: false, kind: testCase.result.error.kind };
+    return {
+      ok: false,
+      kind: testCase.result.error.kind,
+      messageCutFlagged: true,
+      logsCutFlagged: true,
+      callCutFlagged: true,
+    };
   }
   return {
     ok: false,
     kind: testCase.result.error.kind,
+    messageCutFlagged: true,
+    logsCutFlagged: true,
+    callCutFlagged: true,
     accounted: testCase.unknown.length,
+    distinctNames: true,
     listedAreUnknown: true,
+    keptAllThatFit: true,
+    keptFittingName: true,
   };
 }
 
@@ -202,12 +408,19 @@ describe("property: the bounded text of a Script result", () => {
         const [message] = store.listMessages(sessionId);
         const eventText = (message!.parts[0] as { text: string }).text;
         const parsed = JSON.parse(eventText) as { status: string; result: ExecuteResult };
+        const envelopeBytes = bytes(eventText) - bytes(JSON.stringify(parsed.result));
         const unknown = testCase.status === "in_doubt" ? testCase.unknown : undefined;
 
         expect({
           withinLimit: bytes(eventText) <= maxResultBytes,
           status: parsed.status,
-          outcome: outcomeOf(parsed.result, unknown),
+          outcome: outcomeOf(
+            parsed.result,
+            testCase.result,
+            maxResultBytes,
+            envelopeBytes,
+            unknown,
+          ),
         }).toEqual({
           withinLimit: true,
           status: testCase.status,
@@ -217,6 +430,103 @@ describe("property: the bounded text of a Script result", () => {
       { numRuns: 300 },
     );
   }, 60_000);
+
+  it("keeps every unknown write when the set fits and flags the cut stop reason", () => {
+    const names = ["#1 notes.append", "#2 notes.publish"];
+    const { result, text: boundedText } = boundResult(
+      {
+        ok: false,
+        error: {
+          kind: "capability",
+          message: `${"x".repeat(300)}. Already applied: none confirmed. ${UNKNOWN_OUTCOME}${names.join(", ")}.`,
+        },
+        logs: [],
+      },
+      300,
+    );
+
+    expect(bytes(boundedText)).toBeLessThanOrEqual(300);
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      const { listed, omitted } = unknownWrites(result.error.message);
+      expect(listed).toEqual(names);
+      expect(omitted).toBe(0);
+      expect(result.error.message).toMatch(TRUNCATION_FLAG);
+    }
+  });
+
+  it("keeps the distinct unknown writes that fit and counts the rest under a tight budget", () => {
+    const names = Array.from({ length: 20 }, (_, index) => `#${index + 1} notes.append`);
+    const { result, text: boundedText } = boundResult(
+      {
+        ok: false,
+        error: {
+          kind: "capability",
+          message: `${"x".repeat(300)}. Already applied: none confirmed. ${UNKNOWN_OUTCOME}${names.join(", ")}.`,
+        },
+        logs: [],
+      },
+      MIN_RESULT_BYTES,
+    );
+
+    expect(bytes(boundedText)).toBeLessThanOrEqual(MIN_RESULT_BYTES);
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      const { listed, omitted } = unknownWrites(result.error.message);
+      expect(listed.length).toBeGreaterThan(0);
+      expect(omitted).toBeGreaterThan(0);
+      expect(listed.length + omitted).toBe(names.length);
+      expect(new Set(listed).size).toBe(listed.length);
+      expect(listed.every((name) => names.includes(name))).toBe(true);
+    }
+  });
+
+  it("keeps a single unknown write inside the minimum 256-byte event budget", async () => {
+    session += 1;
+    const sessionId = `sess-min-event-${session}`;
+    store.createSession({ id: sessionId, botId: "bot-1", title: sessionId });
+    store.enqueueSessionEvent({
+      id: `evt-min-event-${session}`,
+      botId: "bot-1",
+      sessionId,
+      kind: "script.finished",
+      payload: {
+        event: "script.finished",
+        executionId: "exec-1",
+        status: "in_doubt",
+        result: {
+          ok: false,
+          error: {
+            kind: "capability",
+            message: `${"r".repeat(300)}. Already applied: none confirmed. ${UNKNOWN_OUTCOME}#1 notes.append.`,
+          },
+          logs: [],
+        },
+      },
+    });
+    await createEventDelivery({
+      store,
+      bots: store,
+      admit: (request) => store.admit(request),
+      maxResultBytes: MIN_RESULT_BYTES,
+    })();
+
+    const [message] = store.listMessages(sessionId);
+    const eventText = (message!.parts[0] as { text: string }).text;
+    const parsed = JSON.parse(eventText) as { status: string; result: ExecuteResult };
+
+    expect(bytes(eventText)).toBeLessThanOrEqual(MIN_RESULT_BYTES);
+    expect(parsed.status).toBe("in_doubt");
+    expect(parsed.result.ok).toBe(false);
+    if (!parsed.result.ok) {
+      expect(parsed.result.error.kind).toBe("capability");
+      expect(unknownWrites(parsed.result.error.message)).toEqual({
+        listed: ["#1 notes.append"],
+        omitted: 0,
+      });
+      expect(parsed.result.error.message).toMatch(TRUNCATION_FLAG);
+    }
+  });
 });
 
 const WRITES = ["w.a", "writes.beta", `w.${"long".repeat(40)}`, "w.gamma_delta"] as const;
@@ -259,7 +569,7 @@ const inlineCase: fc.Arbitrary<InlineCase> = fc.oneof(
   fc.record({
     kind: fc.constant("value" as const),
     logs,
-    value: fc.jsonValue({ maxDepth: 3 }).map((value) => value as JsonValue),
+    value: fc.oneof(fc.jsonValue({ maxDepth: 3 }), text).map((value) => value as JsonValue),
   }),
   fc.record({ kind: fc.constant("throw" as const), logs, message: text }),
   fc.record({
@@ -289,11 +599,85 @@ function scriptFor(testCase: Extract<InlineCase, { logs: string[] }>): string {
   return `const d = ${data};\nfor (const line of d.logs) console.log(line);\n${body}`;
 }
 
+function inlineOutcomeOf(
+  result: ExecuteResult,
+  testCase: InlineCase,
+  maxResultBytes: number,
+): JsonValue {
+  switch (testCase.kind) {
+    case "value":
+      return successOutcomeOf(
+        result,
+        {
+          value: testCase.value,
+          logs: testCase.logs,
+          truncated: false,
+        },
+        maxResultBytes,
+        0,
+      );
+    case "throw": {
+      if (result.ok) {
+        return { ok: true };
+      }
+      const normalizedMessage = normalizeUtf8(testCase.message);
+      const messageCutFlagged =
+        normalizedMessage.length === 0 ||
+        result.error.message.includes(normalizedMessage) ||
+        TRUNCATION_FLAG.test(result.error.message);
+      const logsCutFlagged = logsCutHandled(
+        result,
+        testCase.logs.map(normalizeUtf8),
+        maxResultBytes,
+        0,
+      );
+      return {
+        ok: false,
+        kind: result.error.kind,
+        messageCutFlagged,
+        logsCutFlagged,
+      };
+    }
+    case "invalid":
+    case "aborted":
+      return result.ok ? { ok: true } : { ok: false, kind: result.error.kind };
+    case "unknown": {
+      if (result.ok) {
+        return { ok: true };
+      }
+      const unknown = testCase.writes.map((id, index) => `#${index + 1} ${id}`);
+      const logsCutFlagged = logsCutHandled(
+        result,
+        testCase.logs.map(normalizeUtf8),
+        maxResultBytes,
+        0,
+      );
+      return {
+        ok: false,
+        kind: result.error.kind,
+        logsCutFlagged,
+        ...unknownOutcomeOf(result, unknown, testCase.logs.length > 0, maxResultBytes, 0),
+      };
+    }
+  }
+}
+
 function expectedInline(testCase: InlineCase): JsonValue {
   switch (testCase.kind) {
     case "value":
-      return { ok: true };
+      return {
+        ok: true,
+        valuePreservedOrCut: true,
+        logsArePrefix: true,
+        cutFlagged: true,
+      };
     case "throw":
+      return {
+        ok: false,
+        kind: "script",
+        messageCutFlagged: true,
+        logsCutFlagged: true,
+      };
     case "invalid":
       return { ok: false, kind: "script" };
     case "aborted":
@@ -302,8 +686,12 @@ function expectedInline(testCase: InlineCase): JsonValue {
       return {
         ok: false,
         kind: "capability",
+        logsCutFlagged: true,
         accounted: testCase.writes.length,
+        distinctNames: true,
         listedAreUnknown: true,
+        keptAllThatFit: true,
+        keptFittingName: true,
       };
   }
 }
@@ -369,14 +757,9 @@ describe("property: the bounded text execute returns inline", () => {
         const result = (await tool.execute!(args, {
           signal: testCase.kind === "aborted" ? aborted.signal : AbortSignal.timeout(30_000),
         })) as ExecuteResult;
-        const unknown =
-          testCase.kind === "unknown"
-            ? testCase.writes.map((id, index) => `#${index + 1} ${id}`)
-            : undefined;
-
         expect({
           withinLimit: bytes(JSON.stringify(result)) <= maxResultBytes,
-          outcome: outcomeOf(result, unknown),
+          outcome: inlineOutcomeOf(result, testCase, maxResultBytes),
         }).toEqual({ withinLimit: true, outcome: expectedInline(testCase) });
       }),
       { numRuns: 60 },

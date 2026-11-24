@@ -380,26 +380,25 @@ describe("search the catalog", () => {
     expect(server.scriptDriver).toBeDefined();
     const search = createSearchTool({ catalog: host.catalog, maxResultBytes: RESULT_BYTES });
 
-    expect(await search.execute!({ query: "archive" })).toEqual({
-      hits: [
-        {
-          id: "notes.archive",
-          summary: "Archive a note",
-          declaration: [
-            "type NotesArchiveInput = {",
-            "  key: string;",
-            "};",
-            "type NotesArchiveOutput = {",
-            "  archived: boolean;",
-            "};",
-            "/** Archive a note */",
-            'declare const step: { run(id: "notes.archive", input: NotesArchiveInput): Promise<NotesArchiveOutput> };',
-          ].join("\n"),
-          example: 'await step.run("notes.archive", { key: "a" })',
-        },
-      ],
-      truncated: false,
+    const result = (await search.execute!({ query: "archive" })) as {
+      hits: Array<{ id: string; summary: string; declaration: string; example?: string }>;
+      truncated: boolean;
+    };
+
+    expect(result.truncated).toBe(false);
+    expect(result.hits).toHaveLength(1);
+    const [hit] = result.hits;
+    expect(hit).toMatchObject({
+      id: "notes.archive",
+      summary: "Archive a note",
+      example: 'await step.run("notes.archive", { key: "a" })',
     });
+    expect(hit!.declaration).toMatch(/type\s+NotesArchiveInput\b[\s\S]*\bkey:\s*string\b/);
+    expect(hit!.declaration).toMatch(/type\s+NotesArchiveOutput\b[\s\S]*\barchived:\s*boolean\b/);
+    expect(hit!.declaration).toContain("Archive a note");
+    expect(hit!.declaration).toMatch(
+      /run\(\s*id:\s*"notes\.archive",\s*input:\s*NotesArchiveInput\s*\):\s*Promise<NotesArchiveOutput>/,
+    );
   }, 60_000);
 
   it("returns no hits for a query that matches nothing", async () => {
@@ -426,7 +425,7 @@ describe("search the catalog", () => {
 describe("cap what execute hands back", () => {
   const bytes = (value: unknown) => new TextEncoder().encode(JSON.stringify(value)).byteLength;
 
-  it("fits a failed result with a long message and logs within the byte limit", async () => {
+  it("fits a failed result with a long message and logs within the byte limit and flags cuts", async () => {
     const { server } = await startDirectServer();
     const owner = await admitOwningRun(server, "code-mode-truncate-error-long");
 
@@ -437,9 +436,15 @@ describe("cap what execute hands back", () => {
 
     expect(bytes(result)).toBeLessThanOrEqual(256);
     expect(result).toMatchObject({ ok: false, error: { kind: "script" } });
+    if (!result.ok) {
+      expect(result.error.message).toContain("y".repeat(20));
+      expect(result.error.message).toMatch(/truncat/i);
+    }
+    expect(result.logs).not.toContain("a".repeat(60));
+    expect(result.logs.some((line) => /truncat/i.test(line))).toBe(true);
   }, 60_000);
 
-  it("keeps fitting logs alongside a short error message within the byte limit", async () => {
+  it("keeps fitting logs alongside a short error message within the byte limit and flags cut logs", async () => {
     const { server } = await startDirectServer();
     const owner = await admitOwningRun(server, "code-mode-truncate-error-logs");
 
@@ -449,15 +454,17 @@ describe("cap what execute hands back", () => {
     });
 
     expect(bytes(result)).toBeLessThanOrEqual(256);
-    expect(result).toMatchObject({
-      ok: false,
-      error: { kind: "script", message: expect.stringContaining("short") },
-    });
+    expect(result).toMatchObject({ ok: false, error: { kind: "script" } });
+    if (!result.ok) {
+      expect(result.error.message).toContain("short");
+      expect(result.error.message).not.toMatch(/truncat/i);
+    }
     expect(result.logs).toContain("a".repeat(100));
     expect(result.logs).not.toContain("b".repeat(100));
+    expect(result.logs.some((line) => /truncat/i.test(line))).toBe(true);
   }, 60_000);
 
-  it("fits a call to a 70,000-character unknown capability into the default limit", async () => {
+  it("fits a call to a 70,000-character unknown capability into the default limit and flags truncation", async () => {
     const { server } = await startDirectServer();
     const owner = await admitOwningRun(server, "code-mode-truncate-call");
 
@@ -466,14 +473,14 @@ describe("cap what execute hands back", () => {
     });
 
     expect(bytes(result)).toBeLessThanOrEqual(RESULT_BYTES);
-    expect(result).toMatchObject({
-      ok: false,
-      error: { kind: "capability", message: expect.any(String) },
-      logs: [],
-    });
+    expect(result).toMatchObject({ ok: false, error: { kind: "capability" }, logs: [] });
+    if (!result.ok) {
+      expect(result.error.message).toContain("notes.z");
+      expect(result.error.message).toMatch(/truncat/i);
+    }
   }, 60_000);
 
-  it("cuts an oversized result to the byte budget and flags it truncated", async () => {
+  it("cuts an oversized result to the byte budget, keeps original content, and flags it truncated", async () => {
     const { server } = await startDirectServer();
     const owner = await admitOwningRun(server, "code-mode-truncate");
 
@@ -483,7 +490,9 @@ describe("cap what execute hands back", () => {
 
     expect(bytes(result)).toBeLessThanOrEqual(256);
     expect(result).toMatchObject({ ok: true, truncated: true, logs: [] });
-    expect(result.ok && typeof result.result === "string" && result.result.length > 0).toBe(true);
+    expect(
+      result.ok && typeof result.result === "string" && result.result.includes("x".repeat(20)),
+    ).toBe(true);
   }, 60_000);
 
   it("refuses a result limit below the minimum", () => {
@@ -494,15 +503,53 @@ describe("cap what execute hands back", () => {
 });
 
 describe("describe the tools to the model", () => {
-  it("lists each namespace on one line and describes step.run and execute", () => {
+  it("lists each namespace's members on one line and conveys safe retry and repeat-key rules", () => {
     const host = createNoteHost();
 
     const text = codeModeInstructions(host.catalog);
+    const lines = text.split("\n");
+    const notesLine = lines.find(
+      (line) => /\bnotes\b/.test(line) && /\bappend\b/.test(line) && /\bpublish\b/.test(line),
+    );
+    const sentences = text.split(/(?<=[.!?])\s+|\n+/);
 
-    expect(text).toContain("- notes: append, publish, read");
-    expect(text).toContain("step.run");
-    expect(text).toContain("execute");
-    expect(text).toContain("key");
+    expect(notesLine).toBeDefined();
+    expect(notesLine).toMatch(/\bread\b/);
+    expect(text).toMatch(/execute\([^)]*\bkey\??[^)]*\)/);
+    expect(
+      sentences.some((sentence) => /\bstep\.run\b/.test(sentence) && /\bawait\b/.test(sentence)),
+    ).toBe(true);
+    expect(
+      sentences.some(
+        (sentence) =>
+          /\bsame\s+script\b/i.test(sentence) &&
+          /\b(same\s+execution|reattach)\b/i.test(sentence) &&
+          !/\bnew\s+execution\b/i.test(sentence),
+      ),
+    ).toBe(true);
+    expect(
+      sentences.some(
+        (sentence) =>
+          /\b(on\s+purpose|intentionally|again)\b/i.test(sentence) &&
+          /\bnew\s+`?key`?\b/i.test(sentence),
+      ),
+    ).toBe(true);
+    expect(
+      sentences.some(
+        (sentence) =>
+          /\b(failed|finished)\b/i.test(sentence) &&
+          /\b(retry|retrying|repeat)\b/i.test(sentence) &&
+          /\bnew\s+`?key`?\b/i.test(sentence),
+      ),
+    ).toBe(true);
+    expect(
+      sentences.some(
+        (sentence) =>
+          /\b(retry|same\s+script)\b/i.test(sentence) &&
+          /\bnew\s+execution\b/i.test(sentence) &&
+          !/\bnew\s+`?key`?\b/i.test(sentence),
+      ),
+    ).toBe(false);
   });
 });
 

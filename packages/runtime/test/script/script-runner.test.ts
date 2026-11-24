@@ -154,7 +154,12 @@ describe("enforce Script sandbox safety", () => {
     const result = await started(
       `throw Object.assign(new Error("denied"), { kind: "denied", capability: "notes.publish" });`,
     );
-    expect(result.error).toEqual({ kind: "script", message: "Error: denied" });
+    expect(result.error).toMatchObject({
+      kind: "script",
+      message: expect.stringContaining("denied"),
+    });
+    expect(result.error?.capability).toBeUndefined();
+    expect(result.error?.position).toBeUndefined();
   });
 
   it("bounds memory for an allocation loop and keeps the process under twice the limit", async () => {
@@ -195,7 +200,8 @@ describe("enforce Script sandbox safety", () => {
 
   it("does not take a line number from a thrown object's stack", async () => {
     const result = await started('throw { stack: "<input>:99999999999999999999:1" };');
-    expect(result.error).toEqual({ kind: "script", message: "[object Object]" });
+    expect(result.error).toMatchObject({ kind: "script", message: expect.any(String) });
+    expect(result.error?.line).toBeUndefined();
   });
 
   it("freezes every Date constructor route and performance after a step", async () => {

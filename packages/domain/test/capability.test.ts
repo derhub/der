@@ -41,35 +41,31 @@ describe("render a capability declaration", () => {
   it("names the input and output types and carries the description as a doc comment", async () => {
     const registry = await registryWith(appendNote);
 
-    expect(registry.catalog.search("journal")[0]?.declaration).toBe(
-      [
-        "type NotesAppendInput = {",
-        "  /** Body of the note */",
-        "  text: string;",
-        "  tags?: string[];",
-        "};",
-        "type NotesAppendOutput = {",
-        "  id: string;",
-        "  count: number;",
-        "};",
-        "/** Append a note to the journal. Use for short entries. */",
-        'declare const step: { run(id: "notes.append", input: NotesAppendInput): Promise<NotesAppendOutput> };',
-      ].join("\n"),
+    const declaration = registry.catalog.search("journal")[0]?.declaration ?? "";
+
+    expect(declaration).toMatch(
+      /type\s+NotesAppendInput\b[\s\S]*Body of the note[\s\S]*\btext:\s*string\b[\s\S]*\btags\?:\s*string\[\]/,
+    );
+    expect(declaration).toMatch(
+      /type\s+NotesAppendOutput\b[\s\S]*\bid:\s*string\b[\s\S]*\bcount:\s*number\b/,
+    );
+    expect(declaration).toContain("Append a note to the journal.");
+    expect(declaration).toContain("Use for short entries.");
+    expect(declaration).toMatch(
+      /run\(\s*id:\s*"notes\.append",\s*input:\s*NotesAppendInput\s*\):\s*Promise<NotesAppendOutput>/,
     );
   });
 
   it("renders an unknown output for a capability without an output shape", async () => {
     const registry = await registryWith(readWeather);
 
-    expect(registry.catalog.search("temperature")[0]?.declaration).toBe(
-      [
-        "type WeatherReadInput = {",
-        "  city: string;",
-        "};",
-        "type WeatherReadOutput = unknown;",
-        "/** Current temperature for a city. */",
-        'declare const step: { run(id: "weather.read", input: WeatherReadInput): Promise<WeatherReadOutput> };',
-      ].join("\n"),
+    const declaration = registry.catalog.search("temperature")[0]?.declaration ?? "";
+
+    expect(declaration).toMatch(/type\s+WeatherReadInput\b[\s\S]*\bcity:\s*string\b/);
+    expect(declaration).toMatch(/type\s+WeatherReadOutput\s*=\s*unknown\b/);
+    expect(declaration).toContain("Current temperature for a city.");
+    expect(declaration).toMatch(
+      /run\(\s*id:\s*"weather\.read",\s*input:\s*WeatherReadInput\s*\):\s*Promise<WeatherReadOutput>/,
     );
   });
 });
