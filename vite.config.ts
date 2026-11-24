@@ -46,11 +46,14 @@ export default defineConfig({
   },
   lint: {
     ignorePatterns: ["dist/**", "**/dist/**", "node_modules/**"],
+    jsPlugins: ["./lint/storage-boundary.js"],
     options: {
       typeAware: true,
       typeCheck: true,
     },
     rules: {
+      "typescript/no-require-imports": "error",
+      "der/no-dynamic-storage-import": "error",
       "no-restricted-imports": [
         "error",
         {
@@ -64,6 +67,7 @@ export default defineConfig({
         // SQLite implementation and storage migration tests own bun:sqlite directly.
         files: ["packages/storage/**"],
         rules: {
+          "der/no-dynamic-storage-import": "off",
           "no-restricted-imports": ["error", { patterns: [SRC_PATH_IMPORT, RUN_LIFECYCLE_IMPORT] }],
         },
       },
@@ -76,6 +80,7 @@ export default defineConfig({
           "packages/storage/src/script-store.ts",
         ],
         rules: {
+          "der/no-dynamic-storage-import": "off",
           "no-restricted-imports": ["error", { patterns: [SRC_PATH_IMPORT] }],
         },
       },
@@ -83,6 +88,7 @@ export default defineConfig({
         // Only the server bootstrap module and server tests wire concrete SQLite stores.
         files: ["apps/server/src/main.ts", "apps/server/test/**"],
         rules: {
+          "der/no-dynamic-storage-import": "off",
           "no-restricted-imports": [
             "error",
             {

@@ -658,7 +658,11 @@ function pendingEventCount(sessionTitle: string): number {
         .find((candidate) => candidate.textContent?.includes(sessionTitle))
     : undefined;
   const badge = button?.querySelector("[data-pending-events]");
-  return badge ? Number(badge.getAttribute("data-pending-events")) : 0;
+  if (!badge) {
+    return 0;
+  }
+  const match = /\d+/.exec(badge.textContent ?? "");
+  return match ? Number(match[0]) : Number.NaN;
 }
 
 describe("keep the session list current", () => {

@@ -342,7 +342,8 @@ function parseSessionButton(button: Element): { title: string; waiting: number }
   const children = Array.from(button.children);
   const title = children[0]?.textContent?.trim() ?? "";
   const badge = button.querySelector("[data-pending-events]");
-  const waiting = badge ? Number(badge.getAttribute("data-pending-events")) : 0;
+  const match = badge ? /\d+/.exec(badge.textContent ?? "") : null;
+  const waiting = badge ? (match ? Number(match[0]) : Number.NaN) : 0;
   return { title, waiting };
 }
 

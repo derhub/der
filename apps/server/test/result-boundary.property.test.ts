@@ -225,38 +225,66 @@ function successOutcomeOf(
   };
 }
 
+function maxFittingUnknownCount(
+  kind: Extract<ExecuteResult, { ok: false }>["error"]["kind"],
+  line: number | undefined,
+  unknown: readonly string[],
+  reserveLogs: readonly string[],
+  maxResultBytes: number,
+  envelopeBytes: number,
+): number {
+  const fitsCount = (kept: number) => {
+    const omitted = unknown.length - kept;
+    const entries = [...unknown.slice(0, kept), ...(omitted > 0 ? [`${omitted} omitted`] : [])];
+    return (
+      probeFailureSize(
+        kind,
+        `[message truncated] ${UNKNOWN_OUTCOME}${entries.join(", ")}.`,
+        line,
+        reserveLogs,
+        envelopeBytes,
+      ) <= maxResultBytes
+    );
+  };
+  if (fitsCount(unknown.length)) {
+    return unknown.length;
+  }
+  let count = 0;
+  for (let kept = 1; kept < unknown.length; kept += 1) {
+    if (!fitsCount(kept)) {
+      break;
+    }
+    count = kept;
+  }
+  return count;
+}
+
 function unknownOutcomeOf(
   actual: Extract<ExecuteResult, { ok: false }>,
-  unknown: readonly string[],
-  hadLogs: boolean,
+  expected: {
+    readonly kind: Extract<ExecuteResult, { ok: false }>["error"]["kind"];
+    readonly line: number | undefined;
+    readonly unknown: readonly string[];
+    readonly hadLogs: boolean;
+  },
   maxResultBytes: number,
   envelopeBytes: number,
 ) {
   const { listed, omitted } = unknownWrites(actual.error.message);
-  const reserveLogs = hadLogs ? ["[logs truncated]"] : [];
-  const allFit =
-    probeFailureSize(
-      actual.error.kind,
-      `[message truncated] ${UNKNOWN_OUTCOME}${unknown.join(", ")}.`,
-      actual.error.line,
-      reserveLogs,
-      envelopeBytes,
-    ) <= maxResultBytes;
-  const firstFits =
-    unknown.length > 0 &&
-    probeFailureSize(
-      actual.error.kind,
-      `[message truncated] ${UNKNOWN_OUTCOME}${unknown[0]}${unknown.length > 1 ? `, ${unknown.length - 1} omitted` : ""}.`,
-      actual.error.line,
-      reserveLogs,
-      envelopeBytes,
-    ) <= maxResultBytes;
+  const reserveLogs = expected.hadLogs ? ["[logs truncated]"] : [];
+  const minExpectedKept = maxFittingUnknownCount(
+    expected.kind,
+    expected.line,
+    expected.unknown,
+    reserveLogs,
+    maxResultBytes,
+    envelopeBytes,
+  );
   return {
     accounted: listed.length + omitted,
     distinctNames: new Set(listed).size === listed.length,
-    listedAreUnknown: listed.every((name) => unknown.includes(name)),
-    keptAllThatFit: !allFit || omitted === 0,
-    keptFittingName: !firstFits || listed.length > 0,
+    listedAreUnknown: listed.every((name) => expected.unknown.includes(name)),
+    keptFittingNames: listed.length >= minExpectedKept,
   };
 }
 
@@ -294,9 +322,9 @@ function outcomeOf(
     TRUNCATION_FLAG.test(actual.error.message) ||
     (unknown !== undefined &&
       probeFailureSize(
-        actual.error.kind,
+        input.error.kind,
         `[message truncated] ${UNKNOWN_OUTCOME}${unknown.length} omitted.`,
-        actual.error.line,
+        input.error.line,
         reserveLogs,
         envelopeBytes,
       ) > maxResultBytes);
@@ -321,7 +349,17 @@ function outcomeOf(
     messageCutFlagged,
     logsCutFlagged,
     callCutFlagged,
-    ...unknownOutcomeOf(actual, unknown, input.logs.length > 0, maxResultBytes, envelopeBytes),
+    ...unknownOutcomeOf(
+      actual,
+      {
+        kind: input.error.kind,
+        line: input.error.line,
+        unknown,
+        hadLogs: input.logs.length > 0,
+      },
+      maxResultBytes,
+      envelopeBytes,
+    ),
   };
 }
 
@@ -352,8 +390,7 @@ function expectedOutcome(testCase: Case): JsonValue {
     accounted: testCase.unknown.length,
     distinctNames: true,
     listedAreUnknown: true,
-    keptAllThatFit: true,
-    keptFittingName: true,
+    keptFittingNames: true,
   };
 }
 
@@ -449,13 +486,14 @@ describe("property: the bounded text of a Script result", () => {
     expect(result.ok).toBe(false);
     if (!result.ok) {
       const { listed, omitted } = unknownWrites(result.error.message);
-      expect(listed).toEqual(names);
+      expect(listed).toHaveLength(names.length);
+      expect(new Set(listed)).toEqual(new Set(names));
       expect(omitted).toBe(0);
       expect(result.error.message).toMatch(TRUNCATION_FLAG);
     }
   });
 
-  it("keeps the distinct unknown writes that fit and counts the rest under a tight budget", () => {
+  it("keeps every distinct unknown write that fits and counts the rest under a tight budget", () => {
     const names = Array.from({ length: 20 }, (_, index) => `#${index + 1} notes.append`);
     const { result, text: boundedText } = boundResult(
       {
@@ -473,11 +511,14 @@ describe("property: the bounded text of a Script result", () => {
     expect(result.ok).toBe(false);
     if (!result.ok) {
       const { listed, omitted } = unknownWrites(result.error.message);
-      expect(listed.length).toBeGreaterThan(0);
+      // 256 - 65 (JSON shell) - 38 (truncation + prefix + dot) = 153 bytes;
+      // 8 * 15-byte names + 7 * 2-byte commas + 12-byte ", 12 omitted" = 146 <= 153 (9 names = 163 > 153).
+      expect(listed.length).toBeGreaterThanOrEqual(8);
       expect(omitted).toBeGreaterThan(0);
       expect(listed.length + omitted).toBe(names.length);
       expect(new Set(listed).size).toBe(listed.length);
       expect(listed.every((name) => names.includes(name))).toBe(true);
+      expect(result.error.message).toMatch(TRUNCATION_FLAG);
     }
   });
 
@@ -656,7 +697,17 @@ function inlineOutcomeOf(
         ok: false,
         kind: result.error.kind,
         logsCutFlagged,
-        ...unknownOutcomeOf(result, unknown, testCase.logs.length > 0, maxResultBytes, 0),
+        ...unknownOutcomeOf(
+          result,
+          {
+            kind: "capability",
+            line: undefined,
+            unknown,
+            hadLogs: testCase.logs.length > 0,
+          },
+          maxResultBytes,
+          0,
+        ),
       };
     }
   }
@@ -690,8 +741,7 @@ function expectedInline(testCase: InlineCase): JsonValue {
         accounted: testCase.writes.length,
         distinctNames: true,
         listedAreUnknown: true,
-        keptAllThatFit: true,
-        keptFittingName: true,
+        keptFittingNames: true,
       };
   }
 }
