@@ -203,6 +203,20 @@ export class ScriptDriver {
         this.#background(this.kick(id));
       }
     }
+    // An interruption lost to a crash after the execution ended in doubt.
+    for (const id of scripts.listInDoubtWithActiveRun()) {
+      if (this.#closing.signal.aborted) {
+        return;
+      }
+      try {
+        const { execution, steps } = scripts.load(id);
+        if (execution.result !== null) {
+          await this.#interruptRun(execution, steps, execution.result);
+        }
+      } catch (error) {
+        this.deps.logError?.(error);
+      }
+    }
     await this.deps.deliverEvents?.();
   }
 

@@ -201,6 +201,13 @@ describe("run a Script as steps", () => {
     expect(drain.error).toEqual({ kind: "limit", message: "output limit of 512 bytes exceeded" });
   });
 
+  it("ends a drain of endless empty logs at the output limit", async () => {
+    const drain = await inSession(`while (true) console.log("");`, (session) => session.started, {
+      limits: { ...roomy, activeMs: 1_000, outputBytes: 512 },
+    });
+    expect(drain.error).toEqual({ kind: "limit", message: "output limit of 512 bytes exceeded" });
+  });
+
   it("tells a Script that calls der to use step.run", async () => {
     const drain = await inSession(`return der.memory.read({});`, (session) => session.started);
     expect(drain.error).toEqual({

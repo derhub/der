@@ -89,7 +89,12 @@ export interface FinishRunInput {
   readonly engineSession?: EngineSessionInput;
 }
 
+/**
+ * The first finish of an active Run writes its status and terminal chunk together and wins. A later
+ * finish writes nothing and loses: `run` and `terminalEvent` are then the stored ones.
+ */
 export interface FinishRunOutcome {
+  readonly won: boolean;
   readonly run: Run;
   readonly terminalEvent: RunEvent;
   readonly finalMessage?: Message;

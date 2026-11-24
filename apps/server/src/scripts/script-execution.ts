@@ -153,6 +153,8 @@ class ScriptRefused extends Error {
     message: string,
     readonly call?: string,
     readonly line?: number,
+    /** The end of the execution adds what its writes did to the message. */
+    readonly reportsWrites = false,
   ) {
     super(message);
   }
@@ -276,7 +278,14 @@ class ScriptPass {
         throw error;
       }
       await this.#drainWork();
-      await this.#end("failed", error.kind, error.message, error.call, error.line);
+      await this.#end(
+        "failed",
+        error.kind,
+        error.message,
+        error.call,
+        error.line,
+        error.reportsWrites,
+      );
     } finally {
       this.#acceptWork = false;
       this.signal.removeEventListener("abort", this.#notify);
@@ -312,27 +321,32 @@ class ScriptPass {
   #mismatch(detail: string): ScriptRefused {
     return new ScriptRefused(
       "nondeterministic",
-      `the Script did not repeat itself: ${detail}. ${this.#applied()}`,
+      `the Script did not repeat itself: ${detail}`,
+      undefined,
+      undefined,
+      true,
     );
   }
 
   #applied(): string {
-    const applied = [...this.#rows.values()]
-      .filter((step) => step.effect === "write" && step.status === "done")
-      .map((step) => `#${step.position} ${step.capability}`);
-    return `Already applied: ${applied.join(", ") || "nothing"}.`;
+    const writes = (status: StoredStep["status"]) =>
+      [...this.#rows.values()]
+        .filter((step) => step.effect === "write" && step.status === status)
+        .map((step) => `#${step.position} ${step.capability}`)
+        .join(", ");
+    const applied = writes("done");
+    const unknown = writes("unknown");
+    if (unknown === "") {
+      return `Already applied: ${applied || "nothing"}.`;
+    }
+    return `Already applied: ${applied || "none confirmed"}. Unknown outcome: ${unknown}.`;
   }
 
   async #absorb(drain: ScriptDrain, replaying: boolean): Promise<void> {
     for (const line of drain.logs) this.#logs.push(line);
     if (drain.fatal && drain.error !== undefined) {
       const { kind, message, line } = drain.error;
-      throw new ScriptRefused(
-        errorKind(kind),
-        kind === "limit" ? `${message}. ${this.#applied()}` : message,
-        undefined,
-        line,
-      );
+      throw new ScriptRefused(errorKind(kind), message, undefined, line, kind === "limit");
     }
     if (drain.orphans?.length) {
       throw this.#mismatch(`no pending call for recorded step ${drain.orphans[0]}`);
@@ -351,7 +365,7 @@ class ScriptPass {
         this.#rows.size + fresh > maxSteps
           ? `step limit of ${maxSteps}`
           : `in-flight step limit of ${maxInFlight}`;
-      throw new ScriptRefused("limit", `${limit} exceeded. ${this.#applied()}`);
+      throw new ScriptRefused("limit", `${limit} exceeded`, undefined, undefined, true);
     }
     if (drain.requests.length === 0) {
       return;
@@ -770,12 +784,17 @@ class ScriptPass {
     }
   }
 
+  /**
+   * Ends the execution with an error. A write whose outcome is unknown makes the end `in_doubt`
+   * whatever the reason for stopping, and the message then says what the writes did.
+   */
   async #end(
-    status: TerminalScriptRunStatus,
+    reason: TerminalScriptRunStatus,
     kind: ExecuteErrorKind,
-    message: string,
+    cause: string,
     call?: string,
     line?: number,
+    reportsWrites = false,
   ): Promise<void> {
     this.#acceptWork = false;
     await this.#withdrawApprovals();
@@ -786,13 +805,19 @@ class ScriptPass {
       const effect = await this.deps.store.getEffect(effectOf(this.head, step));
       this.guard();
       if (effect === undefined) {
-        this.#storeOutcome(step, stepFailure(step, "failed", message, "skipped"));
+        this.#storeOutcome(step, stepFailure(step, "failed", cause, "skipped"));
         continue;
       }
       const recorded =
         effect.status === "started" ? await this.deps.store.markEffectUnknown(effect.id) : effect;
-      this.#storeOutcome(step, this.#effectOutcome(step, recorded, message));
+      this.#storeOutcome(step, this.#effectOutcome(step, recorded, cause));
     }
+    const inDoubt = [...this.#rows.values()].some((step) => step.status === "unknown");
+    const status = inDoubt ? "in_doubt" : reason;
+    const message =
+      reportsWrites || (inDoubt && reason !== "in_doubt")
+        ? `${cause.replace(/\.$/, "")}. ${this.#applied()}`
+        : cause;
     this.guard();
     this.deps.scripts.finish(this.head.id, {
       status,

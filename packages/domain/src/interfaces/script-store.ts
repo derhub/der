@@ -107,4 +107,6 @@ export interface ScriptStore {
   releaseLease(id: ScriptRunId, owner: string): void;
   /** Executions that are not terminal and whose lease is absent or expired at `now`. */
   listDrivable(now: UtcTimestamp): readonly ScriptRunId[];
+  /** Executions that ended `in_doubt` while their owning Run is still active. */
+  listInDoubtWithActiveRun(): readonly ScriptRunId[];
 }

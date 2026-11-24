@@ -1,6 +1,8 @@
 import { afterEach, describe, expect, it } from "bun:test";
 import * as z from "zod";
-import { defineCapability } from "@der/domain";
+import { defineCapability, type FinishRunInput } from "@der/domain";
+import type { SqliteStore } from "@der/storage";
+import { finalizeDirectRunStep } from "#workflows/index";
 import { openScriptFixture } from "./fixtures/script-host";
 
 const cleanups: (() => Promise<void>)[] = [];
@@ -341,7 +343,7 @@ describe("preserve effect safety when the host cannot continue", () => {
     });
   });
 
-  it("ends a cancelled execution after the grace period while its write never returns", async () => {
+  it("ends a cancelled execution in doubt after the grace period while its write never returns", async () => {
     const { store, run, host, acquire, driver, scripts } = await setup(undefined, {
       writeCancelGraceMs: 100,
     });
@@ -374,7 +376,17 @@ describe("preserve effect safety when the host cannot continue", () => {
 
     await Promise.all([driving, driver.cancelRun(run.id)]);
 
-    expect(scripts.load(id).execution.status).toBe("cancelled");
+    expect(scripts.load(id).execution).toMatchObject({
+      status: "in_doubt",
+      result: {
+        ok: false,
+        error: {
+          kind: "cancelled",
+          message:
+            "script cancelled. Already applied: none confirmed. Unknown outcome: #1 notes.stuck.",
+        },
+      },
+    });
   }, 3_000);
 
   it("records a write already in flight before cancelling the execution", async () => {
@@ -467,4 +479,88 @@ describe("end a detached Script in doubt", () => {
       events: ["script.finished"],
     });
   });
+});
+
+/** Holds every finish of the Run until all callers in `order` have reached it, then lets them write in that order. */
+function finishInOrder(store: SqliteStore, order: readonly FinishRunInput["status"][]) {
+  const turns = new Map(order.map((status) => [status, Promise.withResolvers<void>()]));
+  const written = new Map(order.map((status) => [status, Promise.withResolvers<void>()]));
+  let arrived = 0;
+  const release = async () => {
+    for (const status of order) {
+      turns.get(status)!.resolve();
+      await written.get(status)!.promise;
+    }
+  };
+  return new Proxy(store, {
+    get(target, key) {
+      if (key === "finishRun") {
+        return async (input: FinishRunInput) => {
+          arrived += 1;
+          if (arrived === order.length) void release();
+          await turns.get(input.status)!.promise;
+          try {
+            return await target.finishRun(input);
+          } finally {
+            written.get(input.status)!.resolve();
+          }
+        };
+      }
+      const value: unknown = Reflect.get(target, key, target);
+      return typeof value === "function" ? value.bind(target) : value;
+    },
+  });
+}
+
+describe("end a Run once when an in-doubt interruption meets its normal finish", () => {
+  it.each([
+    { order: ["completed", "interrupted"], terminal: "RUN_FINISHED" },
+    { order: ["interrupted", "completed"], terminal: "RUN_ERROR" },
+  ] as const)(
+    "keeps the status and terminal chunk of the first writer, $order.0 first",
+    async ({ order, terminal }) => {
+      const fixture = await openScriptFixture();
+      const store = finishInOrder(fixture.store, order);
+      const { scripts, driver, acquire } = fixture.openDriver(store);
+      cleanups.push(async () => {
+        await driver.close();
+        fixture.store.close();
+        fixture.database.cleanup();
+      });
+      const run = await fixture.store.markRunRunning(fixture.run.id);
+      const { id } = acquire('await step.run("notes.append", { text: "entry" }); return 1;');
+      scripts.detach(id);
+      fixture.store.database.db.run(
+        "CREATE TRIGGER refuse_updates BEFORE UPDATE ON effects BEGIN SELECT RAISE(ABORT, 'disk full'); END",
+      );
+      await driver.kick(id).catch(() => undefined);
+      fixture.store.database.db.run("DROP TRIGGER refuse_updates");
+
+      const [, finished] = await Promise.all([
+        driver.kick(id),
+        finalizeDirectRunStep(
+          { store, engines: new Map(), approvalTimeoutMs: 5_000 },
+          { run, outcome: { kind: "completed" } },
+        ),
+      ]);
+
+      const chunks = fixture.store.database.db
+        .query<{ chunk_json: string }, [string]>(
+          "SELECT chunk_json FROM run_events WHERE run_id = ? AND is_terminal = 1",
+        )
+        .all(run.id)
+        .map((row) => (JSON.parse(row.chunk_json) as { type: string }).type);
+      expect({
+        execution: scripts.load(id).execution.status,
+        run: fixture.store.getRun(run.id)?.status,
+        finalized: finished.status,
+        terminal: chunks,
+      }).toEqual({
+        execution: "in_doubt",
+        run: order[0],
+        finalized: order[0],
+        terminal: [terminal],
+      });
+    },
+  );
 });

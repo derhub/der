@@ -509,6 +509,117 @@ function createFakeServerFetch(
   };
 }
 
+function sessionOf(botId: string, id: string, title: string, pendingEventCount: number) {
+  return {
+    id,
+    botId,
+    title,
+    engine: "fixture",
+    pendingEventCount,
+    createdAt: "2026-01-01T00:00:00.000Z",
+    updatedAt: "2026-01-01T00:00:00.000Z",
+  };
+}
+
+/**
+ * The fixture server with a second bot. The first session list of each bot is answered at once;
+ * later ones of the fixture bot wait in `held` until the test answers them, and later ones of the
+ * other bot are never answered, so only the answers the test gives can change the list.
+ */
+function createHeldSessionsFetch() {
+  const server = createFakeServerFetch();
+  const held: ((pendingEventCount: number) => void)[] = [];
+  let fixtureListings = 0;
+  let otherListings = 0;
+  const fetcher: typeof fetch = async (input, init) => {
+    const rawUrl =
+      typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
+    const url = new URL(rawUrl, "http://127.0.0.1:5173");
+    if (url.pathname === "/api/bots") {
+      const { bots } = (await (await server.fetcher(input, init)).json()) as { bots: object[] };
+      return Response.json({
+        bots: [...bots, { ...bots[0], id: "bot-other", name: "Other Bot" }],
+      });
+    }
+    if (url.pathname === "/api/bots/bot-other/sessions") {
+      otherListings += 1;
+      if (otherListings > 1) {
+        return new Promise<Response>(() => {});
+      }
+      return Response.json({
+        sessions: [sessionOf("bot-other", "sess-other", "Other Session", 0)],
+      });
+    }
+    if (url.pathname === "/api/bots/bot-fixture/sessions") {
+      fixtureListings += 1;
+      if (fixtureListings === 1) {
+        return Response.json({
+          sessions: [sessionOf("bot-fixture", "sess-fixture", "Fixture Session", 0)],
+        });
+      }
+      return new Promise<Response>((resolve) => {
+        held.push((pendingEventCount) =>
+          resolve(
+            Response.json({
+              sessions: [
+                sessionOf("bot-fixture", "sess-fixture", "Fixture Session", pendingEventCount),
+              ],
+            }),
+          ),
+        );
+      });
+    }
+    return server.fetcher(input, init);
+  };
+  return { fetcher, held, otherListings: () => otherListings };
+}
+
+describe("keep the session list current", () => {
+  it("shows the waiting badge after the pending count changes with no operator action", async () => {
+    const server = createFakeServerFetch();
+    let pending = 0;
+    const fetcher: typeof fetch = async (input, init) => {
+      const rawUrl =
+        typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
+      if (new URL(rawUrl, "http://127.0.0.1:5173").pathname === "/api/bots/bot-fixture/sessions") {
+        return Response.json({
+          sessions: [sessionOf("bot-fixture", "sess-fixture", "Fixture Session", pending)],
+        });
+      }
+      return server.fetcher(input, init);
+    };
+    render(<App fetcher={fetcher} sessionRefreshMs={20} />);
+
+    await screen.findByText("Fixture session ready.");
+    const before = screen.queryByText("1 waiting");
+    pending = 1;
+
+    expect([before, (await screen.findByText("1 waiting")).textContent]).toEqual([
+      null,
+      "1 waiting",
+    ]);
+  });
+
+  it("drops a session list that arrives after its bot is no longer selected", async () => {
+    const user = userEvent.setup();
+    const server = createHeldSessionsFetch();
+    render(<App fetcher={server.fetcher} sessionRefreshMs={20} />);
+
+    await screen.findAllByText("Fixture Session");
+    await waitFor(() => expect(server.held.length).toBeGreaterThan(0));
+    await user.click(screen.getByRole("button", { name: /^Other Bot/ }));
+    await screen.findAllByText("Other Session");
+    const listed = server.otherListings();
+    for (const answer of server.held.splice(0)) answer(1);
+    await waitFor(() => expect(server.otherListings()).toBeGreaterThan(listed));
+
+    expect({
+      fixture: screen.queryAllByText("Fixture Session").length,
+      other: screen.queryAllByText("Other Session").length > 0,
+    }).toEqual({ fixture: 0, other: true });
+  });
+});
+
 describe("operate der through the Web operator console", () => {
   it("renders the exact arguments for both pending Approvals of the active Run", async () => {
     const user = userEvent.setup();

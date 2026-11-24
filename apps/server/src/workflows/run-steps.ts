@@ -74,12 +74,15 @@ type RunFinishDeps = Pick<WorkflowDeps, "now" | "onRunFinished"> & {
   readonly store: Pick<RunStore, "finishRun">;
 };
 
+/** Only the finish that ended the Run notifies; a later one returns the stored Run unchanged. */
 async function finishRunAndNotify(
   deps: Pick<RunFinishDeps, "store" | "onRunFinished">,
   input: FinishRunInput,
 ): Promise<FinishRunOutcome> {
   const finished = await deps.store.finishRun(input);
-  await deps.onRunFinished?.(finished.run);
+  if (finished.won) {
+    await deps.onRunFinished?.(finished.run);
+  }
   return finished;
 }
 
@@ -490,11 +493,6 @@ export async function finalizeDirectRunStep(
     readonly outcome: RunStageResult;
   },
 ): Promise<Run> {
-  const current = await deps.store.getRun(input.run.id);
-  if (current?.status === "interrupted") {
-    return current;
-  }
-
   if (input.outcome.kind === "interrupted") {
     const now = deps.now ? deps.now() : new Date();
     const finished = await finishRunAndNotify(deps, {

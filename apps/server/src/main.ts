@@ -802,6 +802,7 @@ export async function startServer(options: CreateServerOptions = {}): Promise<Ru
 
     let coordinator: RunCoordinator;
     let routineSchedule: RoutineScheduleClient;
+    let resumeDirectRuns: (() => Promise<void>) | undefined;
     const scriptRoutines = (): ScriptRoutineDeps => ({ routines, scriptRunStore, scriptDriver });
 
     const turns = new Map<RunId, TurnRecord>();
@@ -827,17 +828,19 @@ export async function startServer(options: CreateServerOptions = {}): Promise<Ru
           }
         }
       });
-      // An event Run still queued was admitted and never started (a crash after admission).
-      const resumable = store.database.db
-        .query<{ id: RunId }, []>(
-          `SELECT id FROM runs
-           WHERE (engine = 'script' AND status IN ('queued', 'running', 'waiting_approval'))
-              OR (origin = 'event' AND status = 'queued')`,
-        )
-        .all();
-      for (const { id } of resumable) {
-        await directDriver.start?.(id);
-      }
+      resumeDirectRuns = async () => {
+        // An event Run still queued was admitted and never started (a crash after admission).
+        const resumable = store.database.db
+          .query<{ id: RunId }, []>(
+            `SELECT id FROM runs
+             WHERE (engine = 'script' AND status IN ('queued', 'running', 'waiting_approval'))
+                OR (origin = 'event' AND status = 'queued')`,
+          )
+          .all();
+        for (const { id } of resumable) {
+          await directDriver.start?.(id);
+        }
+      };
       closeDirectDriver = () => directDriver.close();
       routineSchedule = createDirectRoutineScheduleClient({
         routines,
@@ -949,6 +952,8 @@ export async function startServer(options: CreateServerOptions = {}): Promise<Ru
     } else if (config.seedFixture && !engines.has("fixture")) {
       engines.set("fixture", createFixtureEngine(store, loadRunInput, closing.signal));
     }
+    // Resumed Runs look up their engine when they start, so every engine is registered first.
+    await resumeDirectRuns?.();
 
     const httpApp = createHttpApp({
       bots: store,

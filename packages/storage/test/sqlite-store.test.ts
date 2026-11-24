@@ -3,7 +3,13 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "bun:test";
-import { DomainError, type RunEvent } from "@der/domain";
+import {
+  DomainError,
+  type FinishRunInput,
+  type JsonValue,
+  type RunEvent,
+  type RunStatus,
+} from "@der/domain";
 import {
   applyMigrations,
   canonicalizeJson,
@@ -1169,6 +1175,106 @@ describe("bot policy", () => {
           eventChainLimit: 3,
         }),
       ).toThrow("policy key must be a capability id or a dotted namespace");
+    } finally {
+      store.close();
+    }
+  });
+});
+
+describe("finish a Run once", () => {
+  const completion = (runId: string) =>
+    ({
+      runId,
+      status: "completed",
+      terminalEvent: { chunkKey: `${runId}:terminal`, chunk: { type: "RUN_FINISHED", runId } },
+      finalMessageParts: [{ type: "text", text: "done" }],
+    }) as const;
+  const interruption = (runId: string) =>
+    ({
+      runId,
+      status: "interrupted",
+      terminalEvent: {
+        chunkKey: `${runId}:terminal`,
+        chunk: { type: "RUN_ERROR", code: "effect.outcome_uncertain", runId },
+      },
+      checkpoint: { interruptedEffectId: "eff-1" },
+    }) as const;
+
+  it.each<{
+    order: string;
+    first: (runId: string) => FinishRunInput;
+    second: (runId: string) => FinishRunInput;
+    stored: { status: RunStatus; checkpoint: JsonValue; terminal: string; replies: string[] };
+  }>([
+    {
+      order: "a completion, then an interruption",
+      first: completion,
+      second: interruption,
+      stored: {
+        status: "completed",
+        checkpoint: null,
+        terminal: "RUN_FINISHED",
+        replies: ["done"],
+      },
+    },
+    {
+      order: "an interruption, then a completion",
+      first: interruption,
+      second: completion,
+      stored: {
+        status: "interrupted",
+        checkpoint: { interruptedEffectId: "eff-1" },
+        terminal: "RUN_ERROR",
+        replies: [],
+      },
+    },
+  ])("keeps the first of $order and reports that the second lost", async (testCase) => {
+    const store = openSqliteStore({ filename: createTempDbPath() });
+    try {
+      const { bot, session } = seedFixture(store);
+      const { run } = await store.admit({
+        botId: bot.id,
+        sessionId: session.id,
+        origin: "web",
+        idempotencyKey: "req-finish-once",
+        input: { parts: [{ type: "text", text: "Finish once" }] },
+      });
+
+      const first = await store.finishRun(testCase.first(run.id));
+      const second = await store.finishRun(testCase.second(run.id));
+
+      const events: RunEvent[] = [];
+      for await (const event of store.replay(run.id, 0)) events.push(event);
+      const stored = store.getRun(run.id);
+      expect({
+        first: { won: first.won, status: first.run.status },
+        second: {
+          won: second.won,
+          status: second.run.status,
+          terminal: (second.terminalEvent.chunk as { type: string }).type,
+          outbox: second.outboxEvents.length,
+        },
+        stored: {
+          status: stored?.status,
+          checkpoint: stored?.checkpoint,
+          terminal: events
+            .filter((event) => event.isTerminal)
+            .map((event) => (event.chunk as { type: string }).type),
+          replies: store
+            .listMessages(session.id)
+            .filter((message) => message.role === "assistant")
+            .map((message) => (message.parts[0] as { text: string }).text),
+        },
+      }).toEqual({
+        first: { won: true, status: testCase.stored.status },
+        second: {
+          won: false,
+          status: testCase.stored.status,
+          terminal: testCase.stored.terminal,
+          outbox: 0,
+        },
+        stored: { ...testCase.stored, terminal: [testCase.stored.terminal] },
+      });
     } finally {
       store.close();
     }

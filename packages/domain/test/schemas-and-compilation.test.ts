@@ -393,6 +393,7 @@ describe("keep Memory schema and capability entry points distinct", () => {
         yield fixtures.runEvent;
       },
       finishRun: async () => ({
+        won: true,
         run: fixtures.run,
         terminalEvent: fixtures.runEvent,
         outboxEvents: [],

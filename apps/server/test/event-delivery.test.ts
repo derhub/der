@@ -166,28 +166,55 @@ describe("deliver a session event", () => {
     });
   });
 
-  it("cuts a failed result's long error message in the event text and flags the cut", async () => {
-    const { store, deliver } = openStore(undefined, 10);
+  it("fits a failed result's long message and logs into the event text limit and flags each cut", async () => {
+    const { store, deliver } = openStore(undefined, 200);
     enqueue(store, "evt-1", {
       status: "failed",
-      result: { ok: false, error: { kind: "capability", message: "z".repeat(50) }, logs: [] },
+      result: {
+        ok: false,
+        error: { kind: "capability", message: "z".repeat(500) },
+        logs: ["l".repeat(100)],
+      },
     });
 
     await deliver();
 
-    expect(
+    const [part] = JSON.parse(
       store.database.db
         .query<{ parts_json: string }, []>(
           "SELECT parts_json FROM messages WHERE run_id = (SELECT id FROM runs WHERE origin = 'event')",
         )
+        .get()!.parts_json,
+    ) as { text: string }[];
+    expect({
+      text: part!.text,
+      fits: new TextEncoder().encode(part!.text).byteLength <= 200,
+    }).toEqual({
+      text: `{"status":"failed","result":{"ok":false,"error":{"kind":"capability","message":"${"z".repeat(68)} [message truncated]"},"logs":["[logs truncated]"]}}`,
+      fits: true,
+    });
+  });
+
+  it("marks delivered and links an event whose admitted Run already ended, and admits nothing", async () => {
+    const { store, deliver } = openStore();
+    enqueue(store, "evt-1", { n: 1 });
+    const admitted = await admitRun(store, "event", "evt-1");
+    await finish(store, admitted.id);
+
+    await deliver();
+
+    expect({
+      runs: eventRuns(store),
+      pending: store.listPendingSessionEvents(),
+      link: store.database.db
+        .query<{ state: string; run_id: string }, []>(
+          "SELECT state, run_id FROM session_events WHERE id = 'evt-1'",
+        )
         .get(),
-    ).toEqual({
-      parts_json: JSON.stringify([
-        {
-          type: "text",
-          text: '{"status":"failed","result":{"ok":false,"error":{"kind":"capability","message":"zzzzzzzzzz [message truncated]"},"logs":[]}}',
-        },
-      ]),
+    }).toEqual({
+      runs: [{ id: admitted.id, status: "completed" }],
+      pending: [],
+      link: { state: "delivered", run_id: admitted.id },
     });
   });
 
@@ -265,6 +292,37 @@ describe("recover an event Run admitted before a crash", () => {
     });
 
     expect(server.store.getRun(run.id)?.status).toBe("waiting_approval");
+  }, 30_000);
+
+  it("starts every queued event Run of eight sessions at startup with its engine", async () => {
+    const tempDb = createTempDatabase("der-event-startup-many-");
+    const before = openSqliteStore({ filename: tempDb.dbPath });
+    const { bot } = seedFixtureRecords(before);
+    const runIds: string[] = [];
+    for (let n = 1; n <= 8; n += 1) {
+      const session = before.createSession({ id: `sess-many-${n}`, botId: bot.id, title: `${n}` });
+      const { run } = await before.admit({
+        botId: bot.id,
+        sessionId: session.id,
+        origin: "event",
+        idempotencyKey: `evt-many-${n}`,
+        input: { parts: [{ type: "text", text: `{"n":${n}}` }] },
+      });
+      runIds.push(run.id);
+    }
+    before.close();
+
+    const server = await startDirectServer(tempDb);
+    const statuses = () => runIds.map((id) => server.store.getRun(id)?.status);
+    await waitUntil(
+      () => statuses().every((status) => status !== "queued" && status !== "running"),
+      {
+        timeoutMs: 10_000,
+        label: "every queued event Run left the queue",
+      },
+    );
+
+    expect(statuses()).toEqual(Array.from({ length: 8 }, () => "waiting_approval"));
   }, 30_000);
 
   it("starts the admitted Run that never started and then delivers the session's next event", async () => {

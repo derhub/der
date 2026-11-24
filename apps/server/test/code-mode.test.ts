@@ -430,20 +430,43 @@ describe("search the catalog", () => {
 });
 
 describe("cap what execute hands back", () => {
-  it("cuts an oversized error message to the byte budget and flags the cut", async () => {
-    const { server } = await startDirectServer();
-    const owner = await admitOwningRun(server, "code-mode-truncate-error");
+  it.each<{ case: string; script: string; expected: ExecuteResult }>([
+    {
+      case: "a long message and long logs",
+      script:
+        'console.log("a".repeat(30)); console.log("b".repeat(30)); throw new Error("y".repeat(200));',
+      expected: {
+        ok: false,
+        error: { kind: "script", message: `Error: ${"y".repeat(44)} [message truncated]` },
+        logs: ["[logs truncated]"],
+      },
+    },
+    {
+      case: "a short message and long logs",
+      script: 'console.log("a".repeat(40)); console.log("b".repeat(40)); throw new Error("short");',
+      expected: {
+        ok: false,
+        error: { kind: "script", message: "Error: short" },
+        logs: ["a".repeat(40), "[logs truncated]"],
+      },
+    },
+  ])(
+    "fits a failed result with $case into the byte limit and flags each cut",
+    async (testCase) => {
+      const { server } = await startDirectServer();
+      const owner = await admitOwningRun(server, "code-mode-truncate-error");
 
-    const result = await callTool(executeToolFor(server, owner.run, 20), {
-      script: `throw new Error("y".repeat(100));`,
-    });
+      const result = await callTool(executeToolFor(server, owner.run, 150), {
+        script: testCase.script,
+      });
 
-    expect(result).toEqual({
-      ok: false,
-      error: { kind: "script", message: "Error: yyyyyyyyyyyyy [message truncated]" },
-      logs: [],
-    });
-  }, 60_000);
+      expect({
+        result,
+        fits: new TextEncoder().encode(JSON.stringify(result)).byteLength <= 150,
+      }).toEqual({ result: testCase.expected, fits: true });
+    },
+    60_000,
+  );
 
   it("cuts an oversized result to the byte budget and flags it truncated", async () => {
     const { server } = await startDirectServer();
@@ -478,6 +501,17 @@ describe("describe the tools to the model", () => {
       "Calling `execute` again with the same Script returns the same execution and never runs it twice. To run the same Script again on purpose, pass a new `key`.",
     );
   }, 60_000);
+
+  it("shows the optional key in the execute signature and keeps a finished result whatever its outcome", () => {
+    const text = codeModeInstructions(createNoteHost().catalog);
+
+    expect([
+      text.includes("`execute({ script, key? })` runs a Script"),
+      text.includes(
+        "A finished execution keeps its result whatever its outcome (completed, failed, cancelled or uncertain), so retrying a failed Script needs a new `key`.",
+      ),
+    ]).toEqual([true, true]);
+  });
 });
 
 describe("give the engine its host tools", () => {

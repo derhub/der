@@ -56,19 +56,60 @@ function fitLogs(logs: readonly string[], maxBytes: number): { logs: string[]; c
   return { logs: kept, cut: false };
 }
 
-export function fitResult(result: ExecuteResult, maxBytes: number): ExecuteResult {
-  const { logs, cut } = fitLogs(result.logs, maxBytes);
-  if (!result.ok) {
-    const message = cutUtf8(result.error.message, maxBytes);
-    return {
-      ...result,
-      error: {
-        ...result.error,
-        message: message === result.error.message ? message : `${message}${MESSAGE_TRUNCATED}`,
-      },
-      logs: cut ? [...logs, LOGS_TRUNCATED] : logs,
-    };
+function jsonBytes(value: JsonValue | ExecuteResult): number {
+  return encoder.encode(JSON.stringify(value)).byteLength;
+}
+
+/**
+ * Fits a failed result, serialized, into `maxBytes`: the message first, then as many logs as
+ * still fit, each cut marked. Only a limit smaller than the bare result's shape is exceeded.
+ */
+function fitFailure(
+  result: Extract<ExecuteResult, { ok: false }>,
+  maxBytes: number,
+): ExecuteResult {
+  if (jsonBytes(result) <= maxBytes) {
+    return result;
   }
+  const shaped = (message: string, logs: string[]): ExecuteResult => ({
+    ...result,
+    error: { ...result.error, message },
+    logs,
+  });
+  const marker = result.logs.length > 0 ? [LOGS_TRUNCATED] : [];
+  let message = result.error.message;
+  if (message !== "" && jsonBytes(shaped(message, marker)) > maxBytes) {
+    let low = 0;
+    let high = encoder.encode(message).byteLength;
+    while (low < high) {
+      const mid = Math.ceil((low + high) / 2);
+      const fits =
+        jsonBytes(shaped(`${cutUtf8(message, mid)}${MESSAGE_TRUNCATED}`, marker)) <= maxBytes;
+      if (fits) {
+        low = mid;
+      } else {
+        high = mid - 1;
+      }
+    }
+    message = `${cutUtf8(message, low)}${MESSAGE_TRUNCATED}`;
+  }
+  const kept: string[] = [];
+  let used = jsonBytes(shaped(message, marker));
+  for (const line of result.logs) {
+    used += jsonBytes(line) + 1;
+    if (used > maxBytes) {
+      return shaped(message, [...kept, ...marker]);
+    }
+    kept.push(line);
+  }
+  return shaped(message, kept);
+}
+
+export function fitResult(result: ExecuteResult, maxBytes: number): ExecuteResult {
+  if (!result.ok) {
+    return fitFailure(result, maxBytes);
+  }
+  const { logs, cut } = fitLogs(result.logs, maxBytes);
   const serialized = JSON.stringify(result.result) ?? "null";
   const tooLarge = encoder.encode(serialized).byteLength > maxBytes;
   const value: JsonValue = tooLarge ? cutUtf8(serialized, maxBytes) : result.result;

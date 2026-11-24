@@ -6,6 +6,8 @@ export interface ScriptStoreHarness {
   /** A store over the same data, as after a process restart. */
   reopen(): ScriptStore;
   newRun(): Promise<{ readonly runId: string; readonly botId: string }>;
+  /** Ends the owning Run, as its engine or an interruption would. */
+  endRun(runId: string): Promise<void>;
   /** Moves the store's clock forward. */
   advance(ms: number): void;
   now(): UtcTimestamp;
@@ -268,6 +270,24 @@ export function scriptStoreContract(open: () => Promise<ScriptStoreHarness>): vo
         false,
         true,
       ]);
+    });
+
+    it("lists an in_doubt execution while its Run is active and no longer once the Run ended", async () => {
+      const { harness, store, execution, runId, botId } = await start();
+      const failedOne = store.acquire({ runId, botId, source: "return 2", seed: 1 });
+      const running = store.acquire({ runId, botId, source: "return 3", seed: 1 });
+      store.finish(execution.id, { status: "in_doubt", result: failed });
+      store.finish(failedOne.id, { status: "failed", result: failed });
+
+      const whileActive = store.listInDoubtWithActiveRun();
+      await harness.endRun(runId);
+      const afterEnd = store.listInDoubtWithActiveRun();
+
+      expect({ whileActive, afterEnd, running: running.status }).toEqual({
+        whileActive: [execution.id],
+        afterEnd: [],
+        running: "running",
+      });
     });
 
     it("refuses to detach an execution that already finished", async () => {

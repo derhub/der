@@ -9,6 +9,8 @@ import type {
 } from "@der/domain";
 import { fitResult } from "../code-mode/execute";
 
+const encoder = new TextEncoder();
+
 export interface EventDeliveryDeps {
   readonly store: SessionEventStore;
   readonly bots: Pick<BotStore, "getBot">;
@@ -36,13 +38,18 @@ export function createEventDelivery(deps: EventDeliveryDeps): DeliverEvents {
 
 /**
  * The event Run's text: the payload as JSON. A finished Script's result is fitted to
- * the size `execute` returns inline, so a long result cannot flood the Run.
+ * the size `execute` returns inline, less the rest of the payload, so a long result
+ * cannot flood the Run.
  */
 function eventText(payload: JsonValue, maxResultBytes: number): string {
   if (typeof payload === "object" && payload !== null && !Array.isArray(payload)) {
     const { result } = payload;
     if (typeof result === "object" && result !== null && !Array.isArray(result)) {
-      const fitted = fitResult(result as unknown as ExecuteResult, maxResultBytes);
+      const envelope = encoder.encode(JSON.stringify({ ...payload, result: null })).byteLength - 4;
+      const fitted = fitResult(
+        result as unknown as ExecuteResult,
+        Math.max(0, maxResultBytes - envelope),
+      );
       return JSON.stringify({ ...payload, result: fitted });
     }
   }

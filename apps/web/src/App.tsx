@@ -21,7 +21,7 @@ import {
   MessageSquareIcon,
   RefreshCwIcon,
 } from "lucide-react";
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type {
   Bot,
   CapabilityDescriptor,
@@ -126,7 +126,11 @@ const styles = stylex.create({
 export interface AppProps {
   readonly api?: OperatorApi;
   readonly fetcher?: typeof fetch;
+  /** How often the selected bot's session list is fetched again while the tab is visible. */
+  readonly sessionRefreshMs?: number;
 }
+
+const SESSION_REFRESH_MS = 5_000;
 
 const ACTOR_STORAGE_KEY = "der:operatorActor";
 
@@ -139,7 +143,11 @@ function loadStoredActor(): string {
   }
 }
 
-export function App({ api: providedApi, fetcher }: AppProps) {
+export function App({
+  api: providedApi,
+  fetcher,
+  sessionRefreshMs = SESSION_REFRESH_MS,
+}: AppProps) {
   const api = useMemo(
     () => providedApi ?? createOperatorApi(fetcher ? { fetcher } : {}),
     [providedApi, fetcher],
@@ -193,40 +201,77 @@ export function App({ api: providedApi, fetcher }: AppProps) {
     void loadBootstrap();
   }, [loadBootstrap]);
 
+  const sessionRequest = useRef(0);
+  const sessionsInFlight = useRef(0);
+
+  /**
+   * Lists a bot's sessions. Only the latest listing issued is applied, so a late answer for
+   * a bot no longer selected, or an older answer for the same bot, is dropped.
+   */
+  const loadSessions = useCallback(
+    async (botId: string, signal?: AbortSignal): Promise<Session[] | undefined> => {
+      const request = ++sessionRequest.current;
+      sessionsInFlight.current += 1;
+      try {
+        const loaded = await api.listSessions(botId, signal);
+        if (request !== sessionRequest.current) {
+          return undefined;
+        }
+        setSessions(loaded);
+        return loaded;
+      } catch (error) {
+        if (request === sessionRequest.current && !signal?.aborted) {
+          setBootstrapProblem(toOperatorProblem(error, `/api/bots/${botId}/sessions`));
+        }
+        return undefined;
+      } finally {
+        sessionsInFlight.current -= 1;
+      }
+    },
+    [api],
+  );
+
   useEffect(() => {
     if (!selectedBotId) {
+      sessionRequest.current += 1;
       setSessions([]);
       setSelectedSessionId(null);
       return;
     }
     const controller = new AbortController();
-    api
-      .listSessions(selectedBotId, controller.signal)
-      .then((loaded) => {
-        setSessions(loaded);
-        setSelectedSessionId((current) => {
-          if (current && loaded.some((entry) => entry.id === current)) {
-            return current;
-          }
-          return loaded[0]?.id ?? null;
-        });
-      })
-      .catch((error) => {
-        if (!controller.signal.aborted) {
-          setBootstrapProblem(toOperatorProblem(error, `/api/bots/${selectedBotId}/sessions`));
+    void loadSessions(selectedBotId, controller.signal).then((loaded) => {
+      if (loaded === undefined) {
+        return;
+      }
+      setSelectedSessionId((current) => {
+        if (current && loaded.some((entry) => entry.id === current)) {
+          return current;
         }
+        return loaded[0]?.id ?? null;
       });
+    });
     return () => controller.abort();
-  }, [api, selectedBotId]);
+  }, [loadSessions, selectedBotId]);
 
-  const refreshSessions = useCallback(() => {
+  // Background work (a detached Script, a server-started event Run) changes pending counts
+  // with no console action, so the list is fetched again while the tab is visible.
+  useEffect(() => {
     if (!selectedBotId) {
       return;
     }
-    api.listSessions(selectedBotId).then(setSessions, (error: unknown) => {
-      setBootstrapProblem(toOperatorProblem(error, `/api/bots/${selectedBotId}/sessions`));
-    });
-  }, [api, selectedBotId]);
+    const timer = setInterval(() => {
+      if (document.visibilityState !== "hidden" && sessionsInFlight.current === 0) {
+        void loadSessions(selectedBotId);
+      }
+    }, sessionRefreshMs);
+    return () => clearInterval(timer);
+  }, [loadSessions, selectedBotId, sessionRefreshMs]);
+
+  const refreshSessions = useCallback(() => {
+    if (selectedBotId) {
+      void loadSessions(selectedBotId);
+    }
+  }, [loadSessions, selectedBotId]);
 
   function handleActorChange(value: string) {
     setActor(value);

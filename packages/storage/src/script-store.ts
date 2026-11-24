@@ -312,6 +312,17 @@ export class SqliteScriptStore implements ScriptStore {
       .map((row) => row.id);
   }
 
+  listInDoubtWithActiveRun(): readonly ScriptRunId[] {
+    return this.database.db
+      .query<{ id: string }, []>(
+        `SELECT s.id FROM script_runs s JOIN runs r ON r.id = s.run_id
+         WHERE s.status = 'in_doubt' AND r.status IN ('queued', 'running', 'waiting_approval')
+         ORDER BY s.created_at, s.occurrence, s.id`,
+      )
+      .all()
+      .map((row) => row.id);
+  }
+
   #execution(db: SqliteDatabase["db"], id: string): ScriptExecution {
     const row = db.query<ExecutionRow, [string]>("SELECT * FROM script_runs WHERE id = ?").get(id);
     if (!row) {

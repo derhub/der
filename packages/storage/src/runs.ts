@@ -57,7 +57,12 @@ export interface FinishRunInput {
   readonly engineSession?: EngineSessionInput;
 }
 
+/**
+ * The first finish of an active Run writes its status and terminal chunk together and wins. A later
+ * finish writes nothing and loses: `run` and `terminalEvent` are then the stored ones.
+ */
 export interface FinishRunOutcome {
+  readonly won: boolean;
   readonly run: Run;
   readonly terminalEvent: RunEvent;
   readonly finalMessage?: Message;
@@ -472,6 +477,8 @@ export function readRunEventsAfter(
   return rows.map(mapRunEventRow);
 }
 
+const ACTIVE_RUN_STATUSES = new Set<string>(["queued", "running", "waiting_approval"]);
+
 export async function finishRun(
   database: SqliteDatabase,
   input: FinishRunInput,
@@ -488,6 +495,23 @@ export async function finishRun(
         `Run ${input.runId} does not exist.`,
         instance,
       );
+    }
+
+    if (!ACTIVE_RUN_STATUSES.has(runRow.status)) {
+      const storedTerminal = db
+        .query<RunEventRow, [string]>(
+          "SELECT * FROM run_events WHERE run_id = ? AND is_terminal = 1 ORDER BY sequence LIMIT 1",
+        )
+        .get(input.runId);
+      if (!storedTerminal) {
+        throw new Error(`Run ${input.runId} ended without a terminal event`);
+      }
+      return {
+        won: false,
+        run: mapRunRow(runRow),
+        terminalEvent: mapRunEventRow(storedTerminal),
+        outboxEvents: [],
+      };
     }
 
     const existingTerminal = db
@@ -672,6 +696,7 @@ export async function finishRun(
     }
 
     return {
+      won: true,
       run: mapRunRow(updatedRun),
       terminalEvent,
       ...(finalMessage !== undefined ? { finalMessage } : {}),

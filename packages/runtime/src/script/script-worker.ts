@@ -74,6 +74,8 @@ const WASM_OVERHEAD_BYTES = 32 * 1024 * 1024;
 const OUT_OF_MEMORY = "InternalError: out of memory";
 const WASM_OUT_OF_BOUNDS = "RuntimeError: Out of bounds memory access";
 const STOP_REQUESTED = 1;
+/** Charged per log entry on top of its text: its JSON quotes and comma, so empty entries still count. */
+const LOG_ENTRY_BYTES = 3;
 
 // The engine renders local time through the worker's Date; pinning it to UTC keeps a Script's
 // date strings independent of the host timezone.
@@ -224,7 +226,7 @@ async function startSession(init: SessionInit): Promise<void> {
       return;
     }
     const line = vm.getString(text);
-    logBytes += encoder.encode(line).byteLength;
+    logBytes += LOG_ENTRY_BYTES + encoder.encode(line).byteLength;
     if (init.outputBytes !== undefined && logBytes > init.outputBytes) {
       outputFull = true;
       return;

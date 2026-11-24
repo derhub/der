@@ -541,6 +541,153 @@ describe("recover Scripts from SQLite", () => {
     }
   });
 
+  it.each([
+    {
+      case: "a removed capability",
+      second: "notes.removed",
+      limits: {},
+      message:
+        "the Script did not repeat itself: step 2 (notes.removed) was recorded but the capability no longer exists. Already applied: none confirmed. Unknown outcome: #1 notes.append.",
+      kind: "nondeterministic",
+    },
+    {
+      case: "the step limit",
+      second: "notes.read",
+      limits: { maxSteps: 1 },
+      message:
+        "step limit of 1 exceeded. Already applied: none confirmed. Unknown outcome: #1 notes.append.",
+      kind: "limit",
+    },
+  ] as const)(
+    "ends in doubt and interrupts the Run when a re-run stops on $case after a write that started",
+    async (testCase) => {
+      const fixture = await openScriptFixture();
+      const first = fixture.openDriver();
+      const write = { text: "x" };
+      const read = { key: "x" };
+      const { id } = first.acquire(`
+        return await step.all([
+          step.run("notes.append", ${JSON.stringify(write)}),
+          step.run(${JSON.stringify(testCase.second)}, ${JSON.stringify(read)}),
+        ]);
+      `);
+      first.scripts.registerSteps(id, [
+        {
+          position: 1,
+          capability: "notes.append",
+          effect: "write",
+          decision: "allow",
+          input: write,
+          inputHash: await fingerprintJson(write),
+        },
+        ...(testCase.second === "notes.removed"
+          ? [
+              {
+                position: 2,
+                capability: "notes.removed",
+                effect: "read" as const,
+                decision: "allow" as const,
+                input: read,
+                inputHash: await fingerprintJson(read),
+              },
+            ]
+          : []),
+      ]);
+      const effect = {
+        runId: fixture.run.id,
+        operationKind: "capability",
+        operationId: "notes.append",
+        canonicalArguments: write,
+        attemptId: `${id}:1`,
+      } as const;
+      await fixture.store.beginEffect(effect);
+      await first.driver.close();
+      fixture.store.close();
+
+      const reopened = fixture.open();
+      const second = fixture.openDriver(reopened, testCase.limits);
+      try {
+        const result = await second.driver.wait(id, new AbortController().signal);
+
+        expect({
+          execution: second.scripts.load(id).execution.status,
+          result,
+          effect: reopened.getEffect(effect)?.status,
+          run: reopened.getRun(fixture.run.id)?.status,
+          appended: fixture.host.appended,
+        }).toEqual({
+          execution: "in_doubt",
+          result: {
+            ok: false,
+            error: { kind: testCase.kind, message: testCase.message },
+            logs: [],
+          },
+          effect: "unknown",
+          run: "interrupted",
+          appended: [],
+        });
+      } finally {
+        await second.driver.close();
+        reopened.close();
+        fixture.database.cleanup();
+      }
+    },
+  );
+
+  it("interrupts at startup the active Run of an execution that ended in doubt", async () => {
+    const fixture = await openScriptFixture();
+    const first = fixture.openDriver();
+    const input = { text: "x" };
+    const { id } = first.acquire('return await step.run("notes.append", { text: "x" });');
+    first.scripts.registerSteps(id, [
+      {
+        position: 1,
+        capability: "notes.append",
+        effect: "write",
+        decision: "allow",
+        input,
+        inputHash: await fingerprintJson(input),
+      },
+    ]);
+    const { effect } = await fixture.store.beginEffect({
+      runId: fixture.run.id,
+      operationKind: "capability",
+      operationId: "notes.append",
+      canonicalArguments: input,
+      attemptId: `${id}:1`,
+    });
+    await fixture.store.markEffectUnknown(effect.id);
+    const message = "Write 1 (notes.append) has an unknown outcome: process stopped";
+    first.scripts.completeStep(id, 1, {
+      status: "unknown",
+      error: { kind: "failed", message: "process stopped" },
+    });
+    first.scripts.finish(id, {
+      status: "in_doubt",
+      result: { ok: false, error: { kind: "capability", message }, logs: [] },
+    });
+    await first.driver.close();
+    fixture.store.close();
+
+    const reopened = fixture.open();
+    const second = fixture.openDriver(reopened);
+    try {
+      await second.driver.sweep();
+
+      expect({
+        run: reopened.getRun(fixture.run.id)?.status,
+        checkpoint: reopened.getRun(fixture.run.id)?.checkpoint,
+      }).toEqual({
+        run: "interrupted",
+        checkpoint: { interruptedEffectId: effect.id, recordedAt: "2026-11-24T01:00:00.000Z" },
+      });
+    } finally {
+      await second.driver.close();
+      reopened.close();
+      fixture.database.cleanup();
+    }
+  });
+
   it("keeps the registered Approval decision when the capability predicate changes on restart", async () => {
     const fixture = await openScriptFixture();
     let asks = true;
