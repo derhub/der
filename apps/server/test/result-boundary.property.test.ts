@@ -4,6 +4,7 @@ import * as z from "zod";
 import {
   CapabilityCatalog,
   defineCapability,
+  jsonValue,
   type Capability,
   type ExecuteResult,
   type JsonValue,
@@ -59,9 +60,11 @@ const failure = fc.record({
   logs,
 });
 
+const domainJsonValue = fc.jsonValue({ maxDepth: 3 }).map((value) => jsonValue.parse(value));
+
 const resultCase: fc.Arbitrary<Case> = fc.oneof(
   fc
-    .record({ value: fc.jsonValue({ maxDepth: 3 }), logs, truncated: fc.boolean() })
+    .record({ value: domainJsonValue, logs, truncated: fc.boolean() })
     .map(({ value, logs: lines, truncated }) => ({
       status: "completed" as const,
       result: { ok: true as const, result: value as JsonValue, logs: lines, truncated },
@@ -610,7 +613,7 @@ const inlineCase: fc.Arbitrary<InlineCase> = fc.oneof(
   fc.record({
     kind: fc.constant("value" as const),
     logs,
-    value: fc.oneof(fc.jsonValue({ maxDepth: 3 }), text).map((value) => value as JsonValue),
+    value: fc.oneof(domainJsonValue, text).map((value) => value as JsonValue),
   }),
   fc.record({ kind: fc.constant("throw" as const), logs, message: text }),
   fc.record({
@@ -815,4 +818,36 @@ describe("property: the bounded text execute returns inline", () => {
       { numRuns: 60 },
     );
   }, 120_000);
+
+  it("preserves NUL bytes in console logs returned inline (regression for seed -1043287295)", async () => {
+    session += 1;
+    const botId = server.seededFixture!.bot.id;
+    const sessionId = `inline-nul-${session}`;
+    server.store.createSession({ id: sessionId, botId, title: sessionId });
+    const { run } = await server.store.admit({
+      botId,
+      sessionId,
+      origin: "http",
+      idempotencyKey: sessionId,
+      input: { parts: [{ type: "text", text: "owner" }] },
+    });
+    const tool = createExecuteTool({
+      run,
+      scriptRunStore: server.scriptRunStore,
+      scriptDriver: server.scriptDriver,
+      maxResultBytes: MIN_RESULT_BYTES,
+      inlineWaitMs: 30_000,
+    });
+    const testCase: InlineCase = { kind: "throw", logs: ["\u0000", "a\u0000b"], message: "" };
+    const result = (await tool.execute!(
+      { script: scriptFor(testCase) },
+      { signal: AbortSignal.timeout(30_000) },
+    )) as ExecuteResult;
+    expect(result.ok).toBe(false);
+    expect(result.logs).toEqual(["\u0000", "a\u0000b"]);
+    expect({
+      withinLimit: bytes(JSON.stringify(result)) <= MIN_RESULT_BYTES,
+      outcome: inlineOutcomeOf(result, testCase, MIN_RESULT_BYTES),
+    }).toEqual({ withinLimit: true, outcome: expectedInline(testCase) });
+  });
 });

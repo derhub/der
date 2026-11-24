@@ -111,6 +111,15 @@ for (const unit of [
 UtcDate.prototype.getTimezoneOffset = () => 0;
 globalThis.Date = UtcDate as DateConstructor;
 
+function decodeJsonString(raw: string): string {
+  try {
+    const parsed: unknown = JSON.parse(raw);
+    return typeof parsed === "string" ? parsed : String(parsed);
+  } catch {
+    return raw;
+  }
+}
+
 function postSession(message: SessionOut): void {
   self.postMessage(JSON.stringify(message));
 }
@@ -205,7 +214,11 @@ async function startSession(init: SessionInit): Promise<void> {
     const deferred = vm.newPromise();
     const ordinal = vm.getNumber(position);
     pending.set(ordinal, deferred);
-    queue.push({ position: ordinal, id: vm.getString(id), input: vm.getString(input) });
+    queue.push({
+      position: ordinal,
+      id: decodeJsonString(vm.getString(id)),
+      input: vm.getString(input),
+    });
     return deferred.handle;
   });
   const end = vm.newFunction("end", (text) => {
@@ -219,13 +232,13 @@ async function startSession(init: SessionInit): Promise<void> {
     }
   });
   const fatalNative = vm.newFunction("fatal", (kind, message) => {
-    fatal ??= { kind: vm.getString(kind), message: vm.getString(message) };
+    fatal ??= { kind: vm.getString(kind), message: decodeJsonString(vm.getString(message)) };
   });
   const log = vm.newFunction("log", (text) => {
     if (outputFull) {
       return;
     }
-    const line = vm.getString(text);
+    const line = decodeJsonString(vm.getString(text));
     logBytes += LOG_ENTRY_BYTES + encoder.encode(line).byteLength;
     if (init.outputBytes !== undefined && logBytes > init.outputBytes) {
       outputFull = true;

@@ -260,6 +260,51 @@ describe("enforce Script sandbox safety", () => {
     );
   });
 
+  it("preserves NUL bytes inside console.log lines", async () => {
+    const result = await started(`console.log("\\u0000"); console.log("a\\u0000b"); return 1;`);
+    expect(result).toEqual({
+      returned: 1,
+      requests: [],
+      logs: ["\u0000", "a\u0000b"],
+      unobserved: [],
+    });
+  });
+
+  it("still yields string logs when Array.prototype.join is overridden", async () => {
+    const result = await started(
+      `Array.prototype.join = () => 123; console.log("a", "b"); return 1;`,
+    );
+    expect(result).toEqual({
+      returned: 1,
+      requests: [],
+      logs: ["123"],
+      unobserved: [],
+    });
+  });
+
+  it("falls back to a string placeholder instead of throwing when logging an unprintable value", async () => {
+    const result = await started(
+      `const x = Object.create(null); x.self = x; console.log(x); return 1;`,
+    );
+    expect(result).toEqual({
+      returned: 1,
+      requests: [],
+      logs: ["[unprintable]"],
+      unobserved: [],
+    });
+  });
+
+  it("never routes a capability id with a NUL byte to its prefix capability", async () => {
+    const called: string[] = [];
+    const handlers = new Map<string, () => void>([["sample", () => called.push("sample")]]);
+    const result = await started(`return await step.run("sample\\u0000end", {});`);
+    for (const req of result.requests) {
+      handlers.get(req.id)?.();
+    }
+    expect(result.requests).toEqual([{ position: 1, id: "sample\u0000end", input: {} }]);
+    expect(called).toEqual([]);
+  });
+
   it("refuses output that exceeds the worker reply budget", async () => {
     const result = await started(`console.log("x".repeat(4096)); return 1;`, { outputBytes: 512 });
     expect(result.error).toMatchObject({

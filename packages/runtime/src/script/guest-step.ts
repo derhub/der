@@ -8,6 +8,7 @@ export const GUEST_STEP = String.raw`(function (request, endScript, fatalNative,
   const NativePromise = Promise;
   const stringify = JSON.stringify;
   const parse = JSON.parse;
+  const toText = String;
   let ordinal = 0;
   let ended = false;
   const observed = new WeakSet();
@@ -39,7 +40,7 @@ export const GUEST_STEP = String.raw`(function (request, endScript, fatalNative,
   }
 
   function fatal(kind, message) {
-    fatalNative(kind, message);
+    fatalNative(kind, stringify(message));
     throw new Error(message);
   }
 
@@ -81,7 +82,7 @@ export const GUEST_STEP = String.raw`(function (request, endScript, fatalNative,
     check(value, "input", 0);
     const n = (ordinal += 1);
     const inputText = stringify(value);
-    const raw = request(n, id, inputText);
+    const raw = request(n, stringify(id), inputText);
     const p = new StepPromise((resolve, reject) => {
       raw.then((text) => {
         const reply = parse(text);
@@ -146,7 +147,28 @@ export const GUEST_STEP = String.raw`(function (request, endScript, fatalNative,
   }
 
   function installConsole() {
-    const write = (...args) => log(args.map((a) => { if (typeof a === "string") return a; try { const t = stringify(a); return t === undefined ? String(a) : t; } catch { return String(a); } }).join(" "));
+    const format = (a) => {
+      if (typeof a === "string") return a;
+      try {
+        const t = stringify(a);
+        return t === undefined ? toText(a) : t;
+      } catch {
+        try {
+          return toText(a);
+        } catch {
+          return "[unprintable]";
+        }
+      }
+    };
+    const write = (...args) => {
+      let line;
+      try {
+        line = toText(args.map(format).join(" "));
+      } catch {
+        line = "[unprintable]";
+      }
+      log(stringify(line));
+    };
     globalThis.console = { log: write, info: write, warn: write, error: write, debug: write };
   }
 
