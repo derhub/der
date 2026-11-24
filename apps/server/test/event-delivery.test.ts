@@ -30,6 +30,7 @@ function openStore(eventChainLimit?: number) {
     store,
     bots: store,
     admit: (request) => store.admit(request),
+    maxResultBytes: 65_536,
   });
   return { store, deliver };
 }

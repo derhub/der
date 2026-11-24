@@ -6,12 +6,14 @@ import {
   type ApprovalResolutionInput,
   type ChannelIntakeMetadata,
   type ExecuteResult,
+  type JsonValue,
   type RunId,
   type ScriptExecution,
   type StoredStep,
 } from "@der/domain";
 import { finalizeInterruptedUncertainStep } from "../workflows/run-steps";
 import {
+  approvalId,
   effectOf,
   executeScriptRun,
   RUN_ENDED,
@@ -73,8 +75,16 @@ export class ScriptDriver {
     return entry.promise;
   }
 
-  async wait(id: string, signal: AbortSignal): Promise<ExecuteResult> {
+  /** Waits for the terminal result; with `timeoutMs`, returns undefined when it has not arrived by then. */
+  wait(id: string, signal: AbortSignal): Promise<ExecuteResult>;
+  wait(id: string, signal: AbortSignal, timeoutMs: number): Promise<ExecuteResult | undefined>;
+  async wait(
+    id: string,
+    signal: AbortSignal,
+    timeoutMs?: number,
+  ): Promise<ExecuteResult | undefined> {
     this.#background(this.kick(id));
+    const until = timeoutMs === undefined ? Infinity : Date.now() + timeoutMs;
     for (;;) {
       signal.throwIfAborted();
       this.#closing.signal.throwIfAborted();
@@ -85,8 +95,29 @@ export class ScriptDriver {
         }
         return execution.result;
       }
+      if (Date.now() >= until) {
+        return undefined;
+      }
       await Bun.sleep(25);
     }
+  }
+
+  /** The asked writes of an execution whose Approval is still pending. */
+  async proposedWrites(
+    id: string,
+  ): Promise<{ position: number; capability: string; input: JsonValue }[]> {
+    const { steps } = this.deps.scripts.load(id);
+    const waiting = [];
+    for (const step of steps) {
+      if (step.effect !== "write" || step.decision !== "ask" || step.status !== "pending") {
+        continue;
+      }
+      const approval = await this.deps.store.getApproval(approvalId(id, step.position));
+      if (approval?.decision.status === "pending") {
+        waiting.push({ position: step.position, capability: step.capability, input: step.input });
+      }
+    }
+    return waiting;
   }
 
   async #interruptRun(
@@ -213,6 +244,10 @@ export class ScriptDriver {
     } finally {
       clearInterval(timer);
       scripts.releaseLease(id, this.#owner);
+    }
+    const { execution } = scripts.load(id);
+    if (execution.result !== null && execution.detachedAt !== null) {
+      await this.deps.deliverEvents?.();
     }
   }
 

@@ -92,9 +92,9 @@ export interface ScriptStore {
   completeStep(id: ScriptRunId, position: number, outcome: StepOutcome): void;
   /** Gives each undelivered position the next seq, all in one new batch; returns the marks of the requested positions. */
   markDelivered(id: ScriptRunId, positions: readonly number[]): readonly DeliveryMark[];
-  /** Sets the terminal status once; later calls leave the first status and result. */
+  /** Sets the terminal status once; later calls leave the first status and result. A detached execution gets its `script.finished` event in the same unit. */
   finish(id: ScriptRunId, end: ScriptEnd): FinishResult;
-  /** Returns true only on the call that set it. */
+  /** Returns true only on the call that set it, and only while the execution is unfinished. */
   detach(id: ScriptRunId): boolean;
   /** Succeeds when no other owner holds an unexpired lease. */
   takeLease(id: ScriptRunId, owner: string, until: UtcTimestamp): boolean;

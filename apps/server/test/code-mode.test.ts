@@ -63,12 +63,15 @@ async function startDirectServer(
   return { server, host };
 }
 
+const ATTENDED_WAIT_MS = 60_000;
+
 function executeToolFor(server: RunningServer, run: Run, maxResultBytes = RESULT_BYTES): AnyTool {
   return createExecuteTool({
     run,
     scriptRunStore: server.scriptRunStore,
     scriptDriver: server.scriptDriver,
     maxResultBytes,
+    inlineWaitMs: ATTENDED_WAIT_MS,
   });
 }
 
@@ -451,10 +454,8 @@ describe("describe the tools to the model", () => {
     const text = codeModeInstructions(host.catalog);
 
     expect(text).toContain("- notes: append, publish, read");
-    expect(text).toContain("`await` every call");
-    expect(text).toContain(
-      "- Modules and `import` are not available. `eval` and `Function` are unavailable. There are no timers.",
-    );
+    expect(text).toContain("Write `await` in front of every `step.run`");
+    expect(text).toContain("Modules, `import`, `eval`, `Function` and timers are not available.");
     expect(text).toContain("`Date`, `Math.random` and `performance.now` return recorded values");
   }, 60_000);
 });

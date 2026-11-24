@@ -1,15 +1,19 @@
 import type {
   BotStore,
+  ExecuteResult,
+  JsonValue,
   RunAdmission,
   RunRequest,
   SessionEvent,
   SessionEventStore,
 } from "@der/domain";
+import { fitResult } from "../code-mode/execute";
 
 export interface EventDeliveryDeps {
   readonly store: SessionEventStore;
   readonly bots: Pick<BotStore, "getBot">;
   readonly admit: (request: RunRequest) => Promise<RunAdmission>;
+  readonly maxResultBytes: number;
   readonly logError?: (error: unknown) => void;
 }
 
@@ -26,6 +30,21 @@ export function createEventDelivery(deps: EventDeliveryDeps): DeliverEvents {
     tail = tail.then(() => deliverPass(deps));
     return tail;
   };
+}
+
+/**
+ * The event Run's text: the payload as JSON. A finished Script's result is fitted to
+ * the size `execute` returns inline, so a long result cannot flood the Run.
+ */
+function eventText(payload: JsonValue, maxResultBytes: number): string {
+  if (typeof payload === "object" && payload !== null && !Array.isArray(payload)) {
+    const { result } = payload;
+    if (typeof result === "object" && result !== null && !Array.isArray(result)) {
+      const fitted = fitResult(result as unknown as ExecuteResult, maxResultBytes);
+      return JSON.stringify({ ...payload, result: fitted });
+    }
+  }
+  return JSON.stringify(payload);
 }
 
 async function deliverPass(deps: EventDeliveryDeps): Promise<void> {
@@ -61,7 +80,7 @@ async function deliverOne(deps: EventDeliveryDeps, event: SessionEvent): Promise
     sessionId: event.sessionId,
     origin: "event",
     idempotencyKey: event.id,
-    input: { parts: [{ type: "text", text: JSON.stringify(event.payload) }] },
+    input: { parts: [{ type: "text", text: eventText(event.payload, deps.maxResultBytes) }] },
   });
   store.markSessionEventDelivered(event.id, admission.run.id);
 }

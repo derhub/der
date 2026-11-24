@@ -228,5 +228,15 @@ export function scriptStoreContract(open: () => Promise<ScriptStoreHarness>): vo
         true,
       ]);
     });
+
+    it("refuses to detach an execution that already finished", async () => {
+      const { store, execution } = await start();
+      store.finish(execution.id, { status: "completed", result: done });
+
+      const detached = store.detach(execution.id);
+      const { execution: stored } = store.load(execution.id);
+
+      expect([detached, stored.detachedAt]).toEqual([false, null]);
+    });
   });
 }

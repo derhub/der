@@ -15,8 +15,10 @@ import {
   type StoredStep,
   type UtcTimestamp,
 } from "@der/domain";
+import { resumeRunAfterDecision } from "./approvals-effects";
 import type { SqliteDatabase } from "./database";
 import { notFoundError } from "./errors";
+import { enqueueSessionEvent } from "./session-events";
 
 interface ExecutionRow {
   readonly id: string;
@@ -239,22 +241,54 @@ export class SqliteScriptStore implements ScriptStore {
   finish(id: ScriptRunId, end: ScriptEnd): FinishResult {
     const now = formatUtcTimestamp(this.database.now());
     return this.database.inTransaction((db) => {
-      db.query(
-        `UPDATE script_runs SET status = ?, result_json = ?, updated_at = ?
-         WHERE id = ? AND status IN ${ACTIVE}`,
-      ).run(end.status, JSON.stringify(end.result), now, id);
+      const changed =
+        db
+          .query(
+            `UPDATE script_runs SET status = ?, result_json = ?, updated_at = ?
+             WHERE id = ? AND status IN ${ACTIVE}`,
+          )
+          .run(end.status, JSON.stringify(end.result), now, id).changes === 1;
       const execution = this.#execution(db, id);
-      return { execution, detached: execution.detachedAt !== null };
+      const detached = execution.detachedAt !== null;
+      if (changed && detached) {
+        const run = db
+          .query<{ session_id: string }, [string]>("SELECT session_id FROM runs WHERE id = ?")
+          .get(execution.runId);
+        enqueueSessionEvent(
+          db,
+          {
+            botId: execution.botId,
+            sessionId: run!.session_id,
+            kind: "script.finished",
+            payload: {
+              event: "script.finished",
+              executionId: id,
+              status: end.status,
+              result: end.result as unknown as JsonValue,
+            },
+          },
+          now,
+        );
+      }
+      return { execution, detached };
     });
   }
 
   detach(id: ScriptRunId): boolean {
     const now = formatUtcTimestamp(this.database.now());
-    return (
-      this.database.db
-        .query("UPDATE script_runs SET detached_at = ? WHERE id = ? AND detached_at IS NULL")
-        .run(now, id).changes === 1
-    );
+    return this.database.inTransaction((db) => {
+      const changed =
+        db
+          .query(
+            `UPDATE script_runs SET detached_at = ?
+             WHERE id = ? AND detached_at IS NULL AND status IN ${ACTIVE}`,
+          )
+          .run(now, id).changes === 1;
+      if (changed) {
+        resumeRunAfterDecision(db, this.#execution(db, id).runId, now);
+      }
+      return changed;
+    });
   }
 
   takeLease(id: ScriptRunId, owner: string, until: UtcTimestamp): boolean {

@@ -67,7 +67,7 @@ export function scriptApprovalOwner(awakeable: string): string | undefined {
   return awakeable.startsWith("script:") ? awakeable.slice("script:".length) : undefined;
 }
 
-function approvalId(id: string, position: number): string {
+export function approvalId(id: string, position: number): string {
   return `appr_${id}_${position}`;
 }
 
@@ -297,7 +297,14 @@ class ScriptPass {
   async #owningRun(): Promise<Run | undefined> {
     const run = await this.deps.store.getRun(this.head.runId);
     this.guard();
-    return run === undefined || RUN_ENDED.has(run.status) ? undefined : run;
+    if (run === undefined) {
+      return undefined;
+    }
+    return RUN_ENDED.has(run.status) && !this.#isDetached() ? undefined : run;
+  }
+
+  #isDetached(): boolean {
+    return this.deps.scripts.load(this.head.id).execution.detachedAt !== null;
   }
 
   #mismatch(detail: string): ScriptRefused {
@@ -526,7 +533,14 @@ class ScriptPass {
   async #announce(approval: Approval): Promise<void> {
     if (!this.#announced.has(approval.id)) {
       this.guard();
-      await this.deps.store.appendRunEvents(approval.runId, [approvalRequestedEvent(approval)]);
+      try {
+        await this.deps.store.appendRunEvents(approval.runId, [approvalRequestedEvent(approval)]);
+      } catch (error) {
+        const endedRun = error instanceof DomainError && error.code === "run.already_terminal";
+        if (!endedRun || !this.#isDetached()) {
+          throw error;
+        }
+      }
       this.#announced.add(approval.id);
     }
   }

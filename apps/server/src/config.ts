@@ -143,6 +143,7 @@ const serverConfigSchema = z
       ]),
     approvalTimeoutMs: z.number().int().positive().default(300_000),
     scriptSweepIntervalMs: z.number().int().positive().default(1000),
+    scriptInlineWaitMs: z.number().int().nonnegative().default(3000),
     scriptMaxAll: z.number().int().positive().default(1000),
     scriptMaxInFlight: z.number().int().positive().default(2000),
     scriptMaxSteps: z.number().int().positive().default(2000),
@@ -269,6 +270,10 @@ export function parseServerConfig(
   const scriptSweepIntervalMs = parseOptionalInt(
     env["DER_SCRIPT_SWEEP_INTERVAL_MS"],
     "DER_SCRIPT_SWEEP_INTERVAL_MS",
+  );
+  const scriptInlineWaitMs = parseOptionalInt(
+    env["DER_SCRIPT_INLINE_WAIT_MS"],
+    "DER_SCRIPT_INLINE_WAIT_MS",
   );
   const scriptMaxAll = parseOptionalInt(env["DER_SCRIPT_MAX_ALL"], "DER_SCRIPT_MAX_ALL");
   const scriptMaxInFlight = parseOptionalInt(
@@ -399,6 +404,7 @@ export function parseServerConfig(
     ...(allowedOrigins !== undefined ? { allowedOrigins } : {}),
     ...(approvalTimeoutMs !== undefined ? { approvalTimeoutMs } : {}),
     ...(scriptSweepIntervalMs !== undefined ? { scriptSweepIntervalMs } : {}),
+    ...(scriptInlineWaitMs !== undefined ? { scriptInlineWaitMs } : {}),
     ...(scriptMaxAll !== undefined ? { scriptMaxAll } : {}),
     ...(scriptMaxInFlight !== undefined ? { scriptMaxInFlight } : {}),
     ...(scriptMaxSteps !== undefined ? { scriptMaxSteps } : {}),

@@ -462,6 +462,7 @@ function createContextLoader(input: {
     readonly scriptRunStore: ScriptStore;
     readonly scriptDriver: ScriptDriver;
     readonly maxResultBytes: number;
+    readonly inlineWaitMs: number;
   };
 }): LoadEngineRunInput {
   return async (run: Run) => {
@@ -502,6 +503,7 @@ function createContextLoader(input: {
           scriptRunStore: codeMode.scriptRunStore,
           scriptDriver: codeMode.scriptDriver,
           maxResultBytes: codeMode.maxResultBytes,
+          inlineWaitMs: codeMode.inlineWaitMs,
         }),
       ],
       approvalBroker,
@@ -891,6 +893,7 @@ export async function startServer(options: CreateServerOptions = {}): Promise<Ru
       store,
       bots: store,
       admit: (request) => coordinator.admit(request),
+      maxResultBytes: config.scriptResultBytes,
       logError: (error) => console.error("Event delivery error", error),
     });
 
@@ -912,6 +915,7 @@ export async function startServer(options: CreateServerOptions = {}): Promise<Ru
         scriptRunStore,
         scriptDriver,
         maxResultBytes: config.scriptResultBytes,
+        inlineWaitMs: config.scriptInlineWaitMs,
       },
     });
 

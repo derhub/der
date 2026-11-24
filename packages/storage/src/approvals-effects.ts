@@ -142,8 +142,11 @@ export async function requestApproval(
     db.query(
       `UPDATE runs
        SET status = 'waiting_approval', updated_at = ?
-       WHERE id = ? AND status IN ('queued', 'running')`,
-    ).run(now, input.runId);
+       WHERE id = ? AND status IN ('queued', 'running')
+         AND NOT EXISTS (
+           SELECT 1 FROM script_runs s WHERE 'script:' || s.id = ? AND s.detached_at IS NOT NULL
+         )`,
+    ).run(now, input.runId, input.awakeable);
 
     const sessionBindings = db
       .query<ChannelBindingRow, [string, string]>(
@@ -233,11 +236,22 @@ export function listPendingScriptApprovalsPastDeadline(
     .map(mapApprovalRow);
 }
 
-function resumeRunAfterDecision(db: SqliteDatabase["db"], runId: RunId, at: UtcTimestamp): void {
+/** A Run waits only on Approvals of attended executions; a detached execution's Approvals do not hold it. */
+export function resumeRunAfterDecision(
+  db: SqliteDatabase["db"],
+  runId: RunId,
+  at: UtcTimestamp,
+): void {
   db.query(
     `UPDATE runs SET status = 'running', updated_at = ?
      WHERE id = ? AND status = 'waiting_approval'
-       AND NOT EXISTS (SELECT 1 FROM approvals WHERE run_id = runs.id AND status = 'pending')`,
+       AND NOT EXISTS (
+         SELECT 1 FROM approvals a
+         WHERE a.run_id = runs.id AND a.status = 'pending'
+           AND NOT EXISTS (
+             SELECT 1 FROM script_runs s WHERE 'script:' || s.id = a.awakeable AND s.detached_at IS NOT NULL
+           )
+       )`,
   ).run(at, runId);
 }
 
@@ -436,7 +450,14 @@ export async function beginEffect(
 
     if (options?.scriptExecutionId !== undefined) {
       const run = db.query<RunRow, [RunId]>("SELECT * FROM runs WHERE id = ?").get(valid.runId);
-      if (run === null || !["queued", "running", "waiting_approval"].includes(run.status)) {
+      const detached =
+        db
+          .query("SELECT 1 FROM script_runs WHERE id = ? AND detached_at IS NOT NULL")
+          .get(options.scriptExecutionId) !== null;
+      if (
+        run === null ||
+        (!detached && !["queued", "running", "waiting_approval"].includes(run.status))
+      ) {
         throw conflictError(
           "effect.run_ended",
           "Run has ended",
