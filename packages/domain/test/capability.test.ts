@@ -17,7 +17,7 @@ const appendNote = defineCapability({
   output: z.object({ id: z.string(), count: z.number() }),
   effect: "write",
   approval: "none",
-  example: 'await der.notes.append({ text: "buy milk" })',
+  example: 'await step.run("notes.append", { text: "buy milk" })',
   execute: async () => ({ id: "n1", count: 1 }),
 });
 
@@ -53,7 +53,7 @@ describe("render a capability declaration", () => {
         "  count: number;",
         "};",
         "/** Append a note to the journal. Use for short entries. */",
-        "declare function der.notes.append(input: NotesAppendInput): Promise<NotesAppendOutput>;",
+        'declare const step: { run(id: "notes.append", input: NotesAppendInput): Promise<NotesAppendOutput> };',
       ].join("\n"),
     );
   });
@@ -68,7 +68,7 @@ describe("render a capability declaration", () => {
         "};",
         "type WeatherReadOutput = unknown;",
         "/** Current temperature for a city. */",
-        "declare function der.weather.read(input: WeatherReadInput): Promise<WeatherReadOutput>;",
+        'declare const step: { run(id: "weather.read", input: WeatherReadInput): Promise<WeatherReadOutput> };',
       ].join("\n"),
     );
   });
@@ -84,7 +84,7 @@ describe("search the catalog", () => {
       {
         id: "notes.append",
         summary: "Append a note to the journal.",
-        example: 'await der.notes.append({ text: "buy milk" })',
+        example: 'await step.run("notes.append", { text: "buy milk" })',
       },
     ]);
   });
@@ -315,5 +315,28 @@ describe("define a capability", () => {
     expect(() => defineCapability({ ...readWeather, approval: "always" })).toThrow(
       'Capability "weather.read" is a read and cannot require approval; declare it as a write.',
     );
+  });
+});
+
+describe("validate capability input", () => {
+  it("uses the capability refinement without executing the capability", async () => {
+    let invocations = 0;
+    const registry = await registryWith(
+      defineCapability({
+        ...readWeather,
+        input: z.object({ city: z.string().refine((city) => city !== "Atlantis") }),
+        execute: async () => ++invocations,
+      }),
+    );
+    expect(registry.catalog.list()[0]?.inputSchema).toMatchObject({
+      properties: { city: { type: "string" } },
+    });
+    expect(() => registry.catalog.validateInput("weather.read", { city: "Atlantis" })).toThrow(
+      'Invalid input for capability "weather.read"',
+    );
+    expect(registry.catalog.validateInput("weather.read", { city: "Oslo" })).toEqual({
+      city: "Oslo",
+    });
+    expect(invocations).toBe(0);
   });
 });

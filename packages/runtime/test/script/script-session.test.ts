@@ -193,10 +193,7 @@ describe("run a Script as steps", () => {
   });
 
   it("tells a Script that calls der to use step.run", async () => {
-    const drain = await inSession(
-      `return await der.memory.read({});`,
-      (session) => session.started,
-    );
+    const drain = await inSession(`return der.memory.read({});`, (session) => session.started);
     expect(drain.error).toEqual({
       kind: "script",
       message: "der is not available: call a capability with await step.run(id, input)",

@@ -1,22 +1,19 @@
 import * as z from "zod";
-import type { ExecuteResult, JsonValue, Run } from "@der/domain";
-import { isTerminalScriptRunStatus, ScriptRunBusyError, type SqliteScriptRuns } from "@der/storage";
+import type { ExecuteResult, JsonValue, Run, ScriptStore } from "@der/domain";
 import type { AnyTool } from "@tanstack/ai";
-import type { ScriptRuns } from "../scripts/script-workflow";
+import type { ScriptDriver } from "../scripts/script-driver";
 
 const executeInput = z.strictObject({ script: z.string().min(1) });
 
 export interface ExecuteToolDeps {
   readonly run: Run;
-  readonly scriptRunStore: Pick<SqliteScriptRuns, "acquire" | "markDelivered">;
-  readonly scriptRuns: ScriptRuns;
+  readonly scriptRunStore: Pick<ScriptStore, "acquire">;
+  readonly scriptDriver: ScriptDriver;
   readonly maxResultBytes: number;
 }
 
 const encoder = new TextEncoder();
 const decoder = new TextDecoder();
-const ANOTHER_SCRIPT_RUNNING =
-  "Another Script is still running in this run. Wait for it to finish, or send the same Script again to get its result.";
 const LOGS_TRUNCATED = "[logs truncated]";
 
 function failure(
@@ -67,26 +64,21 @@ export function fitResult(result: ExecuteResult, maxBytes: number): ExecuteResul
   };
 }
 
-async function runScript(deps: ExecuteToolDeps, script: string, signal: AbortSignal) {
-  const { scriptRun } = await deps.scriptRunStore.acquire({
+async function executeAndWait(deps: ExecuteToolDeps, script: string, signal: AbortSignal) {
+  const execution = deps.scriptRunStore.acquire({
     runId: deps.run.id,
     botId: deps.run.botId,
     source: script,
+    seed: crypto.getRandomValues(new Uint32Array(1))[0]!,
   });
-  let result = isTerminalScriptRunStatus(scriptRun.status) ? scriptRun.result : null;
-  if (result === null) {
-    await deps.scriptRuns.submit(scriptRun.id);
-    result = await deps.scriptRuns.attach(scriptRun.id, signal);
-  }
-  await deps.scriptRunStore.markDelivered(scriptRun.id);
-  return result;
+  return deps.scriptDriver.wait(execution.id, signal);
 }
 
 export function createExecuteTool(deps: ExecuteToolDeps): AnyTool {
   return {
     name: "execute",
     description:
-      "Run a JavaScript Script that calls capabilities as der.<namespace>.<name>(input). Blocks until the Script ends, including while an operator decides an approval. Never throws: check `ok` in the result. If this call is cut off, call it again with the identical script to pick the same run back up.",
+      "Run a JavaScript Script that calls capabilities as await step.run(id, input). Blocks until the Script ends, including while an operator decides an approval. Never throws: check `ok` in the result. If this call is cut off, call it again with the identical script to reattach if its execution is still unfinished.",
     inputSchema: {
       type: "object",
       properties: {
@@ -109,15 +101,15 @@ export function createExecuteTool(deps: ExecuteToolDeps): AnyTool {
       }
       const signal = context?.signal ?? new AbortController().signal;
       try {
-        return fitResult(await runScript(deps, parsed.data.script, signal), deps.maxResultBytes);
+        return fitResult(
+          await executeAndWait(deps, parsed.data.script, signal),
+          deps.maxResultBytes,
+        );
       } catch (error) {
-        if (error instanceof ScriptRunBusyError) {
-          return failure("capability", ANOTHER_SCRIPT_RUNNING);
-        }
         if (signal.aborted) {
           return failure(
             "cancelled",
-            "execute was aborted before the script finished; call execute with the same script to pick the run back up",
+            "execute was aborted before the script finished; call execute with the same script to reattach if its execution is still unfinished",
           );
         }
         return failure("capability", `execute failed: ${errorMessage(error)}`);

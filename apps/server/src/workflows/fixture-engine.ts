@@ -123,7 +123,7 @@ export function createFixtureEngine(
       }
 
       const toolCallId = `${run.id}:execute`;
-      const script = `return await der.${operationId}(${JSON.stringify({ target, mode })});`;
+      const script = `return await step.run(${JSON.stringify(operationId)}, ${JSON.stringify({ target, mode })});`;
       yield {
         type: "chunk",
         chunkKey: `${toolCallId}:start`,

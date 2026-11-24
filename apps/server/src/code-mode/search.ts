@@ -35,7 +35,7 @@ export function createSearchTool(deps: SearchToolDeps): AnyTool {
   return {
     name: "search",
     description:
-      "Find capabilities by query. Returns TypeScript declarations and one-line examples for the capabilities that match, ready to call from `execute` as der.<namespace>.<name>(input).",
+      "Find capabilities by query. Returns TypeScript declarations and one-line examples for the capabilities that match, ready to call from `execute` as await step.run(id, input).",
     inputSchema: {
       type: "object",
       properties: {
@@ -68,7 +68,7 @@ export function createCatalogSearchCapability(catalog: Catalog, maxResultBytes: 
     output: z.object({ hits: z.array(hit), truncated: z.boolean() }),
     effect: "read",
     approval: "none",
-    example: 'await der.catalog.search("append note")',
+    example: 'await step.run("catalog.search", "append note")',
     async execute(query) {
       return fitHits(catalog.search(query), maxResultBytes);
     },

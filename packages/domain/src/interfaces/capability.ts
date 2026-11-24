@@ -32,6 +32,7 @@ export interface Capability<
 export interface Catalog {
   list(): CapabilityDescriptor[];
   search(query: string, limit?: number): CapabilitySearchHit[];
+  validateInput(id: string, input: JsonValue): unknown;
   requiresApproval(id: string, input: JsonValue): boolean;
   invoke(id: string, input: JsonValue, ctx: CapabilityContext): Promise<JsonValue>;
 }
@@ -189,7 +190,7 @@ export function renderDeclaration(capability: Capability): string {
   return [
     `type ${inputName} = ${renderType(input, "")};`,
     `type ${outputName} = ${renderType(output, "")};`,
-    `${doc}declare function der.${capability.id}(input: ${inputName}): Promise<${outputName}>;`,
+    `${doc}declare const step: { run(id: "${capability.id}", input: ${inputName}): Promise<${outputName}> };`,
   ].join("\n");
 }
 
@@ -302,9 +303,8 @@ export class CapabilityCatalog implements Catalog {
     return parsed.success && capability.approval(parsed.data);
   }
 
-  async invoke(id: string, input: JsonValue, ctx: CapabilityContext): Promise<JsonValue> {
-    const capability = this.require(id);
-    const parsed = capability.input.safeParse(input);
+  validateInput(id: string, input: JsonValue): unknown {
+    const parsed = this.require(id).input.safeParse(input);
     if (!parsed.success) {
       throw new DomainError({
         type: "https://der.invalid/problems/invalid-capability-input",
@@ -315,7 +315,12 @@ export class CapabilityCatalog implements Catalog {
         code: "capability.invalid_input",
       });
     }
-    const result = await capability.execute(parsed.data, ctx);
+    return parsed.data;
+  }
+
+  async invoke(id: string, input: JsonValue, ctx: CapabilityContext): Promise<JsonValue> {
+    const capability = this.require(id);
+    const result = await capability.execute(this.validateInput(id, input), ctx);
     return capability.output.parse(result) as JsonValue;
   }
 }

@@ -16,7 +16,7 @@ export function skillCapabilities(skills: SkillCatalog) {
       }),
       effect: "read",
       approval: "none",
-      example: "await der.skills.list({})",
+      example: 'await step.run("skills.list", {})',
       async execute() {
         const catalog = await skills.loadCatalog();
         return { skills: [...catalog.skills], rejected: [...catalog.rejected] };
@@ -29,7 +29,7 @@ export function skillCapabilities(skills: SkillCatalog) {
       output: z.object({ skill, body: z.string() }),
       effect: "read",
       approval: "none",
-      example: 'await der.skills.read({ skillId: "ops-brief" })',
+      example: 'await step.run("skills.read", { skillId: "ops-brief" })',
       async execute(input) {
         const listed = await skills.listSkills();
         const metadata = listed.find((entry) => entry.id === input.skillId);

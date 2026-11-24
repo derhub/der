@@ -8,7 +8,7 @@ export function sandboxCapability(kind: "docker" | "wasmer", sandbox: Sandbox) {
     output: sandboxResult,
     effect: "write",
     approval: "always",
-    example: `await der.sandbox.${kind}({ command: "echo", args: ["hi"], timeoutMs: 5000, network: "none" })`,
+    example: `await step.run("sandbox.${kind}", { command: "echo", args: ["hi"], timeoutMs: 5000, network: "none" })`,
     execute: (input) => sandbox.execute(input),
   });
 }

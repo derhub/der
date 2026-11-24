@@ -54,6 +54,8 @@ import {
   getApproval as getApprovalQuery,
   findWriteInDoubt as findWriteInDoubtQuery,
   getEffect as getEffectQuery,
+  listPendingApprovalsForRun,
+  listPendingScriptApprovalsPastDeadline,
   getLatestApprovalForRun as getLatestApprovalForRunQuery,
   markEffectUnknown as markEffectUnknownCommand,
   requestApproval as requestApprovalCommand,
@@ -475,6 +477,14 @@ export class SqliteStore
     return getLatestApprovalForRunQuery(this.database, runId);
   }
 
+  listPendingApprovalsForRun(runId: RunId): readonly Approval[] {
+    return listPendingApprovalsForRun(this.database, runId);
+  }
+
+  listPendingScriptApprovalsPastDeadline(at: UtcTimestamp): readonly Approval[] {
+    return listPendingScriptApprovalsPastDeadline(this.database, at);
+  }
+
   decide(
     decision: ApprovalResolutionInput,
     channelIntake?: ChannelIntakeMetadata,
@@ -484,7 +494,7 @@ export class SqliteStore
 
   beginEffect(
     identity: EffectIdentity,
-    options?: { readonly approvalId?: ApprovalId },
+    options?: { readonly approvalId?: ApprovalId; readonly scriptExecutionId?: string },
   ): Promise<BeginEffectOutcome> {
     return beginEffectCommand(this.database, identity, options);
   }

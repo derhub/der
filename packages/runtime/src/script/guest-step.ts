@@ -14,14 +14,17 @@ export const GUEST_STEP = String.raw`(function (request, endScript, fatalNative,
   const brand = new WeakSet();
   const meta = new WeakMap();
   const floating = new Map();
+  const stepErrors = new WeakMap();
 
   class StepError extends Error {
-    constructor(n, capability, e) {
+    constructor(n, capability, input, e) {
       super(e.message);
       this.name = "StepError";
       this.kind = e.kind;
       this.step = n;
       this.capability = capability;
+      this.input = input;
+      stepErrors.set(this, { message: e.message, kind: e.kind, step: n, capability });
     }
   }
 
@@ -77,12 +80,13 @@ export const GUEST_STEP = String.raw`(function (request, endScript, fatalNative,
     const value = input === undefined ? {} : input;
     check(value, "input", 0);
     const n = (ordinal += 1);
-    const raw = request(n, id, stringify(value));
+    const inputText = stringify(value);
+    const raw = request(n, id, inputText);
     const p = new StepPromise((resolve, reject) => {
       raw.then((text) => {
         const reply = parse(text);
         if (reply.ok) return resolve(reply.value);
-        const error = new StepError(n, id, reply.error);
+        const error = new StepError(n, id, parse(inputText), reply.error);
         if (!observed.has(p)) floating.set(n, error);
         reject(error);
       });
@@ -159,7 +163,7 @@ export const GUEST_STEP = String.raw`(function (request, endScript, fatalNative,
   }
 
   const failure = (e) => {
-    if (e instanceof StepError) return { message: e.message, kind: e.kind, step: e.step, capability: e.capability };
+    if (stepErrors.has(e)) return stepErrors.get(e);
     if (e instanceof ReferenceError && /\bder\b/.test(e.message)) {
       return { message: "der is not available: call a capability with await step.run(id, input)", kind: "script" };
     }
@@ -184,5 +188,5 @@ export const GUEST_STEP = String.raw`(function (request, endScript, fatalNative,
   installReplayedClockAndRandom();
   installConsole();
   main();
-  return () => stringify([...floating.entries()].map(([n, e]) => ({ n, kind: e.kind, message: e.message })));
+  return () => stringify([...floating.entries()].map(([n, e]) => ({ n, ...stepErrors.get(e) })));
 })`;

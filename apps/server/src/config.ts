@@ -142,7 +142,10 @@ const serverConfigSchema = z
         "http://localhost:5173",
       ]),
     approvalTimeoutMs: z.number().int().positive().default(300_000),
-    scriptMaxCalls: z.number().int().positive().default(100),
+    scriptSweepIntervalMs: z.number().int().positive().default(1000),
+    scriptMaxAll: z.number().int().positive().default(1000),
+    scriptMaxInFlight: z.number().int().positive().default(2000),
+    scriptMaxSteps: z.number().int().positive().default(2000),
     scriptActiveMs: z.number().int().positive().default(30_000),
     scriptMemoryBytes: z.number().int().positive().default(268_435_456),
     scriptOutputBytes: z.number().int().positive().default(1_048_576),
@@ -263,7 +266,16 @@ export function parseServerConfig(
     env["DER_APPROVAL_TIMEOUT_MS"],
     "DER_APPROVAL_TIMEOUT_MS",
   );
-  const scriptMaxCalls = parseOptionalInt(env["DER_SCRIPT_MAX_CALLS"], "DER_SCRIPT_MAX_CALLS");
+  const scriptSweepIntervalMs = parseOptionalInt(
+    env["DER_SCRIPT_SWEEP_INTERVAL_MS"],
+    "DER_SCRIPT_SWEEP_INTERVAL_MS",
+  );
+  const scriptMaxAll = parseOptionalInt(env["DER_SCRIPT_MAX_ALL"], "DER_SCRIPT_MAX_ALL");
+  const scriptMaxInFlight = parseOptionalInt(
+    env["DER_SCRIPT_MAX_IN_FLIGHT"],
+    "DER_SCRIPT_MAX_IN_FLIGHT",
+  );
+  const scriptMaxSteps = parseOptionalInt(env["DER_SCRIPT_MAX_STEPS"], "DER_SCRIPT_MAX_STEPS");
   const scriptActiveMs = parseOptionalInt(env["DER_SCRIPT_ACTIVE_MS"], "DER_SCRIPT_ACTIVE_MS");
   const scriptMemoryBytes = parseOptionalInt(
     env["DER_SCRIPT_MEMORY_BYTES"],
@@ -386,7 +398,10 @@ export function parseServerConfig(
     ...(engineCompactTokens !== undefined ? { engineCompactTokens } : {}),
     ...(allowedOrigins !== undefined ? { allowedOrigins } : {}),
     ...(approvalTimeoutMs !== undefined ? { approvalTimeoutMs } : {}),
-    ...(scriptMaxCalls !== undefined ? { scriptMaxCalls } : {}),
+    ...(scriptSweepIntervalMs !== undefined ? { scriptSweepIntervalMs } : {}),
+    ...(scriptMaxAll !== undefined ? { scriptMaxAll } : {}),
+    ...(scriptMaxInFlight !== undefined ? { scriptMaxInFlight } : {}),
+    ...(scriptMaxSteps !== undefined ? { scriptMaxSteps } : {}),
     ...(scriptActiveMs !== undefined ? { scriptActiveMs } : {}),
     ...(scriptMemoryBytes !== undefined ? { scriptMemoryBytes } : {}),
     ...(scriptOutputBytes !== undefined ? { scriptOutputBytes } : {}),

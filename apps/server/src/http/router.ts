@@ -1,3 +1,4 @@
+import type { ScriptDriver } from "../scripts/script-driver";
 import { Hono } from "hono";
 import * as z from "zod";
 import {
@@ -118,6 +119,7 @@ export interface HttpRoutinePort extends Pick<RoutineStore, "getRoutine"> {
 export type HttpSkillPort = Pick<SkillCatalog, "loadCatalog" | "listSkills" | "readSkillBody">;
 
 export interface HttpRouterDeps {
+  readonly scriptDriver?: ScriptDriver;
   readonly bots: BotStore;
   readonly sessions: SessionStore;
   readonly runs: RunStore;
@@ -652,13 +654,17 @@ function createRunRoutes(deps: {
       });
     }
     const approval = (await deps.approvals.getLatestApprovalForRun(runId)) ?? null;
-    return jsonResponse({ run, approval });
+    const approvals =
+      (await deps.approvals.listPendingApprovalsForRun?.(runId)) ??
+      (approval?.decision.status === "pending" ? [approval] : []);
+    return jsonResponse({ run, approval, approvals });
   });
 
   return routes;
 }
 
 function createApprovalRoutes(deps: {
+  readonly scriptDriver: ScriptDriver | undefined;
   readonly workflow: DurableWorkflow;
   readonly now: () => Date;
 }): Hono {
@@ -681,18 +687,19 @@ function createApprovalRoutes(deps: {
     }
 
     const decidedAt = formatUtcTimestamp(deps.now());
-    const approval = await deps.workflow.decide(
-      {
-        approvalId,
-        botId: parsedBody.data.botId,
-        sessionId: parsedBody.data.sessionId,
-        runId: parsedBody.data.runId,
-        status: parsedBody.data.status,
-        actor: parsedBody.data.actor,
-        decidedAt,
-      },
-      parsedBody.data.channelIntake,
-    );
+    const decision = {
+      approvalId,
+      botId: parsedBody.data.botId,
+      sessionId: parsedBody.data.sessionId,
+      runId: parsedBody.data.runId,
+      status: parsedBody.data.status,
+      actor: parsedBody.data.actor,
+      decidedAt,
+    };
+    const channelIntake = parsedBody.data.channelIntake;
+    const approval =
+      (await deps.scriptDriver?.decide(decision, channelIntake)) ??
+      (await deps.workflow.decide(decision, channelIntake));
 
     return jsonResponse({ approval });
   });
@@ -731,7 +738,10 @@ export function createHttpApp(deps: HttpRouterDeps): Hono {
       config: deps.config,
     }),
   );
-  app.route("/", createApprovalRoutes({ workflow: deps.workflow, now }));
+  app.route(
+    "/",
+    createApprovalRoutes({ workflow: deps.workflow, scriptDriver: deps.scriptDriver, now }),
+  );
 
   app.notFound(async (c) => {
     const url = new URL(c.req.url);

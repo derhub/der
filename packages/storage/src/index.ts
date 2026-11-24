@@ -12,16 +12,6 @@ export {
   type StorageMigration,
 } from "./migrations";
 export {
-  digestScriptSource,
-  isTerminalScriptRunStatus,
-  openSqliteScriptRuns,
-  ScriptRunBusyError,
-  SqliteScriptRuns,
-  type AcquireScriptRunInput,
-  type AcquireScriptRunOutcome,
-  type SqliteScriptRunsOptions,
-} from "./script-runs";
-export {
   openSqliteScriptStore,
   SqliteScriptStore,
   type SqliteScriptStoreOptions,

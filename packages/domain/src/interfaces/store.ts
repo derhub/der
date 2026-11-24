@@ -137,11 +137,12 @@ export interface ApprovalEffectStore {
   ): Promise<Approval>;
   beginEffect(
     identity: EffectIdentity,
-    options?: { readonly approvalId?: ApprovalId },
+    options?: { readonly approvalId?: ApprovalId; readonly scriptExecutionId?: string },
   ): Promise<BeginEffectOutcome>;
   completeEffect(effectId: EffectId, outcome: JsonValue): Promise<EffectRecord>;
   markEffectUnknown(effectId: EffectId): Promise<EffectRecord>;
   getEffect(identity: EffectIdentity): MaybePromise<EffectRecord | undefined>;
+  listPendingApprovalsForRun?(runId: RunId): MaybePromise<readonly Approval[]>;
   findWriteInDoubt(runId: RunId): MaybePromise<EffectRecord | undefined>;
 }
 

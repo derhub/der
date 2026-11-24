@@ -30,9 +30,15 @@ function createSseResponse(frames: readonly string[]): Response {
   });
 }
 
-function createFakeServerFetch(options: { readonly scriptRoutine?: boolean } = {}) {
+function createFakeServerFetch(
+  options: { readonly scriptRoutine?: boolean; readonly multipleApprovals?: boolean } = {},
+) {
   const routineTarget = options.scriptRoutine
-    ? { engine: "script", prompt: null, script: "return await der.notes.read({ key: 'a' });" }
+    ? {
+        engine: "script",
+        prompt: null,
+        script: "return await step.run('notes.read', { key: 'a' });",
+      }
     : { engine: "fixture", prompt: "direct: hourly ok", script: null };
   const admittedKeys: string[] = [];
   const approvalDecisions: Array<{ approvalId: string; body: Record<string, unknown> }> = [];
@@ -254,6 +260,36 @@ function createFakeServerFetch(options: { readonly scriptRoutine?: boolean } = {
     }
 
     if (method === "GET" && url.pathname === "/api/runs/run-1") {
+      const approval = {
+        id: "apr-1",
+        botId: "bot-fixture",
+        sessionId: "sess-fixture",
+        runId: "run-1",
+        effect: {
+          runId: "run-1",
+          operationKind: "capability",
+          operationId: "fixture.apply",
+          canonicalArguments: { target: "lamp-1", mode: "apply" },
+          attemptId: "attempt-1",
+        },
+        prompt: "Approve fixture.apply for lamp-1?",
+        awakeable: "awk-1",
+        deadline: "2026-01-01T00:05:00.000Z",
+        decision:
+          approvalStatus === "pending"
+            ? {
+                status: "pending",
+                awakeable: "awk-1",
+                deadline: "2026-01-01T00:05:00.000Z",
+              }
+            : {
+                status: approvalStatus,
+                actor: "operator",
+                decidedAt: "2026-01-01T00:00:03.000Z",
+              },
+        createdAt: "2026-01-01T00:00:01.000Z",
+        updatedAt: "2026-01-01T00:00:02.000Z",
+      };
       return Response.json({
         run: {
           id: "run-1",
@@ -268,36 +304,23 @@ function createFakeServerFetch(options: { readonly scriptRoutine?: boolean } = {
           updatedAt: "2026-01-01T00:00:02.000Z",
           finishedAt: approvalStatus === "pending" ? null : "2026-01-01T00:00:03.000Z",
         },
-        approval: {
-          id: "apr-1",
-          botId: "bot-fixture",
-          sessionId: "sess-fixture",
-          runId: "run-1",
-          effect: {
-            runId: "run-1",
-            operationKind: "capability",
-            operationId: "fixture.apply",
-            canonicalArguments: { target: "lamp-1", mode: "apply" },
-            attemptId: "attempt-1",
-          },
-          prompt: "Approve fixture.apply for lamp-1?",
-          awakeable: "awk-1",
-          deadline: "2026-01-01T00:05:00.000Z",
-          decision:
-            approvalStatus === "pending"
-              ? {
-                  status: "pending",
-                  awakeable: "awk-1",
-                  deadline: "2026-01-01T00:05:00.000Z",
-                }
-              : {
-                  status: approvalStatus,
-                  actor: "operator",
-                  decidedAt: "2026-01-01T00:00:03.000Z",
+        approval,
+        approvals:
+          approvalStatus === "pending" && options.multipleApprovals
+            ? [
+                approval,
+                {
+                  ...approval,
+                  id: "apr-2",
+                  prompt: "Approve fixture.apply for lamp-2?",
+                  effect: {
+                    ...approval.effect,
+                    canonicalArguments: { target: "lamp-2", mode: "apply" },
+                    attemptId: "attempt-2",
+                  },
                 },
-          createdAt: "2026-01-01T00:00:01.000Z",
-          updatedAt: "2026-01-01T00:00:02.000Z",
-        },
+              ]
+            : [],
       });
     }
 
@@ -476,6 +499,25 @@ function createFakeServerFetch(options: { readonly scriptRoutine?: boolean } = {
 }
 
 describe("operate der through the Web operator console", () => {
+  it("renders the exact arguments for both pending Approvals of the active Run", async () => {
+    const user = userEvent.setup();
+    const server = createFakeServerFetch({ multipleApprovals: true });
+    render(<App fetcher={server.fetcher} />);
+
+    await user.type(
+      await screen.findByPlaceholderText("Send an instruction to Fixture Bot..."),
+      "lamp-1",
+    );
+    await user.click(screen.getByRole("button", { name: "Send" }));
+    await user.click(await screen.findByRole("button", { name: "Retry with same key" }));
+
+    const first = await screen.findByText("Approve fixture.apply for lamp-1?");
+    const second = await screen.findByText("Approve fixture.apply for lamp-2?");
+    expect(first.closest("[data-approval-id]")?.textContent).toContain('"target": "lamp-1"');
+    expect(second.closest("[data-approval-id]")?.textContent).toContain('"target": "lamp-2"');
+    expect(screen.getAllByRole("button", { name: "Approve effect" })).toHaveLength(2);
+  });
+
   it("retries failed run submission with the same Idempotency-Key, streams native chunks, and approves an exact effect", async () => {
     const user = userEvent.setup();
     const server = createFakeServerFetch();
@@ -530,7 +572,7 @@ describe("operate der through the Web operator console", () => {
     await screen.findByText("Fixture session ready.");
     await user.click(screen.getByRole("tab", { name: "Routines" }));
 
-    await screen.findByText("return await der.notes.read({ key: 'a' });");
+    await screen.findByText("return await step.run('notes.read', { key: 'a' });");
     expect(screen.getByText("Script")).toBeTruthy();
   });
 
@@ -625,7 +667,7 @@ describe("operate der through the Web operator console", () => {
                   type: "tool-call",
                   toolCallId: "tc-2",
                   toolName: "execute",
-                  arguments: { script: 'return await der.notes.append("buy milk");' },
+                  arguments: { script: 'return await step.run("notes.append", "buy milk");' },
                 },
                 {
                   type: "tool-result",
@@ -683,7 +725,7 @@ describe("operate der through the Web operator console", () => {
     expect(screen.getByText("append note")).toBeTruthy();
     expect(screen.getByText("notes.append")).toBeTruthy();
     expect(screen.getByText("execute")).toBeTruthy();
-    expect(screen.getByText('return await der.notes.append("buy milk");')).toBeTruthy();
+    expect(screen.getByText('return await step.run("notes.append", "buy milk");')).toBeTruthy();
     expect(screen.getAllByText("denied: Operator denied notes.append.").length).toBeGreaterThan(0);
 
     await user.click(screen.getByRole("button", { name: "New session" }));

@@ -1,12 +1,12 @@
-import type { ExecuteResult, Run, RoutineStore } from "@der/domain";
-import { isTerminalScriptRunStatus, type SqliteScriptRuns } from "@der/storage";
-import type { ScriptRuns } from "../scripts/script-workflow";
+import type { ExecuteResult, Run, RoutineStore, ScriptStore } from "@der/domain";
+import { routineScriptId } from "../scripts/script-execution";
+import type { ScriptDriver } from "../scripts/script-driver";
 import type { RunStageResult, WorkflowDeps } from "./run-steps";
 
 export interface ScriptRoutineDeps {
   readonly routines: Pick<RoutineStore, "getRoutine">;
-  readonly scriptRunStore: Pick<SqliteScriptRuns, "acquire">;
-  readonly scriptRuns: ScriptRuns;
+  readonly scriptRunStore: Pick<ScriptStore, "acquire" | "load">;
+  readonly scriptDriver: ScriptDriver;
 }
 
 function failed(code: string, detail: string): RunStageResult {
@@ -25,11 +25,24 @@ export async function executeScriptRoutineStage(
   if (scripts === undefined) {
     return failed("script.not_configured", "Script routines are not configured on this server.");
   }
+  const current = (await deps.store.getRun(run.id)) ?? run;
+  const resumedId = routineScriptId(current);
   const routine =
-    run.routineId === null ? undefined : await scripts.routines.getRoutine(run.routineId);
-  if (routine?.engine !== "script") {
+    resumedId !== undefined || run.routineId === null
+      ? undefined
+      : await scripts.routines.getRoutine(run.routineId);
+  if (resumedId === undefined && routine?.engine !== "script") {
     return failed("script.routine_missing", `Run ${run.id} does not belong to a script routine.`);
   }
+  const execution =
+    resumedId !== undefined
+      ? scripts.scriptRunStore.load(resumedId).execution
+      : scripts.scriptRunStore.acquire({
+          runId: run.id,
+          botId: run.botId,
+          source: routine!.script!,
+          seed: crypto.getRandomValues(new Uint32Array(1))[0]!,
+        });
 
   const toolCallId = `${run.id}:execute`;
   const messageId = `msg_stream_${run.id}`;
@@ -47,22 +60,16 @@ export async function executeScriptRoutineStage(
       chunk: {
         type: "TOOL_CALL_ARGS",
         toolCallId,
-        delta: JSON.stringify({ script: routine.script }),
+        delta: JSON.stringify({ script: execution.source }),
       },
     },
     { chunkKey: `${toolCallId}:end`, chunk: { type: "TOOL_CALL_END", toolCallId } },
   ]);
 
-  const { scriptRun } = await scripts.scriptRunStore.acquire({
-    runId: run.id,
-    botId: run.botId,
-    source: routine.script,
-  });
-  let result = isTerminalScriptRunStatus(scriptRun.status) ? scriptRun.result : null;
-  if (result === null) {
-    await scripts.scriptRuns.submit(scriptRun.id);
-    result = await scripts.scriptRuns.attach(scriptRun.id, new AbortController().signal);
+  if (resumedId === undefined) {
+    await deps.store.markRunRunning(run.id, { scriptRunId: execution.id });
   }
+  const result = await scripts.scriptDriver.wait(execution.id, new AbortController().signal);
 
   if ((await deps.store.getRun(run.id))?.status === "interrupted") {
     return {

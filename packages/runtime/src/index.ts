@@ -1,5 +1,4 @@
 export {
-  runScript,
   ScriptRunnerError,
   startScript,
   type ScriptDrain,
@@ -10,12 +9,4 @@ export {
   type StepRequest,
   type StepResult,
   type UnobservedStep,
-  type RunScriptOptions,
-  type ScriptCallContext,
-  type ScriptCallHalt,
-  type ScriptCallReply,
-  type ScriptErrorKind,
-  type ScriptHostErrorKind,
-  type ScriptLimits,
-  type ScriptResult,
 } from "./script/script-runner";

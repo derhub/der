@@ -12,7 +12,6 @@ import {
 } from "@der/domain";
 import type { AnyTool } from "@tanstack/ai";
 import { createExecuteTool } from "#code-mode/execute";
-import type { ScriptRuns } from "#scripts/script-workflow";
 import { codeModeInstructions } from "#code-mode/instructions";
 import { createSearchTool } from "#code-mode/search";
 import { createFixtureCapabilities } from "#capabilities/fixture";
@@ -68,7 +67,7 @@ function executeToolFor(server: RunningServer, run: Run, maxResultBytes = RESULT
   return createExecuteTool({
     run,
     scriptRunStore: server.scriptRunStore,
-    scriptRuns: server.scriptRuns!,
+    scriptDriver: server.scriptDriver,
     maxResultBytes,
   });
 }
@@ -103,7 +102,7 @@ function decide(
   owner: { readonly run: Run; readonly botId: string; readonly sessionId: string },
   status: "approved" | "denied" | "expired",
 ) {
-  return server.coordinator.decide({
+  return server.commands.decideApproval({
     approvalId: approval.id,
     botId: owner.botId,
     sessionId: owner.sessionId,
@@ -126,7 +125,7 @@ const transfer = defineCapability({
   },
 }) as unknown as Capability;
 
-const PUBLISH = `return der.notes.publish({ text: "release" });`;
+const PUBLISH = `return await step.run("notes.publish", { text: "release" });`;
 
 describe("execute a gated script through the tool", () => {
   it("raises one approval, then returns the value with one effect once the approval is granted", async () => {
@@ -137,7 +136,30 @@ describe("execute a gated script through the tool", () => {
     const pending = callTool(execute, { script: PUBLISH });
     const approval = await awaitPendingApproval(server, owner.run.id);
     expect(host.published).toEqual([]);
-    await decide(server, approval, owner, "approved");
+    const detail = await fetch(`${server.url}/api/runs/${owner.run.id}`);
+    expect(await detail.json()).toMatchObject({
+      approvals: [
+        {
+          id: approval.id,
+          effect: {
+            operationId: "notes.publish",
+            canonicalArguments: { text: "release" },
+          },
+        },
+      ],
+    });
+    const decision = await fetch(`${server.url}/api/approvals/${approval.id}/decision`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        botId: owner.botId,
+        sessionId: owner.sessionId,
+        runId: owner.run.id,
+        status: "approved",
+        actor: "operator",
+      }),
+    });
+    expect(decision.status).toBe(200);
 
     expect(await pending).toEqual({
       ok: true,
@@ -157,7 +179,7 @@ describe("execute a gated script through the tool", () => {
     const execute = executeToolFor(server, owner.run);
 
     const result = await callTool(execute, {
-      script: `return der.bank.transfer({ amount: 5 });`,
+      script: `return await step.run("bank.transfer", { amount: 5 });`,
     });
 
     expect(result).toEqual({ ok: true, result: { moved: 5 }, logs: [], truncated: false });
@@ -169,7 +191,9 @@ describe("execute a gated script through the tool", () => {
     const owner = await admitOwningRun(server, "code-mode-approval-rule-large");
     const execute = executeToolFor(server, owner.run);
 
-    const pending = callTool(execute, { script: `return der.bank.transfer({ amount: 500 });` });
+    const pending = callTool(execute, {
+      script: `return await step.run("bank.transfer", { amount: 500 });`,
+    });
     const approval = await awaitPendingApproval(server, owner.run.id);
     await decide(server, approval, owner, "approved");
 
@@ -193,7 +217,7 @@ describe("pick a script back up after the tool call was cut", () => {
       error: {
         kind: "cancelled",
         message:
-          "execute was aborted before the script finished; call execute with the same script to pick the run back up",
+          "execute was aborted before the script finished; call execute with the same script to reattach if its execution is still unfinished",
       },
       logs: [],
     });
@@ -208,86 +232,29 @@ describe("pick a script back up after the tool call was cut", () => {
   }, 60_000);
 });
 
-describe("return a stored result without attaching", () => {
-  it("returns the stored result of a finished undelivered script run when attach is unavailable", async () => {
+describe("run multiple Scripts in one Run", () => {
+  it("runs a different Script while another waits on approval", async () => {
     const { server, host } = await startDirectServer();
-    const owner = await admitOwningRun(server, "code-mode-stored-result");
-    const attachDown = new Error("workflow retention elapsed");
-    const finishThenFail: ScriptRuns = {
-      submit: (id) => server.scriptRuns!.submit(id),
-      cancel: (id) => server.scriptRuns!.cancel(id),
-      attach: async (id, signal) => {
-        await server.scriptRuns!.attach(id, signal);
-        throw attachDown;
-      },
-    };
-    const neverAttach: ScriptRuns = {
-      ...finishThenFail,
-      attach: async () => {
-        throw attachDown;
-      },
-    };
-    const append = `return der.notes.append({ text: "tick" });`;
-    const tool = (scriptRuns: ScriptRuns) =>
-      createExecuteTool({
-        run: owner.run,
-        scriptRunStore: server.scriptRunStore,
-        scriptRuns,
-        maxResultBytes: RESULT_BYTES,
-      });
-
-    const first = await callTool(tool(finishThenFail), { script: append });
-    const second = await callTool(tool(neverAttach), { script: append });
-
-    expect(first).toEqual({
-      ok: false,
-      error: { kind: "capability", message: "execute failed: workflow retention elapsed" },
-      logs: [],
-    });
-    expect(second).toEqual({ ok: true, result: { count: 1 }, logs: [], truncated: false });
-    expect(host.appended).toEqual(["tick"]);
-    expect(scriptRunCount(server, owner.run.id)).toBe(1);
-  }, 60_000);
-});
-
-describe("run one script at a time in a run", () => {
-  it("one at a time: a different script sent while another waits on an approval is refused with advice, and the first still completes", async () => {
-    const { server, host } = await startDirectServer();
-    const owner = await admitOwningRun(server, "code-mode-one-at-a-time");
+    const owner = await admitOwningRun(server, "code-mode-concurrent");
     const execute = executeToolFor(server, owner.run);
     const first = callTool(execute, { script: PUBLISH });
     const approval = await awaitPendingApproval(server, owner.run.id);
 
-    const refused = await callTool(execute, {
-      script: `return der.notes.publish({ text: "other" });`,
-    });
-    const again = callTool(execute, { script: PUBLISH });
-    await decide(server, approval, owner, "approved");
+    expect(
+      await callTool(execute, { script: `return await step.run("notes.read", { key: "a" });` }),
+    ).toEqual({ ok: true, result: { value: "value-a" }, logs: [], truncated: false });
+    expect(host.published).toEqual([]);
 
-    expect(refused).toEqual({
-      ok: false,
-      error: {
-        kind: "capability",
-        message:
-          "Another Script is still running in this run. Wait for it to finish, or send the same Script again to get its result.",
-      },
-      logs: [],
-    });
+    await decide(server, approval, owner, "approved");
     expect(await first).toEqual({
       ok: true,
       result: { published: true },
       logs: [],
       truncated: false,
     });
-    expect(await again).toEqual({
-      ok: true,
-      result: { published: true },
-      logs: [],
-      truncated: false,
-    });
     expect(host.published).toEqual(["release"]);
-    expect(scriptRunCount(server, owner.run.id)).toBe(1);
-  }, 60_000);
+    expect(scriptRunCount(server, owner.run.id)).toBe(2);
+  });
 });
 
 describe("repeat a script on purpose", () => {
@@ -295,7 +262,7 @@ describe("repeat a script on purpose", () => {
     const { server, host } = await startDirectServer();
     const owner = await admitOwningRun(server, "code-mode-repeat");
     const execute = executeToolFor(server, owner.run);
-    const append = `return der.notes.append({ text: "tick" });`;
+    const append = `return await step.run("notes.append", { text: "tick" });`;
 
     const first = await callTool(execute, { script: append });
     const second = await callTool(execute, { script: append });
@@ -309,8 +276,8 @@ describe("repeat a script on purpose", () => {
 
 describe("report a refused approval", () => {
   it.each([
-    { status: "denied", message: "Approval for notes.publish was denied" },
-    { status: "expired", message: "Approval for notes.publish expired" },
+    { status: "denied", message: "approval for write 1 (notes.publish) was denied" },
+    { status: "expired", message: "approval for write 1 (notes.publish) was expired" },
   ] as const)(
     "returns ok false with kind $status and records no effect",
     async (testCase) => {
@@ -392,7 +359,7 @@ describe("cancel script runs at run end", () => {
       logs: [],
     });
     expect(server.store.getRun(run.id)?.status).toBe("completed");
-    expect(server.scriptRunStore.listUnfinished(run.id)).toEqual([]);
+    expect(server.store.listPendingApprovalsForRun(run.id)).toEqual([]);
     expect(server.store.getApproval(approval.id)?.decision.status).toBe("expired");
   }, 60_000);
 });
@@ -405,7 +372,7 @@ describe("search the catalog", () => {
     output: z.object({ archived: z.boolean() }),
     effect: "write",
     approval: "none",
-    example: 'await der.notes.archive({ key: "a" })',
+    example: 'await step.run("notes.archive", { key: "a" })',
     async execute() {
       return { archived: true };
     },
@@ -413,7 +380,7 @@ describe("search the catalog", () => {
 
   it("returns the declaration and example of the one capability a query matches", async () => {
     const { server, host } = await startDirectServer({ extra: [archive] });
-    expect(server.scriptRuns).toBeDefined();
+    expect(server.scriptDriver).toBeDefined();
     const search = createSearchTool({ catalog: host.catalog, maxResultBytes: RESULT_BYTES });
 
     expect(await search.execute!({ query: "archive" })).toEqual({
@@ -429,9 +396,9 @@ describe("search the catalog", () => {
             "  archived: boolean;",
             "};",
             "/** Archive a note */",
-            "declare function der.notes.archive(input: NotesArchiveInput): Promise<NotesArchiveOutput>;",
+            'declare const step: { run(id: "notes.archive", input: NotesArchiveInput): Promise<NotesArchiveOutput> };',
           ].join("\n"),
-          example: 'await der.notes.archive({ key: "a" })',
+          example: 'await step.run("notes.archive", { key: "a" })',
         },
       ],
       truncated: false,
@@ -531,14 +498,14 @@ describe("drive a fixture capability through the execute tool", () => {
     });
 
     const approval = await awaitPendingApproval(server, run.id);
-    const [scriptRun] = server.scriptRunStore.listUnfinished(run.id);
+    const scriptRunId = approval.awakeable.slice("script:".length);
 
     expect(approval.effect).toEqual({
       runId: run.id,
       operationKind: "capability",
       operationId: "fixture.apply",
       canonicalArguments: { target: "lamp-1", mode: "apply" },
-      attemptId: `${scriptRun!.id}:1`,
+      attemptId: `${scriptRunId}:1`,
     });
     expect(fixture.applied).toEqual([]);
 
@@ -551,7 +518,7 @@ describe("drive a fixture capability through the execute tool", () => {
     expect(fixture.applied).toEqual([
       {
         operationId: "fixture.apply",
-        attemptId: `${scriptRun!.id}:1`,
+        attemptId: `${scriptRunId}:1`,
         runId: run.id,
         canonicalArguments: { target: "lamp-1", mode: "apply" },
       },

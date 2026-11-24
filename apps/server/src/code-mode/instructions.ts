@@ -28,20 +28,21 @@ export function codeModeInstructions(catalog: Catalog): string {
     "",
     "Script rules:",
     "- A Script is the body of an async function. Give back a JSON value with `return`.",
-    "- Call a capability as `der.<namespace>.<name>(input)`. It returns a Promise: `await` every call.",
+    "- Call a capability as `await step.run(id, input)`. It returns a Promise: `await` every call.",
     ...(hasCatalogSearch
-      ? ["- `der.catalog.search(query)` searches the capabilities from inside a Script."]
+      ? [
+          "- `await step.run('catalog.search', query)` searches the capabilities from inside a Script.",
+        ]
       : []),
     "- Modules and `import` are not available. `eval` and `Function` are unavailable. There are no timers.",
     "- `Date`, `Math.random` and `performance.now` return recorded values, so a Script replays the same way every time. Do not branch on them.",
-    "- A write can need operator approval. `execute` then waits for the decision. A denied or expired approval comes back as `ok: false` with kind `denied` or `expired`.",
-    "- Scripts in a run are sequential: while one is still running, `execute` with a different Script returns `ok: false`. Wait for it, or send the same Script again to get its result.",
+    "- A write can need operator approval. `execute` then waits for the decision. A denied or expired approval rejects that step with kind `denied` or `expired`. An uncaught rejection makes `execute` fail.",
     "- A call you do not `await` is carried to its outcome before the result is reported (unless a limit or cancel ended the Script first), and its error becomes the result.",
-    "- If your `execute` call is cut off, call it again with the identical Script to pick the same run back up. After a result has been returned, the same Script runs again.",
+    "- If your `execute` call is cut off, call it again with the identical Script to reattach to an unfinished execution. After an execution ends, the same Script starts a new occurrence.",
     "",
     "Example:",
     "```js",
-    "const list = await der.routines.list({});",
+    "const list = await step.run('routines.list', {});",
     "return list.routines.map((routine) => routine.id);",
     "```",
     "",

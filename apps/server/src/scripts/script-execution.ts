@@ -1,553 +1,783 @@
 import {
   DomainError,
-  executeResult,
-  type CapabilityDescriptor,
+  formatUtcTimestamp,
+  type Approval,
+  type ApprovalEffectStore,
   type Catalog,
-  type EffectId,
   type EffectIdentity,
-  type ExecuteResult,
+  type EffectRecord,
+  type ExecuteErrorKind,
   type JsonValue,
+  type NewStep,
   type Run,
+  type RunStore,
+  type ScriptExecution,
+  type ScriptStore,
+  type StepOutcome,
+  type StoredStep,
   type TerminalScriptRunStatus,
 } from "@der/domain";
 import {
-  runScript,
-  type ScriptCallContext,
-  type ScriptCallHalt,
-  type ScriptCallReply,
-  type ScriptLimits,
-  type ScriptResult,
+  startScript,
+  type ScriptDrain,
+  type ScriptSession,
+  type SessionLimits,
+  type StepRequest,
+  type StepResult,
 } from "@der/runtime";
-import { fingerprintJson, isTerminalScriptRunStatus, type SqliteScriptRuns } from "@der/storage";
-import type { CoordinatorDriver, RunCoordinator } from "../workflows/coordinator";
-import { finalizeInterruptedUncertainStep, type WorkflowStore } from "../workflows/run-steps";
+import { fingerprintJson } from "@der/storage";
+import { approvalRequestedEvent } from "../workflows/run-steps";
 
 export interface ScriptExecutionDeps {
-  readonly store: WorkflowStore;
-  readonly scriptRuns: SqliteScriptRuns;
+  readonly store: ApprovalEffectStore & Pick<RunStore, "getRun" | "appendRunEvents">;
+  readonly scripts: ScriptStore;
   readonly catalog: Catalog;
-  readonly approvals: Pick<RunCoordinator, "awaitApprovalWithDriver">;
-  readonly limits: ScriptLimits;
-  readonly now?: () => Date;
-  readonly inFlightGraceMs?: number;
+  readonly limits: SessionLimits & {
+    readonly maxSteps: number;
+    readonly maxInFlight: number;
+    readonly outputBytes: number;
+  };
+  readonly approvalTimeoutMs: number;
+  readonly now: () => Date;
 }
 
-export interface ScriptExecutionSignals {
-  readonly cancel?: AbortSignal;
-  readonly attemptEnded?: AbortSignal;
-  readonly boundedDriver?: CoordinatorDriver;
+const RUN_ENDED = new Set<Run["status"]>(["completed", "failed", "cancelled", "interrupted"]);
+const WRITE_CANCEL_GRACE_MS = 10_000;
+const RESULT_DEPTH = 256;
+
+export function routineScriptId(run: Run): string | undefined {
+  const { checkpoint } = run;
+  if (checkpoint === null || typeof checkpoint !== "object" || Array.isArray(checkpoint)) {
+    return undefined;
+  }
+  const id = checkpoint["scriptRunId"];
+  return typeof id === "string" ? id : undefined;
 }
 
-interface ScriptStart {
-  readonly terminal: ExecuteResult | null;
-  readonly source: string;
-  readonly run: Run | null;
-  readonly seed: number;
-  readonly now: number;
-  readonly writeInDoubt: { readonly effectId: EffectId; readonly detail: string } | null;
+export function scriptApprovalOwner(awakeable: string): string | undefined {
+  return awakeable.startsWith("script:") ? awakeable.slice("script:".length) : undefined;
 }
 
-type CallStepResult =
-  | { readonly kind: "reply"; readonly reply: ScriptCallReply }
-  | { readonly kind: "abandoned" }
-  | { readonly kind: "run-ended"; readonly detail: string }
-  | { readonly kind: "doubt"; readonly effectId: EffectId; readonly detail: string }
-  | { readonly kind: "interrupted"; readonly effectId: EffectId; readonly detail: string };
-
-interface Halt {
-  readonly kind: "denied" | "expired" | "cancelled";
-  readonly message: string;
-  readonly call: string;
+function approvalId(id: string, position: number): string {
+  return `appr_${id}_${position}`;
 }
 
-const IN_FLIGHT_GRACE_MS = 10_000;
-const MAX_RESULT_DEPTH = 256;
-const HALT_SCRIPT: ScriptCallHalt = { halt: true };
-const PROMPT_INPUT_CHARS = 400;
-const INPUT_DIGEST_CHARS = 8;
-
-function failure(
-  kind: Extract<ExecuteResult, { ok: false }>["error"]["kind"],
-  message: string,
-  logs: string[] = [],
-  call?: string,
-): ExecuteResult {
-  return { ok: false, error: { kind, message, ...(call === undefined ? {} : { call }) }, logs };
-}
-
-export function cancelledResult(): ExecuteResult {
-  return failure("cancelled", "script cancelled");
-}
-
-function isEndedRunStatus(status: Run["status"]): boolean {
-  return status === "interrupted" || status === "failed" || status === "cancelled";
-}
-
-function uncertainWriteDetail(identity: Pick<EffectIdentity, "operationId" | "attemptId">): string {
-  return `The outcome of a previous write in this Run (capability:${identity.operationId}, ${identity.attemptId}) is unknown, so the Run was interrupted.`;
-}
-
-function errorMessage(error: unknown): string {
+function messageOf(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
-function promptFor(id: string, input: JsonValue): string {
-  const text = JSON.stringify(input) ?? "null";
-  const shown = text.length > PROMPT_INPUT_CHARS ? `${text.slice(0, PROMPT_INPUT_CHARS)}...` : text;
-  return `Script wants to call ${id} with ${shown}`;
+function effectOf(head: ScriptExecution, step: StoredStep): EffectIdentity {
+  return {
+    runId: head.runId,
+    operationKind: "capability",
+    operationId: step.capability,
+    canonicalArguments: step.input,
+    attemptId: `${head.id}:${step.position}`,
+  };
 }
 
-function terminalStatusOf(result: ExecuteResult): TerminalScriptRunStatus {
-  if (result.ok) {
-    return "completed";
+function stepFailure(
+  step: StoredStep,
+  kind: "failed" | "denied" | "expired" | "refused",
+  message: string,
+  status: "failed" | "unknown" | "skipped" = "failed",
+): StepOutcome {
+  return {
+    status,
+    error: { kind, message, step: step.position, capability: step.capability, input: step.input },
+  };
+}
+
+function replyOf(step: StoredStep): StepResult {
+  if (step.status === "done") {
+    return { position: step.position, ok: true, value: step.result };
   }
-  return result.error.kind === "cancelled" ? "cancelled" : "failed";
+  const error = step.error as { kind: string; message: string };
+  return { position: step.position, ok: false, error };
 }
 
-function anySignal(signals: readonly (AbortSignal | undefined)[]): AbortSignal | undefined {
-  const present = signals.filter((signal): signal is AbortSignal => signal !== undefined);
-  return present.length === 0 ? undefined : AbortSignal.any(present);
+function errorKind(kind: string): ExecuteErrorKind {
+  switch (kind) {
+    case "limit":
+    case "denied":
+    case "expired":
+    case "script":
+      return kind;
+    case "failed":
+    case "refused":
+      return "capability";
+    default:
+      return "script";
+  }
+}
+
+function storable(value: JsonValue, depth = 0): boolean {
+  if (depth > RESULT_DEPTH) return false;
+  return (
+    value === null ||
+    typeof value !== "object" ||
+    Object.values(value).every((child) => storable(child, depth + 1))
+  );
+}
+
+function deliveryBatches(steps: readonly StoredStep[]): StoredStep[][] {
+  const batches: StoredStep[][] = [];
+  const delivered = steps
+    .filter((step) => step.seq !== null)
+    .sort((a, b) => (a.seq ?? 0) - (b.seq ?? 0));
+  for (const step of delivered) {
+    const last = batches.at(-1);
+    if (last?.[0]?.batch === step.batch && last !== undefined) {
+      last.push(step);
+    } else {
+      batches.push([step]);
+    }
+  }
+  return batches;
+}
+
+class ScriptRefused extends Error {
+  constructor(
+    readonly kind: ExecuteErrorKind,
+    message: string,
+    readonly call?: string,
+    readonly line?: number,
+  ) {
+    super(message);
+  }
+}
+
+class ScriptPass {
+  readonly #rows: Map<number, StoredStep>;
+  readonly #requested = new Set<number>();
+  readonly #announced = new Set<string>();
+  readonly #ready: StoredStep[] = [];
+  #wake = Promise.withResolvers<void>();
+  readonly #notify = () => this.#wake.resolve();
+  #acceptWork = true;
+  readonly #work = new Map<number, Promise<void>>();
+  readonly #descriptors: Map<string, "read" | "write">;
+  readonly #logs: string[] = [];
+  #inFlight = 0;
+  #round: number;
+  #writing = false;
+  #failure: { error: unknown } | undefined;
+
+  constructor(
+    readonly deps: ScriptExecutionDeps,
+    readonly head: ScriptExecution,
+    steps: readonly StoredStep[],
+    readonly guard: () => void,
+    readonly signal: AbortSignal,
+    readonly changes: EventTarget,
+  ) {
+    this.#rows = new Map(steps.map((step) => [step.position, step]));
+    this.#round = Math.max(0, ...steps.map((step) => step.round ?? 0)) + 1;
+    this.#descriptors = new Map(deps.catalog.list().map(({ id, effect }) => [id, effect]));
+  }
+
+  async run(steps: readonly StoredStep[]): Promise<void> {
+    const run = await this.#owningRun();
+    if (run === undefined) {
+      await this.#cancel();
+      return;
+    }
+    if (run.engine === "script" && routineScriptId(run) !== this.head.id) {
+      return;
+    }
+    const session = startScript(this.head.source, {
+      seed: this.head.seed,
+      now: Date.parse(this.head.createdAt),
+      limits: this.deps.limits,
+    });
+
+    this.signal.addEventListener("abort", this.#notify, { once: true });
+    this.changes.addEventListener("change", this.#notify);
+    try {
+      this.guard();
+      let drain = await session.started;
+      const batches = deliveryBatches(steps);
+      for (const batch of batches) {
+        await this.#absorb(drain, true);
+        for (const step of batch) {
+          if (!this.#requested.has(step.position)) {
+            throw this.#mismatch(
+              `step ${step.position} was not requested before its recorded delivery`,
+            );
+          }
+        }
+        this.#inFlight -= batch.length;
+        drain = await session.deliver(batch.map(replyOf));
+      }
+      await this.#absorb(drain, false);
+      for (const step of steps) {
+        if (!this.#requested.has(step.position)) {
+          throw this.#mismatch(
+            `stored step ${step.position} (${step.capability}) was not requested`,
+          );
+        }
+        if (step.seq === null && (step.status === "done" || step.status === "failed")) {
+          this.#ready.push(step);
+        }
+      }
+
+      if (this.#ready.length > 0) {
+        drain = await this.#deliverReady(session);
+        await this.#absorb(drain, false);
+      }
+
+      for (;;) {
+        this.#wake = Promise.withResolvers<void>();
+        this.guard();
+        this.#throwHostFailure();
+        if ((await this.#owningRun()) === undefined) {
+          await this.#cancel();
+          return;
+        }
+        this.#startReads();
+        const { ask, writes, waiting } = await this.#planWrites();
+        this.#throwHostFailure();
+        this.#startWrite(writes[0]);
+        if (this.#ready.length > 0) {
+          await new Promise<void>((resolve) => setImmediate(resolve));
+          this.guard();
+          this.#throwHostFailure();
+          drain = await this.#deliverReady(session);
+          await this.#absorb(drain, false);
+          continue;
+        }
+        if (ask.length > 0) {
+          await this.#ask(run, ask);
+          continue;
+        }
+        if (this.#work.size > 0) {
+          await this.#wake.promise;
+          continue;
+        }
+        if (waiting) {
+          return;
+        }
+        await this.#settle(drain);
+        return;
+      }
+    } catch (error) {
+      if (!(error instanceof ScriptRefused)) {
+        throw error;
+      }
+      await this.#drainWork();
+      await this.#end("failed", error.kind, error.message, error.call, error.line);
+    } finally {
+      this.#acceptWork = false;
+      this.signal.removeEventListener("abort", this.#notify);
+      this.changes.removeEventListener("change", this.#notify);
+      session.dispose();
+    }
+  }
+
+  #deliverReady(session: ScriptSession): Promise<ScriptDrain> {
+    this.guard();
+    const ready = this.#ready.splice(0);
+    this.deps.scripts.markDelivered(
+      this.head.id,
+      ready.map(({ position }) => position),
+    );
+    this.#inFlight -= ready.length;
+    return session.deliver(ready.map(replyOf));
+  }
+
+  async #owningRun(): Promise<Run | undefined> {
+    const run = await this.deps.store.getRun(this.head.runId);
+    this.guard();
+    return run === undefined || RUN_ENDED.has(run.status) ? undefined : run;
+  }
+
+  #mismatch(detail: string): ScriptRefused {
+    return new ScriptRefused(
+      "nondeterministic",
+      `the Script did not repeat itself: ${detail}. ${this.#applied()}`,
+    );
+  }
+
+  #applied(): string {
+    const applied = [...this.#rows.values()]
+      .filter((step) => step.effect === "write" && step.status === "done")
+      .map((step) => `#${step.position} ${step.capability}`);
+    return `Already applied: ${applied.join(", ") || "nothing"}.`;
+  }
+
+  async #absorb(drain: ScriptDrain, replaying: boolean): Promise<void> {
+    for (const line of drain.logs) this.#logs.push(line);
+    if (drain.fatal && drain.error !== undefined) {
+      const { kind, message, line } = drain.error;
+      throw new ScriptRefused(
+        errorKind(kind),
+        kind === "limit" ? `${message}. ${this.#applied()}` : message,
+        undefined,
+        line,
+      );
+    }
+    if (drain.orphans?.length) {
+      throw this.#mismatch(`no pending call for recorded step ${drain.orphans[0]}`);
+    }
+
+    const { maxSteps, maxInFlight } = this.deps.limits;
+    const fresh = drain.requests.filter(({ position }) => !this.#rows.has(position)).length;
+    if (replaying && fresh > 0) {
+      throw this.#mismatch("a new step was requested before the recorded deliveries were replayed");
+    }
+    if (
+      this.#rows.size + fresh > maxSteps ||
+      this.#inFlight + drain.requests.length > maxInFlight
+    ) {
+      const limit =
+        this.#rows.size + fresh > maxSteps
+          ? `step limit of ${maxSteps}`
+          : `in-flight step limit of ${maxInFlight}`;
+      throw new ScriptRefused("limit", `${limit} exceeded. ${this.#applied()}`);
+    }
+    if (drain.requests.length === 0) {
+      return;
+    }
+    const requested = await Promise.all(drain.requests.map((request) => this.#prepare(request)));
+    this.guard();
+    const stored = this.deps.scripts.registerSteps(this.head.id, requested);
+    for (const [index, row] of stored.entries()) {
+      this.#compare(row, requested[index]!);
+      this.#rows.set(row.position, row);
+      this.#requested.add(row.position);
+    }
+    this.#inFlight += drain.requests.length;
+  }
+
+  async #prepare(request: StepRequest): Promise<NewStep> {
+    const { position, id, input } = request;
+    const inputHash = await fingerprintJson(input);
+    const stored = this.#rows.get(position);
+    if (stored !== undefined) {
+      this.#compare(stored, { position, capability: id, inputHash });
+      const { round, ...request } = stored;
+      return { ...request, ...(round === null ? {} : { round }) };
+    }
+    const effect = this.#descriptors.get(id);
+    if (effect === undefined) {
+      throw new ScriptRefused("capability", `Unknown capability "${id}" at step ${position}.`, id);
+    }
+    try {
+      this.deps.catalog.validateInput(id, input);
+      const ask = effect === "write" && this.deps.catalog.requiresApproval(id, input);
+      return {
+        position,
+        capability: id,
+        inputHash,
+        input,
+        effect,
+        decision: ask ? "ask" : "allow",
+        ...(ask ? { round: this.#round } : {}),
+      };
+    } catch (error) {
+      throw new ScriptRefused("capability", `Step ${position}: ${messageOf(error)}`, id);
+    }
+  }
+
+  #compare(row: StoredStep, request: Pick<NewStep, "position" | "capability" | "inputHash">): void {
+    if (
+      row.position !== request.position ||
+      row.capability !== request.capability ||
+      row.inputHash !== request.inputHash
+    ) {
+      throw this.#mismatch(
+        `step ${request.position} requested ${request.capability} with different capability or input than the stored ${row.capability}`,
+      );
+    }
+  }
+
+  #throwHostFailure(): void {
+    if (this.#failure !== undefined) {
+      throw this.#failure.error;
+    }
+  }
+
+  #guardWork(): void {
+    this.guard();
+    if (!this.#acceptWork) {
+      throw new Error(`The pass for Script execution ${this.head.id} has ended`);
+    }
+  }
+
+  #start(step: StoredStep, work: () => Promise<void>): void {
+    const pending = work()
+      .catch((error: unknown) => {
+        this.#failure ??= { error };
+      })
+      .finally(() => {
+        this.#work.delete(step.position);
+        this.#notify();
+      });
+    this.#work.set(step.position, pending);
+  }
+
+  #startReads(): void {
+    for (const step of this.#rows.values()) {
+      if (step.effect === "read" && step.status === "pending" && !this.#work.has(step.position)) {
+        if (step.decision === "deny") {
+          this.#complete(step, stepFailure(step, "refused", "Capability denied by policy"));
+          continue;
+        }
+        this.#start(step, async () => {
+          let outcome: StepOutcome;
+          try {
+            const result = await this.deps.catalog.invoke(step.capability, step.input, {
+              botId: this.head.botId,
+              signal: this.signal,
+            });
+            outcome = { status: "done", result };
+          } catch (error) {
+            outcome = stepFailure(step, "failed", messageOf(error));
+          }
+          this.#complete(step, outcome);
+        });
+      }
+    }
+  }
+
+  async #planWrites(): Promise<{ ask: StoredStep[]; writes: StoredStep[]; waiting: boolean }> {
+    const ask: StoredStep[] = [];
+    const writes: StoredStep[] = [];
+    let waiting = false;
+    for (const step of this.#rows.values()) {
+      if (step.effect !== "write" || step.status !== "pending" || this.#work.has(step.position)) {
+        continue;
+      }
+      if (step.decision === "deny") {
+        this.#complete(step, stepFailure(step, "refused", "Capability denied by policy"));
+        continue;
+      }
+      const approval =
+        step.decision === "ask"
+          ? await this.deps.store.getApproval(approvalId(this.head.id, step.position))
+          : undefined;
+      this.guard();
+      if (approval !== undefined) {
+        await this.#announce(approval);
+      }
+      switch (approval?.decision.status) {
+        case "pending":
+          waiting = true;
+          break;
+        case "denied":
+        case "expired": {
+          const kind = approval.decision.status;
+          this.#complete(
+            step,
+            stepFailure(
+              step,
+              kind,
+              `approval for write ${step.position} (${step.capability}) was ${kind}`,
+            ),
+          );
+          break;
+        }
+        case "approved":
+          writes.push(step);
+          break;
+        default:
+          (step.decision === "ask" ? ask : writes).push(step);
+      }
+    }
+    writes.sort((a, b) => a.position - b.position);
+    return { ask, writes, waiting };
+  }
+
+  async #ask(run: Run, steps: readonly StoredStep[]): Promise<void> {
+    const deadline = formatUtcTimestamp(
+      new Date(this.deps.now().getTime() + this.deps.approvalTimeoutMs),
+    );
+    for (const step of steps) {
+      this.guard();
+      const { approval } = await this.deps.store.requestApproval({
+        id: approvalId(this.head.id, step.position),
+        botId: this.head.botId,
+        sessionId: run.sessionId,
+        runId: run.id,
+        effect: effectOf(this.head, step),
+        awakeable: `script:${this.head.id}`,
+        prompt: `Script wants to call ${step.capability} with ${JSON.stringify(step.input).slice(0, 400)}`,
+        deadline,
+      });
+      await this.#announce(approval);
+    }
+    this.#round += 1;
+  }
+
+  async #announce(approval: Approval): Promise<void> {
+    if (!this.#announced.has(approval.id)) {
+      this.guard();
+      await this.deps.store.appendRunEvents(approval.runId, [approvalRequestedEvent(approval)]);
+      this.#announced.add(approval.id);
+    }
+  }
+
+  #startWrite(step: StoredStep | undefined): void {
+    if (this.#writing || step === undefined) {
+      return;
+    }
+    this.#writing = true;
+    this.#start(step, async () => {
+      try {
+        await this.#write(step);
+      } finally {
+        this.#writing = false;
+      }
+    });
+  }
+
+  async #write(step: StoredStep): Promise<void> {
+    const { store, catalog } = this.deps;
+    const effect = effectOf(this.head, step);
+    this.#guardWork();
+    let begin: Awaited<ReturnType<ApprovalEffectStore["beginEffect"]>>;
+    try {
+      begin = await store.beginEffect(effect, {
+        scriptExecutionId: this.head.id,
+        ...(step.decision === "ask" ? { approvalId: approvalId(this.head.id, step.position) } : {}),
+      });
+    } catch (error) {
+      if (error instanceof DomainError && error.code === "effect.prior_write_in_doubt") {
+        this.#complete(step, stepFailure(step, "failed", error.message));
+        return;
+      }
+      if (error instanceof DomainError && error.code === "effect.run_ended") {
+        return;
+      }
+      throw new ScriptRefused(
+        "capability",
+        `Could not begin write ${step.position}: ${messageOf(error)}`,
+        step.capability,
+      );
+    }
+    this.#guardWork();
+    if (begin.kind === "ambiguous") {
+      const effect = await store.markEffectUnknown(begin.effect.id);
+      this.#complete(
+        step,
+        this.#effectOutcome(
+          step,
+          effect,
+          "a previous attempt started this write and its outcome was not recorded",
+        ),
+      );
+      return;
+    }
+    if (begin.kind === "completed") {
+      this.#complete(step, this.#effectOutcome(step, begin.effect));
+      return;
+    }
+
+    let outcome: { ok: true; value: JsonValue } | { ok: false; message: string };
+    try {
+      const value = await catalog.invoke(step.capability, step.input, {
+        botId: this.head.botId,
+        effect,
+        signal: this.signal,
+      });
+      outcome = { ok: true, value };
+    } catch (error) {
+      this.#guardWork();
+      if (!(error instanceof DomainError)) {
+        const effect = await store.markEffectUnknown(begin.effect.id);
+        this.#complete(step, this.#effectOutcome(step, effect, messageOf(error)));
+        return;
+      }
+      outcome = { ok: false, message: error.message };
+    }
+    this.#guardWork();
+    const recorded = await store.completeEffect(begin.effect.id, outcome);
+    this.#complete(step, this.#effectOutcome(step, recorded));
+  }
+
+  #effectOutcome(
+    step: StoredStep,
+    effect: EffectRecord,
+    reason = "the write outcome was not recorded",
+  ): StepOutcome {
+    if (effect.status === "unknown") {
+      return stepFailure(step, "failed", reason, "unknown");
+    }
+    const outcome = effect.outcome as { ok: boolean; value?: JsonValue; message?: string } | null;
+    return outcome?.ok
+      ? { status: "done", result: outcome.value ?? null }
+      : stepFailure(step, "failed", outcome?.message ?? "the write failed");
+  }
+
+  #complete(step: StoredStep, outcome: StepOutcome): void {
+    this.#guardWork();
+    this.#storeOutcome(step, outcome);
+  }
+
+  #storeOutcome(step: StoredStep, outcome: StepOutcome): void {
+    this.guard();
+    this.deps.scripts.completeStep(this.head.id, step.position, outcome);
+    const completed = {
+      ...step,
+      status: outcome.status,
+      result: outcome.result ?? null,
+      error: outcome.error ?? null,
+    };
+    this.#rows.set(step.position, completed);
+    if (completed.status === "done" || completed.status === "failed") {
+      this.#ready.push(completed);
+    }
+  }
+
+  async #settle(drain: ScriptDrain): Promise<void> {
+    const doubtful = [...this.#rows.values()].find((step) => step.status === "unknown");
+    if (doubtful !== undefined) {
+      const detail = doubtful.error as { message: string };
+      await this.#end(
+        "in_doubt",
+        "capability",
+        `Write ${doubtful.position} (${doubtful.capability}) has an unknown outcome: ${detail.message}`,
+      );
+    } else if (drain.error !== undefined) {
+      await this.#end(
+        "failed",
+        errorKind(drain.error.kind),
+        drain.error.message,
+        drain.error.capability,
+      );
+    } else if (drain.unobserved[0] !== undefined) {
+      const rejected = drain.unobserved[0];
+      await this.#end(
+        "failed",
+        errorKind(rejected.kind),
+        `Step ${rejected.position} was started and never awaited, and it was rejected: ${rejected.message}`,
+      );
+    } else if ("returned" in drain) {
+      const result = drain.returned ?? null;
+      if (!storable(result)) {
+        await this.#end("failed", "script", "script produced a result the host cannot store");
+        return;
+      }
+      this.guard();
+      try {
+        this.deps.scripts.finish(this.head.id, {
+          status: "completed",
+          result: { ok: true, result, logs: this.#logs, truncated: false },
+        });
+      } catch (error) {
+        await this.#end("failed", "capability", `Could not finish Script: ${messageOf(error)}`);
+      }
+    } else {
+      await this.#end(
+        "failed",
+        "script",
+        "The Script is waiting for something that is not a step.",
+      );
+    }
+  }
+
+  async #drainWork(): Promise<void> {
+    if (this.#work.size === 0) return;
+    const stopped = Promise.withResolvers<void>();
+    const stop = () => stopped.resolve();
+    this.signal.addEventListener("abort", stop, { once: true });
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      this.guard();
+      await Promise.race([
+        Promise.all(this.#work.values()),
+        stopped.promise,
+        new Promise<void>((resolve) => {
+          timer = setTimeout(resolve, WRITE_CANCEL_GRACE_MS);
+        }),
+      ]);
+      this.guard();
+    } finally {
+      clearTimeout(timer);
+      this.signal.removeEventListener("abort", stop);
+    }
+  }
+
+  async #cancel(): Promise<void> {
+    await this.#drainWork();
+    await this.#end("cancelled", "cancelled", "script cancelled");
+  }
+
+  async #withdrawApprovals(): Promise<void> {
+    const { store } = this.deps;
+    const pending = (await store.listPendingApprovalsForRun?.(this.head.runId)) ?? [];
+    for (const approval of pending) {
+      if (!approval.effect.attemptId.startsWith(`${this.head.id}:`)) {
+        continue;
+      }
+      this.guard();
+      try {
+        await store.decide({
+          approvalId: approval.id,
+          botId: approval.botId,
+          sessionId: approval.sessionId,
+          runId: approval.runId,
+          status: "expired",
+          decidedAt: formatUtcTimestamp(this.deps.now()),
+        });
+      } catch (error) {
+        this.guard();
+        if ((await store.getApproval(approval.id))?.decision.status === "pending") {
+          throw error;
+        }
+      }
+    }
+  }
+
+  async #end(
+    status: TerminalScriptRunStatus,
+    kind: ExecuteErrorKind,
+    message: string,
+    call?: string,
+    line?: number,
+  ): Promise<void> {
+    this.#acceptWork = false;
+    await this.#withdrawApprovals();
+    for (const step of this.#rows.values()) {
+      if (step.effect !== "write" || step.status !== "pending") {
+        continue;
+      }
+      const effect = await this.deps.store.getEffect(effectOf(this.head, step));
+      this.guard();
+      if (effect === undefined) {
+        this.#storeOutcome(step, stepFailure(step, "failed", message, "skipped"));
+        continue;
+      }
+      const recorded =
+        effect.status === "started" ? await this.deps.store.markEffectUnknown(effect.id) : effect;
+      this.#storeOutcome(step, this.#effectOutcome(step, recorded, message));
+    }
+    this.guard();
+    this.deps.scripts.finish(this.head.id, {
+      status,
+      result: {
+        ok: false,
+        error: {
+          kind,
+          message,
+          ...(call === undefined ? {} : { call }),
+          ...(line === undefined ? {} : { line }),
+        },
+        logs: this.#logs,
+      },
+    });
+  }
 }
 
 export async function executeScriptRun(
   deps: ScriptExecutionDeps,
-  driver: CoordinatorDriver,
-  scriptRunId: string,
-  signals: ScriptExecutionSignals = {},
-): Promise<ExecuteResult | undefined> {
-  const nowMs = (): number => (deps.now ? deps.now() : new Date()).getTime();
-  const isCancelled = (): boolean => deps.scriptRuns.isCancelRequested(scriptRunId);
-  let ordinal = 0;
-  let halt: Halt | undefined;
-  let interrupted: { readonly effectId: EffectId; readonly detail: string } | undefined;
-  let hostFailure:
-    | { readonly error: unknown; readonly effect: EffectIdentity | undefined }
-    | undefined;
-  let writeInFlight: EffectIdentity | undefined;
-  let runEnded: string | undefined;
-  const bounded = signals.boundedDriver ?? driver;
-
-  const start = await bounded.runStep("script-start", async (): Promise<ScriptStart> => {
-    const scriptRun = deps.scriptRuns.get(scriptRunId);
-    if (!scriptRun) {
-      throw new DomainError({
-        type: "https://der.invalid/problems/script-run-not-found",
-        title: "ScriptRun not found",
-        status: 404,
-        detail: `ScriptRun ${scriptRunId} does not exist.`,
-        instance: `/api/script-runs/${scriptRunId}`,
-        code: "script_run.not_found",
-      });
-    }
-    const run = (await deps.store.getRun(scriptRun.runId)) ?? null;
-    const doubtful = await deps.store.findWriteInDoubt(scriptRun.runId);
-    return {
-      writeInDoubt:
-        doubtful === undefined
-          ? null
-          : { effectId: doubtful.id, detail: uncertainWriteDetail(doubtful.identity) },
-      terminal: isTerminalScriptRunStatus(scriptRun.status) ? scriptRun.result : null,
-      source: scriptRun.source,
-      run,
-      seed: crypto.getRandomValues(new Uint32Array(1))[0] ?? 0,
-      now: nowMs(),
-    };
-  });
-  if (start.terminal !== null) {
-    return start.terminal;
+  id: string,
+  guard: () => void,
+  signal: AbortSignal,
+  changes: EventTarget,
+): Promise<void> {
+  const { execution, steps } = deps.scripts.load(id);
+  if (execution.result === null) {
+    await new ScriptPass(deps, execution, steps, guard, signal, changes).run(steps);
   }
-  if (start.run === null) {
-    return finish(failure("capability", "owning Run no longer exists"));
-  }
-  const run: Run = start.run;
-  if (isEndedRunStatus(run.status)) {
-    return finish(failure("capability", `owning Run ${run.id} has ended as ${run.status}`));
-  }
-
-  if (start.writeInDoubt !== null) {
-    interrupted = start.writeInDoubt;
-    return finish(
-      await settle({
-        ok: false,
-        error: { kind: "capability", message: start.writeInDoubt.detail },
-        logs: [],
-      }),
-    );
-  }
-
-  const descriptors = new Map<string, CapabilityDescriptor>(
-    deps.catalog.list().map((descriptor) => [descriptor.id, descriptor]),
-  );
-  const callSignal = anySignal([signals.cancel, signals.attemptEnded]);
-
-  const invoke = async (
-    id: string,
-    input: JsonValue,
-    effect: EffectIdentity | undefined,
-  ): Promise<JsonValue> =>
-    deps.catalog.invoke(id, input, {
-      botId: run.botId,
-      ...(effect === undefined ? {} : { effect }),
-      ...(callSignal === undefined ? {} : { signal: callSignal }),
-    });
-
-  const readStep = (name: string, id: string, input: JsonValue): Promise<CallStepResult> =>
-    bounded.runStep(name, async (): Promise<CallStepResult> => {
-      if (isCancelled()) {
-        return {
-          kind: "reply",
-          reply: {
-            ok: false,
-            error: { kind: "cancelled", message: "script cancelled" },
-            now: nowMs(),
-          },
-        };
-      }
-      try {
-        return {
-          kind: "reply",
-          reply: { ok: true, value: await invoke(id, input, undefined), now: nowMs() },
-        };
-      } catch (error) {
-        return {
-          kind: "reply",
-          reply: {
-            ok: false,
-            error: { kind: "capability", message: errorMessage(error) },
-            now: nowMs(),
-          },
-        };
-      }
-    });
-
-  const writeStep = (
-    name: string,
-    id: string,
-    input: JsonValue,
-    effect: EffectIdentity,
-    approvalId: string | undefined,
-    context: ScriptCallContext,
-  ): Promise<CallStepResult> =>
-    driver.runStep(name, async (): Promise<CallStepResult> => {
-      const own = await deps.store.getEffect(effect);
-      if (own === undefined) {
-        if (isCancelled()) {
-          return {
-            kind: "reply",
-            reply: {
-              ok: false,
-              error: { kind: "cancelled", message: "script cancelled" },
-              now: nowMs(),
-            },
-          };
-        }
-        if (context.settled()) {
-          return { kind: "abandoned" };
-        }
-        const current = await deps.store.getRun(run.id);
-        if (current !== undefined && isEndedRunStatus(current.status)) {
-          return {
-            kind: "run-ended",
-            detail: `owning Run ${run.id} has ended as ${current.status}`,
-          };
-        }
-        const doubtful = await deps.store.findWriteInDoubt(run.id);
-        if (doubtful !== undefined) {
-          return {
-            kind: "doubt",
-            effectId: doubtful.id,
-            detail: uncertainWriteDetail(doubtful.identity),
-          };
-        }
-      }
-      await deps.scriptRuns.setStatus(scriptRunId, "running");
-      const begin = await deps.store.beginEffect(effect, approvalId ? { approvalId } : undefined);
-      if (begin.kind === "completed") {
-        return {
-          kind: "reply",
-          reply: { ...replyFromOutcome(begin.effect.outcome), now: nowMs() },
-        };
-      }
-      if (begin.kind === "ambiguous") {
-        await deps.store.markEffectUnknown(begin.effect.id);
-        return {
-          kind: "interrupted",
-          effectId: begin.effect.id,
-          detail: `Effect capability:${id} (${effect.attemptId}) had a prior started marker with uncertain outcome.`,
-        };
-      }
-      try {
-        const value = await invoke(id, input, effect);
-        await deps.store.completeEffect(begin.effect.id, { ok: true, value });
-        return { kind: "reply", reply: { ok: true, value, now: nowMs() } };
-      } catch (error) {
-        if (error instanceof DomainError) {
-          await deps.store.completeEffect(begin.effect.id, { ok: false, message: error.message });
-          return {
-            kind: "reply",
-            reply: {
-              ok: false,
-              error: { kind: "capability", message: error.message },
-              now: nowMs(),
-            },
-          };
-        }
-        await deps.store.markEffectUnknown(begin.effect.id);
-        return { kind: "interrupted", effectId: begin.effect.id, detail: errorMessage(error) };
-      }
-    });
-
-  const askApproval = async (
-    name: string,
-    id: string,
-    input: JsonValue,
-    effect: EffectIdentity,
-  ): Promise<{ readonly approvalId: string } | { readonly reply: ScriptCallReply }> => {
-    await driver.runStep(`${name}:ask`, () =>
-      deps.scriptRuns.setStatus(scriptRunId, "waiting_approval").then(() => null),
-    );
-    const outcome = await deps.approvals.awaitApprovalWithDriver(
-      driver,
-      { run, effect, prompt: promptFor(id, input) },
-      signals.cancel,
-    );
-    if (outcome.status === "approved") {
-      return { approvalId: outcome.approvalId };
-    }
-    const cancelled = await driver.runStep(`${name}:settle`, async () => {
-      await deps.store.markRunRunning(run.id);
-      await deps.scriptRuns.setStatus(scriptRunId, "running");
-      return isCancelled();
-    });
-    const kind = cancelled ? "cancelled" : outcome.status;
-    const message = cancelled
-      ? "script cancelled"
-      : outcome.status === "denied"
-        ? `Approval for ${id} was denied`
-        : `Approval for ${id} expired`;
-    halt = { kind, message, call: id };
-    return { reply: { ok: false, error: { kind, message }, now: nowMs() } };
-  };
-
-  const serveCall = async (
-    id: string,
-    input: JsonValue,
-    context: ScriptCallContext,
-  ): Promise<ScriptCallReply | ScriptCallHalt> => {
-    ordinal += 1;
-    if (halt !== undefined) {
-      return { ok: false, error: { kind: "cancelled", message: halt.message } };
-    }
-    const name = `call-${ordinal}:${id}:${(await fingerprintJson(input)).slice(0, INPUT_DIGEST_CHARS)}`;
-    const descriptor = descriptors.get(id);
-    let step: CallStepResult;
-    if (descriptor?.effect === "write") {
-      const effect: EffectIdentity = {
-        runId: run.id,
-        operationKind: "capability",
-        operationId: id,
-        canonicalArguments: input,
-        attemptId: `${scriptRunId}:${ordinal}`,
-      };
-      let approvalId: string | undefined;
-      const rule = await bounded.runStep(
-        `${name}:needs-approval`,
-        async (): Promise<
-          { readonly needsApproval: boolean } | { readonly failure: string; readonly now: number }
-        > => {
-          try {
-            return { needsApproval: deps.catalog.requiresApproval(id, input) };
-          } catch (error) {
-            return { failure: errorMessage(error), now: nowMs() };
-          }
-        },
-      );
-      if ("failure" in rule) {
-        return {
-          ok: false,
-          error: { kind: "capability", message: rule.failure },
-          now: rule.now,
-        };
-      }
-      if (context.settled()) {
-        return HALT_SCRIPT;
-      }
-      if (rule.needsApproval) {
-        const asked = await askApproval(name, id, input, effect);
-        if ("reply" in asked) {
-          return asked.reply;
-        }
-        approvalId = asked.approvalId;
-      }
-      writeInFlight = effect;
-      step = await writeStep(name, id, input, effect, approvalId, context);
-      writeInFlight = undefined;
-    } else {
-      step = await readStep(name, id, input);
-    }
-    switch (step.kind) {
-      case "reply":
-        return step.reply;
-      case "abandoned":
-        return HALT_SCRIPT;
-      case "run-ended":
-        runEnded ??= step.detail;
-        halt = { kind: "cancelled", message: step.detail, call: id };
-        return HALT_SCRIPT;
-      case "doubt":
-        interrupted ??= { effectId: step.effectId, detail: step.detail };
-        halt = { kind: "cancelled", message: step.detail, call: id };
-        return HALT_SCRIPT;
-      case "interrupted":
-        interrupted ??= { effectId: step.effectId, detail: step.detail };
-        halt = { kind: "cancelled", message: step.detail, call: id };
-        return HALT_SCRIPT;
-    }
-  };
-
-  const inFlight = new Set<Promise<unknown>>();
-  const call = (
-    id: string,
-    input: JsonValue,
-    context: ScriptCallContext,
-  ): Promise<ScriptCallReply | ScriptCallHalt> => {
-    const served = serveCall(id, input, context).catch((error: unknown) => {
-      hostFailure ??= { error, effect: writeInFlight };
-      return HALT_SCRIPT;
-    });
-    inFlight.add(served);
-    void served.finally(() => inFlight.delete(served));
-    return served;
-  };
-
-  const result = await runScript({
-    script: start.source,
-    call,
-    limits: deps.limits,
-    seed: start.seed,
-    now: start.now,
-    ...(callSignal === undefined ? {} : { signal: callSignal }),
-  });
-  if (signals.attemptEnded?.aborted) {
-    return undefined;
-  }
-  await waitForCallsInFlight();
-  if (hostFailure !== undefined) {
-    interrupted = await resolveInDoubtWrite(hostFailure.effect, errorMessage(hostFailure.error));
-    if (interrupted === undefined) {
-      throw hostFailure.error;
-    }
-  }
-
-  return finish(await settle(result));
-
-  async function resolveInDoubtWrite(
-    effect: EffectIdentity | undefined,
-    cause: string,
-  ): Promise<{ readonly effectId: EffectId; readonly detail: string } | undefined> {
-    const doubt = await driver.runStep("script-resolve-doubt", async () => {
-      const recorded = effect === undefined ? undefined : await deps.store.getEffect(effect);
-      if (
-        recorded === undefined ||
-        (recorded.status !== "started" && recorded.status !== "unknown")
-      ) {
-        return null;
-      }
-      return {
-        effectId: recorded.id,
-        detail: `Effect capability:${recorded.identity.operationId} (${recorded.identity.attemptId}) could not be recorded after the host failed: ${cause}`,
-      };
-    });
-    return doubt ?? undefined;
-  }
-
-  async function waitForCallsInFlight(): Promise<void> {
-    if (inFlight.size === 0) {
-      return;
-    }
-    let timer: ReturnType<typeof setTimeout> | undefined;
-    const grace = new Promise<void>((resolve) => {
-      timer = setTimeout(resolve, deps.inFlightGraceMs ?? IN_FLIGHT_GRACE_MS);
-    });
-    await Promise.race([Promise.allSettled(inFlight), grace]);
-    clearTimeout(timer);
-  }
-
-  async function settle(scripted: ScriptResult): Promise<ExecuteResult> {
-    if (interrupted !== undefined) {
-      const detail = interrupted;
-      await driver.runStep("script-interrupt-run", async () => {
-        await deps.store.markEffectUnknown(detail.effectId);
-        await finalizeInterruptedUncertainStep(
-          deps.now ? { store: deps.store, now: deps.now } : { store: deps.store },
-          { run, effectId: detail.effectId, detail: detail.detail },
-        );
-        return null;
-      });
-      return failure("capability", detail.detail, scripted.logs);
-    }
-    if (runEnded !== undefined) {
-      return failure("capability", runEnded, scripted.logs);
-    }
-    if (halt !== undefined && halt.kind !== "cancelled") {
-      return failure(halt.kind, halt.message, scripted.logs, halt.call);
-    }
-    if (halt?.kind === "cancelled" || isCancelled() || signals.cancel?.aborted) {
-      return failure("cancelled", "script cancelled", scripted.logs);
-    }
-    return scripted;
-  }
-
-  async function finish(computed: ExecuteResult): Promise<ExecuteResult> {
-    const outcome = isStorable(computed)
-      ? computed
-      : failure("script", "script produced a result the host cannot store");
-    const settled = await bounded.runStep("script-finish", async () => {
-      const row = await deps.scriptRuns.finish(
-        scriptRunId,
-        interrupted !== undefined ? "interrupted" : terminalStatusOf(outcome),
-        outcome,
-      );
-      return row.result ?? outcome;
-    });
-    return settled;
-  }
-}
-
-function nestingDepth(value: unknown): number {
-  let deepest = 0;
-  const pending: Array<readonly [unknown, number]> = [[value, 0]];
-  for (let next = pending.pop(); next !== undefined; next = pending.pop()) {
-    const [node, depth] = next;
-    if (typeof node === "object" && node !== null) {
-      deepest = Math.max(deepest, depth + 1);
-      for (const child of Object.values(node)) {
-        pending.push([child, depth + 1]);
-      }
-    }
-  }
-  return deepest;
-}
-
-function isStorable(result: ExecuteResult): boolean {
-  if (nestingDepth(result) > MAX_RESULT_DEPTH) {
-    return false;
-  }
-  try {
-    return executeResult.safeParse(result).success;
-  } catch {
-    return false;
-  }
-}
-
-function replyFromOutcome(outcome: JsonValue | null): ScriptCallReply {
-  if (outcome !== null && typeof outcome === "object" && !Array.isArray(outcome)) {
-    if (outcome["ok"] === true) {
-      return { ok: true, value: outcome["value"] ?? null };
-    }
-    if (outcome["ok"] === false && typeof outcome["message"] === "string") {
-      return { ok: false, error: { kind: "capability", message: outcome["message"] } };
-    }
-  }
-  return { ok: true, value: null };
 }

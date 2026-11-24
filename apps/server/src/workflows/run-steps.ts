@@ -18,6 +18,7 @@ import {
   type Run,
   type RunAdmission,
   type RunEvent,
+  type RunEventInput,
   type RunId,
   type RunRequest,
   type RunStore,
@@ -361,6 +362,23 @@ async function runEngineAttempt(
   return { kind: "completed" };
 }
 
+export function approvalRequestedEvent(approval: Approval): RunEventInput {
+  return {
+    chunkKey: `${approval.runId}:approval:${approval.id}:requested`,
+    chunk: {
+      type: "CUSTOM",
+      name: "approval.requested",
+      value: {
+        approvalId: approval.id,
+        operationKind: approval.effect.operationKind,
+        operationId: approval.effect.operationId,
+        prompt: approval.prompt,
+        deadline: approval.deadline,
+      },
+    },
+  };
+}
+
 export async function persistPendingApprovalStep(
   deps: WorkflowDeps,
   input: {
@@ -381,22 +399,7 @@ export async function persistPendingApprovalStep(
     deadline: input.deadline,
   });
 
-  await deps.store.appendRunEvents(input.run.id, [
-    {
-      chunkKey: `${input.run.id}:approval:${result.approval.id}:requested`,
-      chunk: {
-        type: "CUSTOM",
-        name: "approval.requested",
-        value: {
-          approvalId: result.approval.id,
-          operationKind: input.effect.operationKind,
-          operationId: input.effect.operationId,
-          prompt: input.prompt,
-          deadline: result.approval.deadline,
-        },
-      },
-    },
-  ]);
+  await deps.store.appendRunEvents(input.run.id, [approvalRequestedEvent(result.approval)]);
 
   return {
     approvalId: result.approval.id,

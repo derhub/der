@@ -28,6 +28,7 @@ import {
   type Session,
   type SessionId,
   type Skill,
+  type ScriptStore,
 } from "@der/domain";
 import { createMcpIntegration } from "@der/mcp";
 import {
@@ -59,9 +60,8 @@ import {
   type OfficialEngineKind,
 } from "@der/runtime/sandbox";
 import {
-  openSqliteScriptRuns,
+  openSqliteScriptStore,
   openSqliteStore,
-  type SqliteScriptRuns,
   type SqliteStore,
   type StorageMigration,
   type UpsertChannelBindingInput,
@@ -99,13 +99,7 @@ import { createFixtureCapabilities } from "./capabilities/fixture";
 import { createExecuteTool } from "./code-mode/execute";
 import { codeModeInstructions } from "./code-mode/instructions";
 import { createCatalogSearchCapability, createSearchTool } from "./code-mode/search";
-import type { ScriptExecutionDeps } from "./scripts/script-execution";
-import {
-  createDirectScriptRuns,
-  createRestateScriptRuns,
-  createScriptWorkflow,
-  type ScriptRuns,
-} from "./scripts/script-workflow";
+import { ScriptDriver } from "./scripts/script-driver";
 
 export interface SeededFixtureRecords {
   readonly bot: Bot;
@@ -196,8 +190,8 @@ export interface RunningServer {
   readonly routines: SqliteRoutines;
   readonly skills: SkillCatalog;
   readonly catalog: Catalog;
-  readonly scriptRunStore: SqliteScriptRuns;
-  readonly scriptRuns: ScriptRuns;
+  readonly scriptRunStore: ScriptStore;
+  readonly scriptDriver: ScriptDriver;
   readonly engines: ReadonlyMap<EngineKind, Engine>;
   readonly coordinator: RunCoordinator;
   readonly workflow: DurableWorkflow;
@@ -464,8 +458,8 @@ function createContextLoader(input: {
   readonly turns: Map<RunId, TurnRecord>;
   readonly codeMode: {
     readonly catalog: Catalog;
-    readonly scriptRunStore: SqliteScriptRuns;
-    readonly scriptRuns: ScriptRuns;
+    readonly scriptRunStore: ScriptStore;
+    readonly scriptDriver: ScriptDriver;
     readonly maxResultBytes: number;
   };
 }): LoadEngineRunInput {
@@ -505,7 +499,7 @@ function createContextLoader(input: {
         createExecuteTool({
           run,
           scriptRunStore: codeMode.scriptRunStore,
-          scriptRuns: codeMode.scriptRuns,
+          scriptDriver: codeMode.scriptDriver,
           maxResultBytes: codeMode.maxResultBytes,
         }),
       ],
@@ -663,7 +657,7 @@ export async function startServer(options: CreateServerOptions = {}): Promise<Ru
   const closing = new AbortController();
   let integrationRegistry: IntegrationRegistry | undefined;
   let closeDirectDriver: (() => void) | undefined;
-  let closeDirectScriptRuns: (() => Promise<void>) | undefined;
+  let closeScriptDriver: (() => Promise<void>) | undefined;
   let restateServer: ReturnType<typeof Bun.serve> | undefined;
   let httpServer: ReturnType<typeof Bun.serve> | undefined;
   let outbox: ReturnType<typeof createOutboxSender> | undefined;
@@ -775,33 +769,29 @@ export async function startServer(options: CreateServerOptions = {}): Promise<Ru
 
     const engines = new Map<EngineKind, Engine>(options.engines);
     const clockNow = options.now ?? (() => store.database.now());
-    const scriptRunStore = openSqliteScriptRuns({ database: store.database });
-    let scriptRuns: ScriptRuns;
-
-    let coordinator: RunCoordinator;
-    let routineSchedule: RoutineScheduleClient;
-
-    const cancelUnfinishedScriptRuns = async (run: Run): Promise<void> => {
-      for (const scriptRun of scriptRunStore.listUnfinished(run.id)) {
-        await scriptRuns?.cancel(scriptRun.id);
-      }
-    };
-
-    const scriptRoutines = (): ScriptRoutineDeps => ({ routines, scriptRunStore, scriptRuns });
-
-    const scriptExecutionDeps = (): ScriptExecutionDeps => ({
+    const scriptRunStore = openSqliteScriptStore({ database: store.database });
+    const scriptDriver = new ScriptDriver({
       store,
-      scriptRuns: scriptRunStore,
+      scripts: scriptRunStore,
       catalog,
-      approvals: coordinator,
+      approvalTimeoutMs: config.approvalTimeoutMs,
+      sweepIntervalMs: config.scriptSweepIntervalMs,
       limits: {
         memoryBytes: config.scriptMemoryBytes,
         activeMs: config.scriptActiveMs,
-        maxCalls: config.scriptMaxCalls,
+        maxSteps: config.scriptMaxSteps,
+        maxInFlight: config.scriptMaxInFlight,
+        maxAll: config.scriptMaxAll,
         outputBytes: config.scriptOutputBytes,
       },
       now: clockNow,
+      logError: (error) => console.error("Script driver error", error),
     });
+    closeScriptDriver = () => scriptDriver.close();
+
+    let coordinator: RunCoordinator;
+    let routineSchedule: RoutineScheduleClient;
+    const scriptRoutines = (): ScriptRoutineDeps => ({ routines, scriptRunStore, scriptDriver });
 
     const turns = new Map<RunId, TurnRecord>();
 
@@ -814,20 +804,27 @@ export async function startServer(options: CreateServerOptions = {}): Promise<Ru
         driver: directDriver,
         approvalTimeoutMs: config.approvalTimeoutMs,
         now: clockNow,
-        onRunFinished: cancelUnfinishedScriptRuns,
+        onRunFinished: (run) => scriptDriver.cancelRun(run.id),
         scriptRoutines,
       });
-      directDriver.setRunner((runId) => coordinator.executeRun(runId, directDriver));
-      closeDirectDriver = () => directDriver.close();
-      await scriptRunStore.interruptAbandoned();
-      const directScriptRuns = createDirectScriptRuns({
-        ...scriptExecutionDeps(),
-        driver: directDriver,
-        decide: (decision) => coordinator.decide(decision),
+      directDriver.setRunner(async (runId) => {
+        try {
+          await coordinator.executeRun(runId, directDriver);
+        } catch (error) {
+          if (!closing.signal.aborted) {
+            console.error(`Direct Run ${runId} failed`, error);
+          }
+        }
       });
-      scriptRuns = directScriptRuns;
-      closeDirectScriptRuns = () => directScriptRuns.close();
-
+      const unfinishedRoutines = store.database.db
+        .query<{ id: RunId }, []>(
+          "SELECT id FROM runs WHERE engine = 'script' AND status IN ('queued', 'running', 'waiting_approval')",
+        )
+        .all();
+      for (const { id } of unfinishedRoutines) {
+        await directDriver.start?.(id);
+      }
+      closeDirectDriver = () => directDriver.close();
       routineSchedule = createDirectRoutineScheduleClient({
         routines,
         engines,
@@ -855,7 +852,7 @@ export async function startServer(options: CreateServerOptions = {}): Promise<Ru
         driver: restateDriver,
         approvalTimeoutMs: config.approvalTimeoutMs,
         now: clockNow,
-        onRunFinished: cancelUnfinishedScriptRuns,
+        onRunFinished: (run) => scriptDriver.cancelRun(run.id),
         scriptRoutines,
       });
       routineSchedule = createRoutineScheduleClient(config.restateIngressUrl);
@@ -871,15 +868,6 @@ export async function startServer(options: CreateServerOptions = {}): Promise<Ru
           }),
         );
       }
-
-      if (!hasRestateServiceNamed(extraServices, "ScriptWorkflow")) {
-        extraServices.push(createScriptWorkflow(scriptExecutionDeps()));
-      }
-      scriptRuns = createRestateScriptRuns(config.restateIngressUrl, {
-        scriptRuns: scriptRunStore,
-        decide: (decision) => coordinator.decide(decision),
-        now: clockNow,
-      });
 
       const restateFetchHandler = createRestateFetchHandler(coordinator, extraServices);
       restateServer = Bun.serve({
@@ -906,7 +894,7 @@ export async function startServer(options: CreateServerOptions = {}): Promise<Ru
       codeMode: {
         catalog,
         scriptRunStore,
-        scriptRuns,
+        scriptDriver,
         maxResultBytes: config.scriptResultBytes,
       },
     });
@@ -949,6 +937,7 @@ export async function startServer(options: CreateServerOptions = {}): Promise<Ru
       skills,
       catalog,
       workflow: coordinator,
+      scriptDriver,
       routineSchedule,
       engines,
       config,
@@ -992,7 +981,9 @@ export async function startServer(options: CreateServerOptions = {}): Promise<Ru
 
     const commands: ServerCommands = {
       admitRun: (request) => coordinator.admit(request),
-      decideApproval: (decision, channelIntake) => coordinator.decide(decision, channelIntake),
+      decideApproval: async (decision, channelIntake) =>
+        (await scriptDriver.decide(decision, channelIntake)) ??
+        coordinator.decide(decision, channelIntake),
       configureRoutine: (routineId, input) => routineSchedule.configure(routineId, input),
       listBots: () => store.listBots(),
       listSessions: (botId) => store.listSessions(botId),
@@ -1033,6 +1024,8 @@ export async function startServer(options: CreateServerOptions = {}): Promise<Ru
       listChannelBindings: (filter) => store.listChannelBindings(filter),
     };
 
+    scriptDriver.start();
+
     const restateUrl =
       restateServer !== undefined
         ? `http://${config.restateHost}:${restateServer.port}`
@@ -1046,7 +1039,7 @@ export async function startServer(options: CreateServerOptions = {}): Promise<Ru
       skills,
       catalog,
       scriptRunStore,
-      scriptRuns,
+      scriptDriver,
       engines,
       coordinator,
       workflow: coordinator,
@@ -1068,7 +1061,7 @@ export async function startServer(options: CreateServerOptions = {}): Promise<Ru
 
         closing.abort();
         await runStep(() => startedOutbox.stop());
-        await runStep(() => closeDirectScriptRuns?.());
+        await runStep(() => closeScriptDriver?.());
         await runStep(() => closeDirectDriver?.());
         await runStep(() => integrationRegistry?.stop());
         await runStep(() => startedHttpServer.stop(true));
@@ -1089,7 +1082,7 @@ export async function startServer(options: CreateServerOptions = {}): Promise<Ru
     };
   } catch (error) {
     await outbox?.stop().catch(() => undefined);
-    await closeDirectScriptRuns?.().catch(() => undefined);
+    await closeScriptDriver?.().catch(() => undefined);
     try {
       closeDirectDriver?.();
     } catch {
