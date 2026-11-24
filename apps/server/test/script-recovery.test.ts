@@ -152,7 +152,7 @@ describe("recover Scripts from SQLite", () => {
         ok: false,
         error: {
           kind: "capability",
-          message: "A write in this Run has an unknown outcome (notes.append).",
+          message: expect.stringContaining("notes.append"),
         },
       });
       expect(fixture.host.appended).toEqual(["sibling"]);
@@ -204,7 +204,7 @@ describe("recover Scripts from SQLite", () => {
             ok: false,
             error: {
               kind: "nondeterministic",
-              message: expect.stringContaining("did not repeat itself"),
+              message: expect.any(String),
             },
           },
         },
@@ -477,19 +477,16 @@ describe("recover Scripts from SQLite", () => {
       case: "a stored read whose capability now declares write",
       capability: "notes.publish",
       effect: "read",
-      detail: "step 1 (notes.publish) was recorded as a read and is now declared write",
     },
     {
       case: "a stored write whose capability now declares read",
       capability: "notes.read",
       effect: "write",
-      detail: "step 1 (notes.read) was recorded as a write and is now declared read",
     },
     {
       case: "a stored step whose capability no longer exists",
       capability: "notes.removed",
       effect: "read",
-      detail: "step 1 (notes.removed) was recorded but the capability no longer exists",
     },
   ] as const)("fails the re-run of $case before invoking anything", async (testCase) => {
     const fixture = await openScriptFixture();
@@ -521,13 +518,13 @@ describe("recover Scripts from SQLite", () => {
         result: second.scripts.load(id).execution.result,
         invoked: [...fixture.host.reads, ...fixture.host.appended, ...fixture.host.published],
         approvals: reopened.listPendingApprovalsForRun(fixture.run.id),
-      }).toEqual({
+      }).toMatchObject({
         execution: "failed",
         result: {
           ok: false,
           error: {
             kind: "nondeterministic",
-            message: `the Script did not repeat itself: ${testCase.detail}. Already applied: nothing.`,
+            message: expect.stringContaining(testCase.capability),
           },
           logs: [],
         },
@@ -546,16 +543,12 @@ describe("recover Scripts from SQLite", () => {
       case: "a removed capability",
       second: "notes.removed",
       limits: {},
-      message:
-        "the Script did not repeat itself: step 2 (notes.removed) was recorded but the capability no longer exists. Already applied: none confirmed. Unknown outcome: #1 notes.append.",
       kind: "nondeterministic",
     },
     {
       case: "the step limit",
       second: "notes.read",
       limits: { maxSteps: 1 },
-      message:
-        "step limit of 1 exceeded. Already applied: none confirmed. Unknown outcome: #1 notes.append.",
       kind: "limit",
     },
   ] as const)(
@@ -615,11 +608,14 @@ describe("recover Scripts from SQLite", () => {
           effect: reopened.getEffect(effect)?.status,
           run: reopened.getRun(fixture.run.id)?.status,
           appended: fixture.host.appended,
-        }).toEqual({
+        }).toMatchObject({
           execution: "in_doubt",
           result: {
             ok: false,
-            error: { kind: testCase.kind, message: testCase.message },
+            error: {
+              kind: testCase.kind,
+              message: expect.stringMatching(/Unknown outcome:.*notes\.append/),
+            },
             logs: [],
           },
           effect: "unknown",

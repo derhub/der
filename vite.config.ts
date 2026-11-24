@@ -13,6 +13,31 @@ const RUN_LIFECYCLE_IMPORT = {
     "Only the Run lifecycle sets a Run's status or writes its terminal chunk. Go through the store (startRun via markRunRunning, finishRun, requestApproval, decide) instead of importing run-lifecycle.",
 };
 
+/** SQLite stays inside @der/storage; every other layer depends on narrow domain ports. */
+const SQLITE_IMPORT = {
+  name: "bun:sqlite",
+  message: "Keep bun:sqlite inside packages/storage; use the domain storage ports elsewhere.",
+};
+
+const STORAGE_PACKAGE_IMPORT = {
+  regex: "^@der/storage(/|$)",
+  message:
+    "Depend on narrow storage ports from @der/domain here; keep concrete @der/storage wiring in packages/storage and apps/server/src/main.ts.",
+};
+
+const STORAGE_SQLITE_WIRING = {
+  name: "@der/storage",
+  importNames: [
+    "openSqliteDatabase",
+    "openSqliteStore",
+    "openSqliteScriptStore",
+    "SqliteStore",
+    "SqliteScriptStore",
+  ],
+  message:
+    "Depend on narrow storage ports from @der/domain here; keep concrete SQLite store wiring in apps/server/src/main.ts.",
+};
+
 export default defineConfig({
   fmt: {
     singleQuote: false,
@@ -26,9 +51,19 @@ export default defineConfig({
       typeCheck: true,
     },
     rules: {
-      "no-restricted-imports": ["error", { patterns: [SRC_PATH_IMPORT, RUN_LIFECYCLE_IMPORT] }],
+      "no-restricted-imports": [
+        "error",
+        { paths: [SQLITE_IMPORT], patterns: [SRC_PATH_IMPORT, RUN_LIFECYCLE_IMPORT] },
+      ],
     },
     overrides: [
+      {
+        // SQLite implementation and storage migration tests own bun:sqlite directly.
+        files: ["packages/storage/**"],
+        rules: {
+          "no-restricted-imports": ["error", { patterns: [SRC_PATH_IMPORT, RUN_LIFECYCLE_IMPORT] }],
+        },
+      },
       {
         // The storage modules that expose the Run lifecycle through the store's own methods.
         files: [
@@ -39,6 +74,38 @@ export default defineConfig({
         ],
         rules: {
           "no-restricted-imports": ["error", { patterns: [SRC_PATH_IMPORT] }],
+        },
+      },
+      {
+        // Server transport, capability, code-mode, event, and messaging layers depend only on domain ports.
+        files: [
+          "apps/server/src/http/**",
+          "apps/server/src/messaging/**",
+          "apps/server/src/events/**",
+          "apps/server/src/code-mode/**",
+          "apps/server/src/capabilities/**",
+        ],
+        rules: {
+          "no-restricted-imports": [
+            "error",
+            {
+              paths: [SQLITE_IMPORT],
+              patterns: [SRC_PATH_IMPORT, RUN_LIFECYCLE_IMPORT, STORAGE_PACKAGE_IMPORT],
+            },
+          ],
+        },
+      },
+      {
+        // Workflows and scripts may use pure helpers like fingerprintJson, never concrete SQLite stores.
+        files: ["apps/server/src/workflows/**", "apps/server/src/scripts/**"],
+        rules: {
+          "no-restricted-imports": [
+            "error",
+            {
+              paths: [SQLITE_IMPORT, STORAGE_SQLITE_WIRING],
+              patterns: [SRC_PATH_IMPORT, RUN_LIFECYCLE_IMPORT],
+            },
+          ],
         },
       },
     ],

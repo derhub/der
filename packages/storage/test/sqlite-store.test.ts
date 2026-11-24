@@ -1169,7 +1169,8 @@ describe("bot policy", () => {
   it("rejects a policy key that is not a capability id or namespace", () => {
     const store = openSqliteStore({ filename: createTempDbPath() });
     try {
-      expect(() =>
+      let thrown: unknown;
+      try {
         store.createBot({
           name: "P",
           persona: "",
@@ -1177,8 +1178,12 @@ describe("bot policy", () => {
           allowedEngines: ["fixture"],
           capabilityPolicy: { "notes.": "allow" },
           eventChainLimit: 3,
-        }),
-      ).toThrow("policy key must be a capability id or a dotted namespace");
+        });
+      } catch (error) {
+        thrown = error;
+      }
+      expect(thrown).toBeInstanceOf(DomainError);
+      expect(thrown).toMatchObject({ code: "bot.invalid_input", status: 400 });
     } finally {
       store.close();
     }

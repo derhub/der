@@ -331,9 +331,13 @@ describe("validate capability input", () => {
     expect(registry.catalog.list()[0]?.inputSchema).toMatchObject({
       properties: { city: { type: "string" } },
     });
-    expect(() => registry.catalog.validateInput("weather.read", { city: "Atlantis" })).toThrow(
-      'Invalid input for capability "weather.read"',
-    );
+    let thrown: unknown;
+    try {
+      registry.catalog.validateInput("weather.read", { city: "Atlantis" });
+    } catch (error) {
+      thrown = error;
+    }
+    expect(thrown).toMatchObject({ code: "capability.invalid_input", status: 400 });
     expect(registry.catalog.validateInput("weather.read", { city: "Oslo" })).toEqual({
       city: "Oslo",
     });

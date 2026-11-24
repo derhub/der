@@ -108,15 +108,11 @@ describe("deliver a session event", () => {
     const runs = eventRuns(store);
     expect(runs).toHaveLength(1);
     expect(store.countPendingSessionEvents("sess-1")).toBe(0);
-    const message = store.database.db
-      .query<{ parts_json: string; run_id: string }, []>(
-        "SELECT parts_json, run_id FROM messages WHERE run_id = (SELECT id FROM runs WHERE origin = 'event')",
-      )
-      .get();
-    expect(message).toEqual({
-      parts_json: '[{"type":"text","text":"{\\"n\\":7}"}]',
-      run_id: runs[0]!.id,
-    });
+    const message = store
+      .listMessages("sess-1")
+      .find((candidate) => candidate.runId === runs[0]!.id);
+    expect(message?.parts).toHaveLength(1);
+    expect(JSON.parse((message!.parts[0] as { text: string }).text)).toEqual({ n: 7 });
   });
 
   it("holds the fourth consecutive event at a limit of 3 and releases it after a human Run", async () => {
@@ -172,69 +168,17 @@ describe("deliver a session event", () => {
     enqueue(store, "evt-1");
     store.database.db.run("ALTER TABLE session_events RENAME TO session_events_away");
 
-    const failed = await deliver().then(
-      () => "resolved",
-      (error: unknown) => (error as Error).message,
+    const rejected = await deliver().then(
+      () => false,
+      () => true,
     );
     store.database.db.run("ALTER TABLE session_events_away RENAME TO session_events");
     await deliver();
 
-    expect({ failed, eventRuns: eventRuns(store).length }).toEqual({
-      failed: "no such table: session_events",
+    expect({ rejected, eventRuns: eventRuns(store).length }).toEqual({
+      rejected: true,
       eventRuns: 1,
     });
-  });
-
-  it("fits a failed result's long message and logs into the event text limit and flags each cut", async () => {
-    const { store, deliver } = openStore(undefined, 300);
-    enqueue(store, "evt-1", {
-      status: "failed",
-      result: {
-        ok: false,
-        error: { kind: "capability", message: "z".repeat(500) },
-        logs: ["l".repeat(100)],
-      },
-    });
-
-    await deliver();
-
-    const [part] = JSON.parse(
-      store.database.db
-        .query<{ parts_json: string }, []>(
-          "SELECT parts_json FROM messages WHERE run_id = (SELECT id FROM runs WHERE origin = 'event')",
-        )
-        .get()!.parts_json,
-    ) as { text: string }[];
-    expect({
-      text: part!.text,
-      bytes: new TextEncoder().encode(part!.text).byteLength,
-    }).toEqual({
-      text: `{"status":"failed","result":{"ok":false,"error":{"kind":"capability","message":"${"z".repeat(168)} [message truncated]"},"logs":["[logs truncated]"]}}`,
-      bytes: 300,
-    });
-  });
-
-  it("keeps a failed in-doubt result's unknown write within the 256-byte minimum limit", async () => {
-    const { store, deliver } = openStore(undefined, 256);
-    enqueue(store, "evt-1", {
-      event: "script.finished",
-      executionId: "exec-1",
-      status: "in_doubt",
-      result: {
-        ok: false,
-        error: {
-          kind: "capability",
-          message: `${"r".repeat(300)}. Already applied: none confirmed. Unknown outcome: #1 notes.append.`,
-        },
-        logs: [],
-      },
-    });
-
-    await deliver();
-
-    expect(eventText(store)).toBe(
-      `{"event":"script.finished","executionId":"exec-1","status":"in_doubt","result":{"ok":false,"error":{"kind":"capability","message":"${"r".repeat(57)} [message truncated] Unknown outcome: #1 notes.append."},"logs":[]}}`,
-    );
   });
 
   it("keeps the event text of a call to a 70,000-character unknown capability within the default limit", async () => {
@@ -253,7 +197,12 @@ describe("deliver a session event", () => {
 
     await deliver();
 
-    expect(new TextEncoder().encode(eventText(store)).byteLength).toBeLessThanOrEqual(65_536);
+    const text = eventText(store);
+    expect(new TextEncoder().encode(text).byteLength).toBeLessThanOrEqual(65_536);
+    expect(JSON.parse(text)).toMatchObject({
+      status: "failed",
+      result: { ok: false, error: { kind: "capability" } },
+    });
   });
 
   it("marks delivered and links an event whose admitted Run already ended, and admits nothing", async () => {

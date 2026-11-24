@@ -170,17 +170,13 @@ describe("execute a Script that waits on an Approval past the inline wait", () =
     const message = server.store
       .listMessages(owner.sessionId)
       .find((candidate) => candidate.runId === eventRun!.id && candidate.role === "user")!;
-    expect(message.parts).toEqual([
-      {
-        type: "text",
-        text: JSON.stringify({
-          event: "script.finished",
-          executionId: pending.executionId,
-          status: "completed",
-          result: { ok: true, result: { published: true }, logs: [], truncated: false },
-        }),
-      },
-    ]);
+    expect(message.parts).toHaveLength(1);
+    expect(JSON.parse((message.parts[0] as { text: string }).text)).toEqual({
+      event: "script.finished",
+      executionId: pending.executionId,
+      status: "completed",
+      result: { ok: true, result: { published: true }, logs: [], truncated: false },
+    });
   }, 60_000);
 
   it("admits a new human Run in the session while the detached execution still waits", async () => {

@@ -81,7 +81,7 @@ const resultCase: fc.Arbitrary<Case> = fc.oneof(
     .record({
       failure,
       applied: fc.array(capabilityId, { maxLength: 3 }),
-      unknown: fc.array(capabilityId, { minLength: 1, maxLength: 12 }),
+      unknown: fc.array(capabilityId, { minLength: 1, maxLength: 40 }),
     })
     .map(({ failure: f, applied, unknown }) => {
       const names = unknown.map((id, index) => `#${applied.length + index + 1} ${id}`);
@@ -95,6 +95,7 @@ const resultCase: fc.Arbitrary<Case> = fc.oneof(
             kind: f.kind,
             message: `${f.message.replace(/\.$/, "")}. Already applied: ${done || "none confirmed"}. ${UNKNOWN_OUTCOME}${names.join(", ")}.`,
             ...(f.call === undefined ? {} : { call: f.call }),
+            ...(f.line === undefined ? {} : { line: f.line }),
           },
           logs: f.logs,
         },

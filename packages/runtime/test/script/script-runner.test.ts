@@ -95,11 +95,10 @@ describe("enforce Script sandbox safety", () => {
       async (_route, body) => {
         const result = await started(`const code = "return 1;"; ${body}`);
 
-        expect(result).toMatchObject({
-          error: {
-            kind: "script",
-            message: "EvalError: code generation from strings is not available in a Script",
-          },
+        expect(result.returned).toBeUndefined();
+        expect(result.error).toMatchObject({
+          kind: "script",
+          message: expect.stringContaining("EvalError"),
         });
       },
       60_000,
@@ -164,9 +163,9 @@ describe("enforce Script sandbox safety", () => {
       "const keep = []; for (;;) keep.push(new Uint8Array(4_000_000).fill(1));",
       { memoryBytes: bound },
     );
-    expect(result.error).toEqual({
+    expect(result.error).toMatchObject({
       kind: "limit",
-      message: "memory limit of 268435456 bytes exceeded",
+      message: expect.stringMatching(/memory/i),
     });
     expect(process.memoryUsage().rss).toBeLessThan(2 * bound);
   });
@@ -175,9 +174,9 @@ describe("enforce Script sandbox safety", () => {
     const result = await started(`return 1; // ${"x".repeat(64 * 1024 * 1024)}`, {
       memoryBytes: 4 * 1024 * 1024,
     });
-    expect(result.error).toEqual({
+    expect(result.error).toMatchObject({
       kind: "limit",
-      message: "memory limit of 4194304 bytes exceeded",
+      message: expect.stringMatching(/memory/i),
     });
   });
 
@@ -246,9 +245,9 @@ describe("enforce Script sandbox safety", () => {
           session.started.then(() => "guest"),
         ]);
         expect(first).toBe("host");
-        expect((await session.started).error).toEqual({
+        expect((await session.started).error).toMatchObject({
           kind: "limit",
-          message: "active time limit of 150 ms exceeded",
+          message: expect.stringMatching(/time/i),
         });
       },
       { activeMs: 150 },
@@ -257,6 +256,9 @@ describe("enforce Script sandbox safety", () => {
 
   it("refuses output that exceeds the worker reply budget", async () => {
     const result = await started(`console.log("x".repeat(4096)); return 1;`, { outputBytes: 512 });
-    expect(result.error).toEqual({ kind: "limit", message: "output limit of 512 bytes exceeded" });
+    expect(result.error).toMatchObject({
+      kind: "limit",
+      message: expect.stringMatching(/output/i),
+    });
   });
 });

@@ -36,57 +36,35 @@ Pass integrations to the server with `startServer({ integrations })` (`CreateSer
 
 ## Define a capability
 
-```ts
-// packages/domain/src/interfaces/capability.ts
-interface Capability<TInput extends z.ZodType, TOutput extends z.ZodType> {
-  readonly id: string;
-  readonly description: string;
-  readonly input: TInput;
-  readonly output: TOutput;
-  readonly effect: "read" | "write";
-  readonly approval: "none" | "always" | ((input: z.infer<TInput>) => boolean); // the default; a bot's policy can override it
-  readonly example?: string;
-  execute(input: z.infer<TInput>, ctx: CapabilityContext): Promise<z.infer<TOutput>>;
-}
-interface CapabilityContext {
-  readonly botId?: string;
-  readonly effect?: EffectIdentity;
-  readonly signal?: AbortSignal;
-}
-```
+See `Capability` and `CapabilityContext` in `@der/domain` for the full type definitions.
 
-- `input` and `output` are Zod schemas. Inputs and outputs cross a JSON boundary, so use JSON-compatible types.
-- `ctx.botId` is the bot that owns the calling Run. Scope data by it, as the host capabilities do (`apps/server/src/capabilities/scope.ts`).
-- `ctx.effect` is set for a `write` called from a Script. It carries the identity of the recorded Effect (`runId`, `operationKind: "capability"`, `operationId` = the capability id, `canonicalArguments`, `attemptId`). `attemptId` is the execution id and the step's position, and stays the same when the Script is re-run. Use it as an idempotency key against the upstream system.
-- `ctx.signal` aborts when the server closes. Cancelling a Script does not abort a call that is already running: the call gets up to ten seconds to finish, and no further step starts.
-- `example` is one line of Script that calls the capability. It is shown to the agent and counts toward search ranking.
+- `input` and `output` are Zod schemas over JSON-compatible values.
+- `ctx.botId` identifies the bot that owns the calling Run; scope data by it.
+- `ctx.effect` is present for writes called from a Script and carries a stable `attemptId` across re-runs to use as an upstream idempotency key.
+- `ctx.signal` aborts on server shutdown, not Script cancellation. An in-flight call gets a short grace period to finish while no new steps start.
+- `example` is one line of Script calling the capability, shown to the agent and used in search ranking.
 
 ### Ids
 
-An id is dot-separated, with at least two segments, and every segment matches `[A-Za-z_$][A-Za-z0-9_$]*`: `tasks.list`, `mcp.github.create_issue`. The first segment is the namespace. A Script calls the capability as `step.run("<id>", input)`. `defineCapability` throws `integration.invalid_capability` for any other id.
+Ids are dot-separated identifier segments starting with a namespace (`tasks.list`, `mcp.github.create_issue`). A Script calls a capability with `step.run("<id>", input)`.
 
 ### Effect class and approval
 
-- `effect: "read"` must have `approval: "none"`; `defineCapability` throws otherwise. A read's result is stored with its step and the read is not invoked again on a re-run; it leaves no Effect record.
-- `effect: "write"` is stored as a step and gets an Effect record before it runs. The recorded outcome is returned when the Script is re-run, so the call is applied once.
-- `approval: "always"` asks an operator for an exact-operation Approval on every call unless the bot's policy says otherwise (below). The prompt shows the capability id and the first 400 characters of the input.
-- `approval: (input) => boolean` is evaluated against the validated input, once, when the step is first stored. The answer is stored with the step, so a re-run does not evaluate it again.
-- `approval: "none"` on a `write` runs without an Approval but is still recorded as an Effect.
-
-`approval` is the default, not the final word. Each bot has a policy that maps a capability id or a namespace to `allow`, `ask` or `deny`; the most specific entry wins, and the capability's `approval` applies where none matches (README, "Per-bot policy"). `ask` requests an Approval for the exact capability and arguments, `allow` runs the write without one, and `deny` rejects the step with error kind `refused`. A `read` set to `ask` runs without asking. A capability author cannot widen a deny.
-
-A denied or expired Approval rejects that step's promise with error kind `denied` or `expired`. The Script can catch it and carry on; an uncaught rejection ends the Script. A step a Script starts and never awaits still runs before the Script ends. A write is refused while another write of the same Run has an unknown outcome.
+- `effect: "read"` cannot require approval. A read caches its result with its step on re-run and leaves no Effect record.
+- `effect: "write"` records an Effect before running so re-runs return the stored outcome and never apply the write twice.
+- `approval` (`"none"`, `"always"`, or a predicate evaluated once when the step is first stored) sets the capability's default. Each bot's policy (`allow`, `ask`, or `deny`, most specific match wins; see README, "Per-bot policy") overrides it. A read set to `ask` still runs without prompting, and a capability cannot widen a `deny`.
+- A denied or expired Approval or policy refusal rejects only that step's promise; the Script can catch it and continue. Unawaited steps still run before the Script ends. Writes are refused while another write in the same Run has an unknown outcome.
 
 ### Input validation
 
-`Catalog.validateInput(id, input)` checks the input against the capability's `input` schema and throws `capability.invalid_input` (`400`). The host calls it before it stores a step, so an input that fails never reaches `execute` and nothing is stored; the Script ends with error kind `capability`. `Catalog.invoke` calls it again, so the schema is also the check for any other caller.
+The host validates input against the capability's `input` schema before storing a step, so invalid input fails the Script without reaching `execute` or storage.
 
 ### Errors
 
-- A `DomainError` thrown by a `write` is recorded as a failed Effect and rejects the step with kind `failed`. A Script can catch it.
-- Any other error thrown by a `write` after dispatch is treated as an unknown outcome: the Effect is marked unknown and the write is not repeated. The step's promise never settles, so nothing that depends on it runs. The execution ends `in_doubt` with error kind `capability`. If its owning Run is still active, that Run is interrupted with `effect.outcome_uncertain`; if the Run already ended, it stays as it ended and the `script.finished` event carries the `in_doubt` outcome. An execution that stops for another reason (a re-run mismatch, a limit, a Script error, cancellation) while one of its writes has an unknown outcome also ends `in_doubt`, keeps that reason's error kind, and names the write in its message after `Unknown outcome:`. A result cut to `DER_SCRIPT_RESULT_BYTES` keeps that list and cuts the reason before it, so the `[message truncated]` marker stands before the list; names that do not fit become a count, `N omitted`, down to `Unknown outcome: N omitted.` alone. The same holds when the server stops after a write began and before its outcome was recorded. Throw a `DomainError` when the upstream call is known not to have happened.
-- Any error thrown by a `read` rejects the step with kind `failed`. A read that was interrupted before its result was stored runs again on a re-run, so a read must have no effect.
-- Unknown ids fail with `capability.unknown` (`404`), invalid input with `capability.invalid_input` (`400`). Both end the Script with kind `capability` before a step is stored.
+- Throw a `DomainError` from a `write` when the upstream side effect is known not to have happened: it records a failed Effect and rejects only that step so the Script can catch it.
+- Any other error thrown after a `write` starts (or a server stop mid-write) leaves an unknown outcome: the Effect is marked unknown and never repeated, the step never settles, and the execution ends `in_doubt`. An active owning Run is interrupted; if it already ended, the `script.finished` event carries the `in_doubt` outcome. Stopping for another reason while a write is in doubt also ends `in_doubt` and accounts for the unknown writes even when the result is bounded to fit the size limit.
+- Any error thrown by a `read` rejects that step. Because an interrupted read re-runs on resume, reads must have no side effects.
+- Unknown capability ids and invalid inputs fail the Script before any step is stored.
 
 ## The declaration an agent sees
 
@@ -179,7 +157,7 @@ const { tasks } = await step.run("tasks.list", { openOnly: true });
 return await step.run("tasks.remove", { ids: tasks.map((entry) => entry.id) });
 ```
 
-With two or more open tasks and no policy entry for `tasks`, the `tasks.remove` call waits for an operator Approval and then records one Effect. A bot with `"tasks.remove": "allow"` skips the Approval, and one with `"tasks": "deny"` has the call rejected with kind `refused`. With one open task it runs at once and still records an Effect.
+With two or more open tasks and no policy entry for `tasks`, the `tasks.remove` call waits for an operator Approval and then records one Effect. A bot with `"tasks.remove": "allow"` skips the Approval, and one with `"tasks": "deny"` refuses the call. With one open task it runs at once and still records an Effect.
 
 ## Remote MCP tools
 
