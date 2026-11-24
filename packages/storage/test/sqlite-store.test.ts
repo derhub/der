@@ -629,18 +629,18 @@ describe("append bounded run events and replay exclusively after cursor", () => 
         { chunkKey: `${run.id}:2`, chunk: { type: "TEXT_MESSAGE_CONTENT", delta: "hel" } },
         { chunkKey: `${run.id}:3`, chunk: { type: "TEXT_MESSAGE_CONTENT", delta: "lo" } },
         { chunkKey: `${run.id}:2`, chunk: { type: "TEXT_MESSAGE_CONTENT", delta: "hel" } },
-        {
-          chunkKey: `${run.id}:4`,
-          chunk: { type: "RUN_FINISHED", runId: run.id },
-          isTerminal: true,
-        },
       ]);
+      await store.finishRun({
+        runId: run.id,
+        status: "completed",
+        terminalEvent: { chunkKey: `${run.id}:terminal`, chunk: { type: "RUN_FINISHED" } },
+      });
 
-      expect(batch.map((event) => event.sequence)).toEqual([1, 2, 3, 2, 4]);
+      expect(batch.map((event) => event.sequence)).toEqual([1, 2, 3, 2]);
       expect(store.getRunStreamState(run.id)).toEqual({
         highWaterMark: 4,
         terminalSequence: 4,
-        status: "queued",
+        status: "completed",
       });
 
       const replayed: RunEvent[] = [];

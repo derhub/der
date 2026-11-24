@@ -1,4 +1,4 @@
-import { render, screen, waitFor, within } from "@testing-library/react";
+import { act, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { describe, expect, it } from "vite-plus/test";
 import { formatSseEvent, PROBLEM_DETAILS_MEDIA_TYPE, type Message } from "@der/domain";
@@ -574,6 +574,131 @@ function createHeldSessionsFetch() {
   return { fetcher, held, otherListings: () => otherListings };
 }
 
+type ListedSession = ReturnType<typeof sessionOf>;
+
+/**
+ * The fixture server with a second bot, "bot-other". `respond` answers each session listing by
+ * bot and 1-based listing number; a listing it leaves `undefined` waits in `held` until the test
+ * answers it, and rejects as fetch does once its request is aborted. Each answer settles its
+ * `read` once the console has read the body. With `holdRunEvents`, run-1's stream stays open
+ * after RUN_STARTED until `endRun`.
+ */
+function createSessionListsFetch(
+  respond: (botId: string, listing: number) => ListedSession[] | undefined,
+  options: { readonly holdRunEvents?: boolean } = {},
+) {
+  const server = createFakeServerFetch();
+  const listings = new Map<string, number>();
+  const held: {
+    botId: string;
+    listing: number;
+    answer: (sessions: ListedSession[]) => Promise<void>;
+  }[] = [];
+  const reads: Promise<void>[] = [];
+  let endRun = () => {};
+  let runEventsOpened = false;
+  const answered = (sessions: ListedSession[]) => {
+    const response = Response.json({ sessions });
+    const json = response.json.bind(response);
+    let markRead = () => {};
+    const read = new Promise<void>((resolve) => {
+      markRead = resolve;
+    });
+    response.json = async () => {
+      const body: unknown = await json();
+      markRead();
+      return body;
+    };
+    reads.push(read);
+    return { response, read };
+  };
+  const fetcher: typeof fetch = async (input, init) => {
+    const rawUrl =
+      typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
+    const url = new URL(rawUrl, "http://127.0.0.1:5173");
+    if (url.pathname === "/api/bots") {
+      const { bots } = (await (await server.fetcher(input, init)).json()) as { bots: object[] };
+      return Response.json({
+        bots: [...bots, { ...bots[0], id: "bot-other", name: "Other Bot" }],
+      });
+    }
+    const listed = /^\/api\/bots\/([^/]+)\/sessions$/.exec(url.pathname);
+    if (listed && (init?.method ?? "GET") === "GET") {
+      const botId = listed[1]!;
+      const listing = (listings.get(botId) ?? 0) + 1;
+      listings.set(botId, listing);
+      const sessions = respond(botId, listing);
+      if (sessions !== undefined) {
+        return answered(sessions).response;
+      }
+      return new Promise<Response>((resolve, reject) => {
+        init?.signal?.addEventListener("abort", () =>
+          reject(new DOMException("The operation was aborted.", "AbortError")),
+        );
+        held.push({
+          botId,
+          listing,
+          answer: (next) => {
+            const { response, read } = answered(next);
+            resolve(response);
+            return read;
+          },
+        });
+      });
+    }
+    if (options.holdRunEvents && url.pathname === "/api/runs/run-1/events") {
+      runEventsOpened = true;
+      const encoder = new TextEncoder();
+      const body = new ReadableStream<Uint8Array>({
+        start(controller) {
+          controller.enqueue(
+            encoder.encode(
+              formatSseEvent({
+                id: 1,
+                data: { type: "RUN_STARTED", runId: "run-1", threadId: "sess-fixture" },
+              }),
+            ),
+          );
+          endRun = () => {
+            try {
+              controller.enqueue(
+                encoder.encode(
+                  formatSseEvent({
+                    id: 2,
+                    data: { type: "RUN_FINISHED", runId: "run-1", threadId: "sess-fixture" },
+                  }),
+                ),
+              );
+              controller.close();
+            } catch {
+              // The console already closed the stream.
+            }
+          };
+          init?.signal?.addEventListener("abort", () => endRun());
+        },
+      });
+      return new Response(body, {
+        status: 200,
+        headers: { "content-type": "text/event-stream; charset=utf-8" },
+      });
+    }
+    return server.fetcher(input, init);
+  };
+  return {
+    fetcher,
+    held,
+    reads,
+    endRun: () => endRun(),
+    runEventsOpened: () => runEventsOpened,
+  };
+}
+
+/** Waits until the console has read `read` and applied whatever it does with it. */
+async function settled(read: Promise<unknown>) {
+  await read;
+  await act(() => new Promise((resolve) => setTimeout(resolve, 0)));
+}
+
 describe("keep the session list current", () => {
   it("shows the waiting badge after the pending count changes with no operator action", async () => {
     const server = createFakeServerFetch();
@@ -612,6 +737,72 @@ describe("keep the session list current", () => {
     const listed = server.otherListings();
     for (const answer of server.held.splice(0)) answer(1);
     await waitFor(() => expect(server.otherListings()).toBeGreaterThan(listed));
+
+    expect({
+      fixture: screen.queryAllByText("Fixture Session").length,
+      other: screen.queryAllByText("Other Session").length > 0,
+    }).toEqual({ fixture: 0, other: true });
+  });
+
+  it("keeps refreshing the selected bot while a listing for the previous bot never answers", async () => {
+    const user = userEvent.setup();
+    let otherPending = 0;
+    const server = createSessionListsFetch((botId, listing) => {
+      if (botId === "bot-other") {
+        return [sessionOf("bot-other", "sess-other", "Other Session", otherPending)];
+      }
+      return listing === 1 ? [sessionOf(botId, "sess-fixture", "Fixture Session", 0)] : undefined;
+    });
+    render(<App fetcher={server.fetcher} sessionRefreshMs={20} />);
+
+    await screen.findAllByText("Fixture Session");
+    await waitFor(() => expect(server.held.length).toBeGreaterThan(0));
+    await user.click(screen.getByRole("button", { name: /^Other Bot/ }));
+    await screen.findAllByText("Other Session");
+    otherPending = 1;
+
+    expect((await screen.findByText("1 waiting")).textContent).toBe("1 waiting");
+  });
+
+  it("drops an older listing of the same bot that answers after a newer one", async () => {
+    const server = createSessionListsFetch((botId, listing) =>
+      listing === 2 ? [sessionOf(botId, "sess-fixture", "Fixture Session", 2)] : undefined,
+    );
+    render(<App fetcher={server.fetcher} sessionRefreshMs={20} />);
+
+    await screen.findByText("2 waiting");
+    await settled(
+      server.held
+        .find((entry) => entry.listing === 1)!
+        .answer([sessionOf("bot-fixture", "sess-fixture", "Fixture Session", 1)]),
+    );
+
+    expect({
+      newer: screen.queryByText("2 waiting")?.textContent,
+      older: screen.queryByText("1 waiting"),
+    }).toEqual({ newer: "2 waiting", older: null });
+  });
+
+  it("drops the session list a previous bot's Run asks for after another bot is selected", async () => {
+    const user = userEvent.setup();
+    const server = createSessionListsFetch(
+      (botId) =>
+        botId === "bot-other"
+          ? [sessionOf(botId, "sess-other", "Other Session", 0)]
+          : [sessionOf(botId, "sess-fixture", "Fixture Session", 0)],
+      { holdRunEvents: true },
+    );
+    render(<App fetcher={server.fetcher} />);
+
+    await screen.findByText("Fixture session ready.");
+    await user.type(screen.getByPlaceholderText("Send an instruction to Fixture Bot..."), "lamp-1");
+    await user.click(screen.getByRole("button", { name: "Send" }));
+    await user.click(await screen.findByRole("button", { name: "Retry with same key" }));
+    await waitFor(() => expect(server.runEventsOpened()).toBe(true));
+    await user.click(screen.getByRole("button", { name: /^Other Bot/ }));
+    await screen.findAllByText("Other Session");
+    server.endRun();
+    await settled(Promise.all(server.reads));
 
     expect({
       fixture: screen.queryAllByText("Fixture Session").length,

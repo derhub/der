@@ -1,6 +1,7 @@
 import {
   DomainError,
   formatUtcTimestamp,
+  runUsage,
   type Approval,
   type ApprovalEffectStore,
   type ApprovalId,
@@ -26,7 +27,6 @@ import {
   type UtcTimestamp,
   type Workflow,
 } from "@der/domain";
-import { readRunUsage } from "@der/runtime/engines";
 import type { ScriptRoutineDeps } from "./script-routine-stage";
 
 export interface AwaitApprovalInput {
@@ -113,6 +113,12 @@ export interface ApprovalDecisionPayload {
 
 const DEFAULT_EVENT_BATCH_SIZE = 8;
 const ATTEMPT_RESET_EVENT = "der.attempt-reset";
+const ENGINE_ATTEMPT_FINISHED_EVENT = "der.engine-attempt-finished";
+const TRANSIENT_ATTEMPT_FAILURES = new Set([
+  "engine.resume_unavailable",
+  "engine.transport_lost",
+  "engine.cancelled",
+]);
 
 function isToolCallEnd(chunk: JsonValue): boolean {
   return (
@@ -190,9 +196,9 @@ export async function executeEngineStage(deps: WorkflowDeps, run: Run): Promise<
 
 /**
  * What an earlier execution of this Run's engine step left in the run events. A persisted
- * terminal chunk means the engine already answered: its outcome is replayed instead of calling
- * the engine again. Otherwise a non-empty log gets a key suffix so the new attempt's chunks never
- * dedupe against the abandoned attempt's.
+ * `der.engine-attempt-finished` marker means the engine already finished an attempt: its outcome
+ * is replayed instead of calling the engine again. Otherwise a non-empty log gets a key suffix so
+ * the new attempt's chunks never dedupe against the abandoned attempt's.
  */
 async function readEarlierExecution(
   deps: WorkflowDeps,
@@ -206,25 +212,34 @@ async function readEarlierExecution(
   if (last === undefined) {
     return { keySuffix: "" };
   }
-  const terminal = events.find((event) => event.isTerminal === true);
-  if (terminal === undefined) {
+  const finished = events.find(
+    (event) =>
+      isJsonRecord(event.chunk) &&
+      event.chunk["type"] === "CUSTOM" &&
+      event.chunk["name"] === ENGINE_ATTEMPT_FINISHED_EVENT,
+  );
+  if (finished === undefined) {
     return { keySuffix: `:replay-${last.sequence}` };
   }
 
-  const chunk = isJsonRecord(terminal.chunk) ? terminal.chunk : {};
-  if (chunk["type"] !== "RUN_FINISHED") {
+  const chunk = isJsonRecord(finished.chunk) ? finished.chunk : {};
+  const value = isJsonRecord(chunk["value"]) ? chunk["value"] : {};
+  if (value["kind"] !== "completed") {
     return {
       keySuffix: "",
       outcome: {
         kind: "failed",
-        code: typeof chunk["code"] === "string" ? chunk["code"] : "engine.run_error",
-        detail: typeof chunk["message"] === "string" ? chunk["message"] : "Engine run failed.",
+        code: typeof value["code"] === "string" ? value["code"] : "engine.run_error",
+        detail: typeof value["detail"] === "string" ? value["detail"] : "Engine run failed.",
       },
     };
   }
-  const suffix = attemptKeySuffix(run.id, terminal.chunkKey);
+  const suffix =
+    typeof value["suffix"] === "string"
+      ? value["suffix"]
+      : chunkAttemptSuffix(run.id, finished.chunkKey);
   const text = events
-    .filter((event) => attemptKeySuffix(run.id, event.chunkKey) === suffix)
+    .filter((event) => chunkAttemptSuffix(run.id, event.chunkKey) === suffix)
     .flatMap((event) =>
       isJsonRecord(event.chunk) &&
       event.chunk["type"] === "TEXT_MESSAGE_CONTENT" &&
@@ -233,7 +248,8 @@ async function readEarlierExecution(
         : [],
     )
     .join("");
-  const usage = readRunUsage(chunk);
+  const parsedUsage = value["usage"] !== undefined ? runUsage.safeParse(value["usage"]) : undefined;
+  const usage = parsedUsage?.success ? parsedUsage.data : undefined;
   return {
     keySuffix: "",
     outcome: {
@@ -244,14 +260,17 @@ async function readEarlierExecution(
   };
 }
 
-function isJsonRecord(value: JsonValue): value is { readonly [key: string]: JsonValue } {
+function isJsonRecord(
+  value: JsonValue | undefined,
+): value is { readonly [key: string]: JsonValue } {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
-/** Engine chunk keys are `<runId>:<seq>:<TYPE><suffix>`; the suffix names the attempt. */
-function attemptKeySuffix(runId: RunId, chunkKey: string): string | undefined {
-  const match = /^\d+:[A-Z_]+(.*)$/.exec(chunkKey.slice(runId.length + 1));
-  return match?.[1];
+/** Engine chunk keys carry an optional `:replay-<seq>` suffix naming the attempt. */
+function chunkAttemptSuffix(runId: RunId, chunkKey: string): string {
+  const rest = chunkKey.startsWith(`${runId}:`) ? chunkKey.slice(runId.length + 1) : chunkKey;
+  const at = rest.indexOf(":replay-");
+  return at >= 0 ? rest.slice(at) : "";
 }
 
 async function runEngineAttempt(
@@ -261,11 +280,7 @@ async function runEngineAttempt(
   keySuffix: string,
 ): Promise<RunStageResult> {
   const batchSize = deps.eventBatchSize ?? DEFAULT_EVENT_BATCH_SIZE;
-  const pendingChunks: {
-    readonly chunkKey: string;
-    readonly chunk: JsonValue;
-    readonly isTerminal?: boolean;
-  }[] = [];
+  const pendingChunks: RunEventInput[] = [];
 
   const readInterruptedStage = async (
     fallbackDetail?: string,
@@ -303,6 +318,47 @@ async function runEngineAttempt(
     await deps.store.appendRunEvents(run.id, batch);
   };
 
+  const appendAttemptFinished = async (
+    outcome:
+      | { readonly kind: "completed"; readonly usage?: RunUsage }
+      | { readonly kind: "failed"; readonly code: string; readonly detail: string },
+  ) => {
+    const currentStatus = (await deps.store.getRun(run.id))?.status;
+    if (
+      currentStatus !== "queued" &&
+      currentStatus !== "running" &&
+      currentStatus !== "waiting_approval"
+    ) {
+      return;
+    }
+    const value: { [key: string]: JsonValue } = {
+      kind: outcome.kind,
+      suffix: keySuffix,
+      ...(outcome.kind === "completed" && outcome.usage !== undefined
+        ? {
+            usage: {
+              inputTokens: outcome.usage.inputTokens,
+              cachedInputTokens: outcome.usage.cachedInputTokens,
+              cacheWriteTokens: outcome.usage.cacheWriteTokens,
+              outputTokens: outcome.usage.outputTokens,
+              reportedCostUsd: outcome.usage.reportedCostUsd,
+            },
+          }
+        : {}),
+      ...(outcome.kind === "failed" ? { code: outcome.code, detail: outcome.detail } : {}),
+    };
+    await deps.store.appendRunEvents(run.id, [
+      {
+        chunkKey: `${run.id}:engine-attempt-finished${keySuffix}`,
+        chunk: {
+          type: "CUSTOM",
+          name: ENGINE_ATTEMPT_FINISHED_EVENT,
+          value,
+        },
+      },
+    ]);
+  };
+
   try {
     for await (const event of engine.run(run)) {
       const interrupted = await readInterruptedStage();
@@ -311,11 +367,12 @@ async function runEngineAttempt(
       }
 
       if (event.type === "chunk") {
-        pendingChunks.push({
-          chunkKey: `${event.chunkKey}${keySuffix}`,
-          chunk: event.chunk,
-          ...(event.isTerminal !== undefined ? { isTerminal: event.isTerminal } : {}),
-        });
+        // finishRun writes the terminal chunk with the status that wins, so an interruption
+        // committing after the engine's own RUN_FINISHED cannot leave a contradicting stream.
+        if (event.isTerminal) {
+          continue;
+        }
+        pendingChunks.push({ chunkKey: `${event.chunkKey}${keySuffix}`, chunk: event.chunk });
         if (pendingChunks.length >= batchSize || isToolCallEnd(event.chunk)) {
           await flush();
         }
@@ -329,6 +386,10 @@ async function runEngineAttempt(
         if (postInterrupted) {
           return postInterrupted;
         }
+        await appendAttemptFinished({
+          kind: "completed",
+          ...(event.usage !== undefined ? { usage: event.usage } : {}),
+        });
         const turn = deps.turns?.get(run.id);
         return {
           kind: "completed",
@@ -343,6 +404,13 @@ async function runEngineAttempt(
       const failInterrupted = await readInterruptedStage(event.detail);
       if (failInterrupted) {
         return failInterrupted;
+      }
+      if (!TRANSIENT_ATTEMPT_FAILURES.has(event.code)) {
+        await appendAttemptFinished({
+          kind: "failed",
+          code: event.code,
+          detail: event.detail,
+        });
       }
       return {
         kind: "failed",
@@ -366,6 +434,7 @@ async function runEngineAttempt(
   }
 
   await flush();
+  await appendAttemptFinished({ kind: "completed" });
   return { kind: "completed" };
 }
 

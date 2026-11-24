@@ -829,6 +829,36 @@ export async function startServer(options: CreateServerOptions = {}): Promise<Ru
         }
       });
       resumeDirectRuns = async () => {
+        // Direct mode keeps no engine state across a restart, so an event Run that was running
+        // is ended; left active, it would hold its session's next event for ever.
+        const stranded = store.database.db
+          .query<{ id: RunId; session_id: string }, []>(
+            `SELECT id, session_id FROM runs
+             WHERE origin = 'event' AND engine != 'script' AND status = 'running'`,
+          )
+          .all();
+        for (const { id, session_id: sessionId } of stranded) {
+          const detail =
+            "The server restarted while this Run was running; direct mode cannot resume it.";
+          const finished = await store.finishRun({
+            runId: id,
+            status: "interrupted",
+            terminalEvent: {
+              chunkKey: `${id}:terminal`,
+              chunk: {
+                type: "RUN_ERROR",
+                message: detail,
+                code: "run.server_restarted",
+                runId: id,
+                threadId: sessionId,
+              },
+            },
+            detail,
+          });
+          if (finished.won) {
+            await finishRun(finished.run);
+          }
+        }
         // An event Run still queued was admitted and never started (a crash after admission).
         const resumable = store.database.db
           .query<{ id: RunId }, []>(

@@ -1,8 +1,8 @@
 import { afterEach, describe, expect, it } from "bun:test";
 import * as z from "zod";
-import { defineCapability, type FinishRunInput } from "@der/domain";
+import { defineCapability, type Engine, type FinishRunInput } from "@der/domain";
 import type { SqliteStore } from "@der/storage";
-import { finalizeDirectRunStep } from "#workflows/index";
+import { executeEngineStage, finalizeDirectRunStep } from "#workflows/index";
 import { openScriptFixture } from "./fixtures/script-host";
 
 const cleanups: (() => Promise<void>)[] = [];
@@ -472,6 +472,28 @@ describe("end a detached Script in doubt", () => {
     });
   });
 
+  it("names the write of unknown outcome last in the result message", async () => {
+    const context = await setup();
+    const { store, acquire, driver, scripts } = context;
+    const { id } = acquire('await step.run("notes.append", { text: "entry" }); return 1;');
+    store.database.db.run(
+      "CREATE TRIGGER refuse_updates BEFORE UPDATE ON effects BEGIN SELECT RAISE(ABORT, 'disk full'); END",
+    );
+    await driver.kick(id).catch(() => undefined);
+    store.database.db.run("DROP TRIGGER refuse_updates");
+    await driver.kick(id);
+
+    expect(scripts.load(id).execution.result).toEqual({
+      ok: false,
+      error: {
+        kind: "capability",
+        message:
+          "Write 1 (notes.append) has an unknown outcome: a previous attempt started this write and its outcome was not recorded. Already applied: none confirmed. Unknown outcome: #1 notes.append.",
+      },
+      logs: [],
+    });
+  });
+
   it("leaves an owning Run that already ended as it ended and carries the outcome in one event", async () => {
     expect(await inDoubtDetached(true)).toEqual({
       execution: "in_doubt",
@@ -563,4 +585,62 @@ describe("end a Run once when an in-doubt interruption meets its normal finish",
       });
     },
   );
+
+  it("streams no RUN_FINISHED when the interruption commits after the engine finished its stream", async () => {
+    const fixture = await openScriptFixture();
+    const { scripts, driver, acquire } = fixture.openDriver();
+    cleanups.push(async () => {
+      await driver.close();
+      fixture.store.close();
+      fixture.database.cleanup();
+    });
+    const run = await fixture.store.markRunRunning(fixture.run.id);
+    const engine: Engine = {
+      kind: "fixture",
+      async *run(current) {
+        yield { type: "chunk", chunkKey: `${current.id}:1`, chunk: { type: "RUN_STARTED" } };
+        yield {
+          type: "chunk",
+          chunkKey: `${current.id}:2:RUN_FINISHED`,
+          chunk: { type: "RUN_FINISHED" },
+          isTerminal: true,
+        };
+        yield { type: "completed" };
+      },
+    };
+    const deps = {
+      store: fixture.store,
+      engines: new Map([["fixture" as const, engine]]),
+      approvalTimeoutMs: 5_000,
+    };
+    const { id } = acquire('await step.run("notes.append", { text: "entry" }); return 1;');
+    scripts.detach(id);
+    fixture.store.database.db.run(
+      "CREATE TRIGGER refuse_updates BEFORE UPDATE ON effects BEGIN SELECT RAISE(ABORT, 'disk full'); END",
+    );
+    await driver.kick(id).catch(() => undefined);
+    fixture.store.database.db.run("DROP TRIGGER refuse_updates");
+
+    const outcome = await executeEngineStage(deps, run);
+    await driver.kick(id);
+    const finished = await finalizeDirectRunStep(deps, { run, outcome });
+
+    const chunks = fixture.store.database.db
+      .query<{ chunk_json: string; is_terminal: number }, [string]>(
+        "SELECT chunk_json, is_terminal FROM run_events WHERE run_id = ? ORDER BY sequence",
+      )
+      .all(run.id)
+      .map((row) => ({
+        type: (JSON.parse(row.chunk_json) as { type: string }).type,
+        terminal: row.is_terminal === 1,
+      }));
+    expect({ run: finished.status, chunks }).toEqual({
+      run: "interrupted",
+      chunks: [
+        { type: "RUN_STARTED", terminal: false },
+        { type: "CUSTOM", terminal: false },
+        { type: "RUN_ERROR", terminal: true },
+      ],
+    });
+  });
 });

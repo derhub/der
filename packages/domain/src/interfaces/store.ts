@@ -67,10 +67,10 @@ export interface SessionEventStore {
   getActiveRun(sessionId: SessionId): Run | undefined;
 }
 
+/** Appended chunks are never terminal: only `finishRun` writes the terminal chunk, with the status it sets. */
 export interface RunEventInput {
   readonly chunkKey: string;
   readonly chunk: JsonValue;
-  readonly isTerminal?: boolean;
 }
 
 export interface FinishRunInput {

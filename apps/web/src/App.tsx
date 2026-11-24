@@ -202,36 +202,39 @@ export function App({
   }, [loadBootstrap]);
 
   const sessionRequest = useRef(0);
-  const sessionsInFlight = useRef(0);
+  const sessionsBot = useRef<string | null>(null);
 
   /**
-   * Lists a bot's sessions. Only the latest listing issued is applied, so a late answer for
-   * a bot no longer selected, or an older answer for the same bot, is dropped.
+   * Lists the selected bot's sessions. Only the latest listing issued is applied, so a late
+   * answer, or an older answer for the same bot, is dropped; a listing for a bot no longer
+   * selected, such as one a previous bot's Run asks for, is neither issued nor applied.
    */
   const loadSessions = useCallback(
     async (botId: string, signal?: AbortSignal): Promise<Session[] | undefined> => {
+      if (botId !== sessionsBot.current) {
+        return undefined;
+      }
       const request = ++sessionRequest.current;
-      sessionsInFlight.current += 1;
+      const isCurrent = () => request === sessionRequest.current && botId === sessionsBot.current;
       try {
         const loaded = await api.listSessions(botId, signal);
-        if (request !== sessionRequest.current) {
+        if (!isCurrent()) {
           return undefined;
         }
         setSessions(loaded);
         return loaded;
       } catch (error) {
-        if (request === sessionRequest.current && !signal?.aborted) {
+        if (isCurrent() && !signal?.aborted) {
           setBootstrapProblem(toOperatorProblem(error, `/api/bots/${botId}/sessions`));
         }
         return undefined;
-      } finally {
-        sessionsInFlight.current -= 1;
       }
     },
     [api],
   );
 
   useEffect(() => {
+    sessionsBot.current = selectedBotId;
     if (!selectedBotId) {
       sessionRequest.current += 1;
       setSessions([]);
@@ -254,17 +257,25 @@ export function App({
   }, [loadSessions, selectedBotId]);
 
   // Background work (a detached Script, a server-started event Run) changes pending counts
-  // with no console action, so the list is fetched again while the tab is visible.
+  // with no console action, so the list is fetched again while the tab is visible. A poll
+  // still unanswered at the next tick is abandoned, so a stalled request never stops refresh.
   useEffect(() => {
     if (!selectedBotId) {
       return;
     }
+    let poll: AbortController | undefined;
     const timer = setInterval(() => {
-      if (document.visibilityState !== "hidden" && sessionsInFlight.current === 0) {
-        void loadSessions(selectedBotId);
+      if (document.visibilityState === "hidden") {
+        return;
       }
+      poll?.abort();
+      poll = new AbortController();
+      void loadSessions(selectedBotId, poll.signal);
     }, sessionRefreshMs);
-    return () => clearInterval(timer);
+    return () => {
+      clearInterval(timer);
+      poll?.abort();
+    };
   }, [loadSessions, selectedBotId, sessionRefreshMs]);
 
   const refreshSessions = useCallback(() => {

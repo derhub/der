@@ -73,6 +73,17 @@ function eventRuns(store: SqliteStore) {
     .all();
 }
 
+function eventText(store: SqliteStore): string {
+  const [part] = JSON.parse(
+    store.database.db
+      .query<{ parts_json: string }, []>(
+        "SELECT parts_json FROM messages WHERE run_id = (SELECT id FROM runs WHERE origin = 'event')",
+      )
+      .get()!.parts_json,
+  ) as { text: string }[];
+  return part!.text;
+}
+
 describe("deliver a session event", () => {
   it("holds an event while a Run is active and admits it after that Run finishes", async () => {
     const { store, deliver } = openStore();
@@ -193,6 +204,48 @@ describe("deliver a session event", () => {
       text: `{"status":"failed","result":{"ok":false,"error":{"kind":"capability","message":"${"z".repeat(68)} [message truncated]"},"logs":["[logs truncated]"]}}`,
       fits: true,
     });
+  });
+
+  it("keeps a failed in-doubt result within an 80-byte limit as the in_doubt marker", async () => {
+    const { store, deliver } = openStore(undefined, 80);
+    enqueue(store, "evt-1", {
+      event: "script.finished",
+      executionId: "exec-1",
+      status: "in_doubt",
+      result: {
+        ok: false,
+        error: {
+          kind: "capability",
+          message: `${"r".repeat(300)}. Already applied: none confirmed. Unknown outcome: #1 notes.append.`,
+        },
+        logs: [],
+      },
+    });
+
+    await deliver();
+
+    expect(eventText(store)).toBe(
+      '{"event":"script.finished","executionId":"exec-1","status":"in_doubt","result":{"ok":false,"error":{"kind":"capability","message":"in_doubt"},"logs":[]}}',
+    );
+  });
+
+  it("keeps the event text of a call to a 70,000-character unknown capability within the default limit", async () => {
+    const { store, deliver } = openStore();
+    const id = `notes.${"z".repeat(70_000)}`;
+    enqueue(store, "evt-1", {
+      event: "script.finished",
+      executionId: "exec-1",
+      status: "failed",
+      result: {
+        ok: false,
+        error: { kind: "capability", message: `Unknown capability "${id}" at step 1.`, call: id },
+        logs: [],
+      },
+    });
+
+    await deliver();
+
+    expect(new TextEncoder().encode(eventText(store)).byteLength).toBeLessThanOrEqual(65_536);
   });
 
   it("marks delivered and links an event whose admitted Run already ended, and admits nothing", async () => {
@@ -378,6 +431,49 @@ describe("recover an event Run admitted before a crash", () => {
         ["evt-1", "delivered", true],
         ["evt-2", "delivered", false],
       ],
+    });
+  }, 30_000);
+
+  it("ends at startup an event Run left running and then delivers the session's next event", async () => {
+    const tempDb = createTempDatabase("der-event-running-");
+    const before = openSqliteStore({ filename: tempDb.dbPath });
+    const { bot, session } = seedFixtureRecords(before);
+    const event = { botId: bot.id, sessionId: session.id, kind: "script.finished" } as const;
+    const { run } = await before.admit({
+      botId: bot.id,
+      sessionId: session.id,
+      origin: "event",
+      idempotencyKey: "evt-1",
+      input: { parts: [{ type: "text", text: '{"n":1}' }] },
+    });
+    before.enqueueSessionEvent({ ...event, id: "evt-1", payload: { n: 1 } });
+    before.markSessionEventDelivered("evt-1", run.id);
+    before.enqueueSessionEvent({ ...event, id: "evt-2", payload: { n: 2 } });
+    await before.markRunRunning(run.id);
+    before.close();
+
+    const server = await startDirectServer(tempDb);
+    await waitUntil(() => server.store.listPendingSessionEvents().length === 0, {
+      timeoutMs: 3_000,
+      label: "the session's next event admitted",
+    });
+
+    const terminal = server.store.database.db
+      .query<{ chunk_json: string }, [string]>(
+        "SELECT chunk_json FROM run_events WHERE run_id = ? AND is_terminal = 1",
+      )
+      .all(run.id)
+      .map((row) => JSON.parse(row.chunk_json) as { type: string; code: string });
+    expect({
+      run: server.store.getRun(run.id)?.status,
+      terminal: terminal.map(({ type, code }) => ({ type, code })),
+      eventRuns: server.store.database.db
+        .query<{ id: string }, []>("SELECT id FROM runs WHERE origin = 'event' ORDER BY rowid")
+        .all().length,
+    }).toEqual({
+      run: "interrupted",
+      terminal: [{ type: "RUN_ERROR", code: "run.server_restarted" }],
+      eventRuns: 2,
     });
   }, 30_000);
 });

@@ -587,9 +587,17 @@ describe("rebuild the context", () => {
     const done = await executeWithReplayedEngineStep(ctx);
 
     const events = await runEventsOf(ctx.server, done.id);
-    const terminal = events.find((event) => event.isTerminal === true)!;
-    const rebuiltAttempt = events.filter((event) =>
-      event.chunkKey.endsWith(terminal.chunkKey.slice(terminal.chunkKey.indexOf(":replay-"))),
+    const finishedMarker = events.find((event) => {
+      const chunk = event.chunk as Record<string, unknown>;
+      return chunk["type"] === "CUSTOM" && chunk["name"] === "der.engine-attempt-finished";
+    })!;
+    const suffix = String(
+      ((finishedMarker.chunk as Record<string, unknown>)["value"] as Record<string, unknown>)[
+        "suffix"
+      ],
+    );
+    const rebuiltAttempt = events.filter(
+      (event) => suffix.length > 0 && event.chunkKey.endsWith(suffix),
     );
     expect([
       cli.calls.map((call) => resumeTarget(call)),

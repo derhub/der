@@ -39,10 +39,10 @@ import {
   type SessionRow,
 } from "./rows";
 
+/** Appended chunks are never terminal: only `finishRun` writes the terminal chunk, with the status it sets. */
 export interface RunEventInput {
   readonly chunkKey: string;
   readonly chunk: JsonValue;
-  readonly isTerminal?: boolean;
 }
 
 export interface FinishRunInput {
@@ -405,15 +405,8 @@ export async function appendRunEvents(
 
         db.query(
           `INSERT INTO run_events (run_id, sequence, chunk_key, chunk_json, is_terminal, created_at)
-           VALUES (?, ?, ?, ?, ?, ?)`,
-        ).run(
-          runId,
-          nextSeq,
-          entry.chunkKey,
-          JSON.stringify(entry.chunk),
-          entry.isTerminal ? 1 : 0,
-          now,
-        );
+           VALUES (?, ?, ?, ?, 0, ?)`,
+        ).run(runId, nextSeq, entry.chunkKey, JSON.stringify(entry.chunk), now);
 
         const inserted = db
           .query<RunEventRow, [string, number]>(

@@ -49,6 +49,7 @@ function eventText(payload: JsonValue, maxResultBytes: number): string {
       const fitted = fitResult(
         result as unknown as ExecuteResult,
         Math.max(0, maxResultBytes - envelope),
+        payload["status"] === "in_doubt",
       );
       return JSON.stringify({ ...payload, result: fitted });
     }

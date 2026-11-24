@@ -23,6 +23,7 @@ const encoder = new TextEncoder();
 const decoder = new TextDecoder();
 const LOGS_TRUNCATED = "[logs truncated]";
 const MESSAGE_TRUNCATED = " [message truncated]";
+const CALL_TRUNCATED = " [call truncated]";
 
 function failure(
   kind: Extract<ExecuteResult, { ok: false }>["error"]["kind"],
@@ -60,54 +61,131 @@ function jsonBytes(value: JsonValue | ExecuteResult): number {
   return encoder.encode(JSON.stringify(value)).byteLength;
 }
 
+type Failure = Extract<ExecuteResult, { ok: false }>;
+
+/** An in-doubt end's message closes with this and its unknown writes: `#2 notes.append, #3 notes.add.` */
+export const UNKNOWN_OUTCOME = "Unknown outcome: ";
+
+/** The longest cut of `text`, marked with `suffix`, that `fits`; undefined when even the bare marker does not. */
+function longestFit(
+  text: string,
+  suffix: string,
+  fits: (candidate: string) => boolean,
+): string | undefined {
+  const marked = (bytes: number) => {
+    const cut = cutUtf8(text, bytes);
+    return cut === "" ? suffix.trimStart() : `${cut}${suffix}`;
+  };
+  if (!fits(marked(0))) {
+    return undefined;
+  }
+  let low = 0;
+  let high = encoder.encode(text).byteLength;
+  while (low < high) {
+    const mid = Math.ceil((low + high) / 2);
+    if (fits(marked(mid))) {
+      low = mid;
+    } else {
+      high = mid - 1;
+    }
+  }
+  return marked(low);
+}
+
 /**
- * Fits a failed result, serialized, into `maxBytes`: the message first, then as many logs as
- * still fit, each cut marked. Only a limit smaller than the bare result's shape is exceeded.
+ * Cuts a message from its end, except an in-doubt message's unknown writes: those are kept
+ * whole, then as many as fit with a count of the rest, and only the text before them is cut.
  */
-function fitFailure(
-  result: Extract<ExecuteResult, { ok: false }>,
-  maxBytes: number,
-): ExecuteResult {
+function fitMessage(message: string, fits: (candidate: string) => boolean): string | undefined {
+  if (fits(message)) {
+    return message;
+  }
+  const at = message.lastIndexOf(UNKNOWN_OUTCOME);
+  if (at < 0) {
+    return longestFit(message, MESSAGE_TRUNCATED, fits);
+  }
+  const head = message.slice(0, at);
+  const names = message
+    .slice(at + UNKNOWN_OUTCOME.length)
+    .replace(/\.$/, "")
+    .split(", ");
+  const tail = (kept: number) => {
+    const omitted = names.length - kept;
+    const listed = [...names.slice(0, kept), ...(omitted > 0 ? [`${omitted} omitted`] : [])];
+    return `${UNKNOWN_OUTCOME}${listed.join(", ")}.`;
+  };
+  const withHead = (kept: number) => {
+    const cut = longestFit(head, MESSAGE_TRUNCATED, (candidate) =>
+      fits(`${candidate} ${tail(kept)}`),
+    );
+    return cut === undefined ? undefined : `${cut} ${tail(kept)}`;
+  };
+  const whole = withHead(names.length);
+  if (whole !== undefined) {
+    return whole;
+  }
+  // With some names omitted, one fewer name always shortens the list, so the search is monotone.
+  let low = -1;
+  let high = names.length - 1;
+  while (low < high) {
+    const mid = Math.ceil((low + high) / 2);
+    if (fits(`${MESSAGE_TRUNCATED.trimStart()} ${tail(mid)}`)) {
+      low = mid;
+    } else {
+      high = mid - 1;
+    }
+  }
+  return low < 0 ? undefined : withHead(low);
+}
+
+/**
+ * Fits a failed result, serialized, into `maxBytes`: the message first, then the call, then as
+ * many logs as still fit, each cut marked. A limit too small for any of the message gets a fixed
+ * marker that keeps the error kind and says `in_doubt` when the execution ended in doubt.
+ */
+function fitFailure(result: Failure, maxBytes: number, inDoubt: boolean): Failure {
   if (jsonBytes(result) <= maxBytes) {
     return result;
   }
-  const shaped = (message: string, logs: string[]): ExecuteResult => ({
-    ...result,
-    error: { ...result.error, message },
+  const { call, ...error } = result.error;
+  const shaped = (message: string, logs: string[], keptCall?: string): Failure => ({
+    ok: false,
+    error: { ...error, message, ...(keptCall === undefined ? {} : { call: keptCall }) },
     logs,
   });
+  const fits = (candidate: Failure) => jsonBytes(candidate) <= maxBytes;
   const marker = result.logs.length > 0 ? [LOGS_TRUNCATED] : [];
-  let message = result.error.message;
-  if (message !== "" && jsonBytes(shaped(message, marker)) > maxBytes) {
-    let low = 0;
-    let high = encoder.encode(message).byteLength;
-    while (low < high) {
-      const mid = Math.ceil((low + high) / 2);
-      const fits =
-        jsonBytes(shaped(`${cutUtf8(message, mid)}${MESSAGE_TRUNCATED}`, marker)) <= maxBytes;
-      if (fits) {
-        low = mid;
-      } else {
-        high = mid - 1;
-      }
-    }
-    message = `${cutUtf8(message, low)}${MESSAGE_TRUNCATED}`;
+  const message = fitMessage(result.error.message, (candidate) => fits(shaped(candidate, marker)));
+  if (message === undefined) {
+    return {
+      ok: false,
+      error: { kind: error.kind, message: inDoubt ? "in_doubt" : "truncated" },
+      logs: [],
+    };
   }
+  const keptCall =
+    call === undefined || fits(shaped(message, marker, call))
+      ? call
+      : longestFit(call, CALL_TRUNCATED, (candidate) => fits(shaped(message, marker, candidate)));
   const kept: string[] = [];
-  let used = jsonBytes(shaped(message, marker));
+  let used = jsonBytes(shaped(message, marker, keptCall));
   for (const line of result.logs) {
     used += jsonBytes(line) + 1;
     if (used > maxBytes) {
-      return shaped(message, [...kept, ...marker]);
+      return shaped(message, [...kept, ...marker], keptCall);
     }
     kept.push(line);
   }
-  return shaped(message, kept);
+  return shaped(message, kept, keptCall);
 }
 
-export function fitResult(result: ExecuteResult, maxBytes: number): ExecuteResult {
+export function fitResult(
+  result: ExecuteResult,
+  maxBytes: number,
+  inDoubt: boolean,
+): ExecuteResult {
   if (!result.ok) {
-    return fitFailure(result, maxBytes);
+    return fitFailure(result, maxBytes, inDoubt);
   }
   const { logs, cut } = fitLogs(result.logs, maxBytes);
   const serialized = JSON.stringify(result.result) ?? "null";
@@ -146,7 +224,7 @@ async function executeAndWait(
   const detachedNow = store.detach(execution.id);
   const settled = store.load(execution.id).execution;
   if (!detachedNow && settled.result !== null) {
-    return settled.result;
+    return fitResult(settled.result, deps.maxResultBytes, settled.status === "in_doubt");
   }
   return {
     status: "pending",
@@ -190,8 +268,7 @@ export function createExecuteTool(deps: ExecuteToolDeps): AnyTool {
       }
       const signal = context?.signal ?? new AbortController().signal;
       try {
-        const outcome = await executeAndWait(deps, parsed.data.script, parsed.data.key, signal);
-        return "status" in outcome ? outcome : fitResult(outcome, deps.maxResultBytes);
+        return await executeAndWait(deps, parsed.data.script, parsed.data.key, signal);
       } catch (error) {
         if (signal.aborted) {
           return failure(

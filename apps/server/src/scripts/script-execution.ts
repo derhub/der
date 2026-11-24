@@ -29,6 +29,7 @@ import {
   type StepResult,
 } from "@der/runtime";
 import { fingerprintJson } from "@der/storage";
+import { UNKNOWN_OUTCOME } from "../code-mode/execute";
 import { approvalRequestedEvent } from "../workflows/run-steps";
 
 export interface ScriptExecutionDeps {
@@ -339,7 +340,7 @@ class ScriptPass {
     if (unknown === "") {
       return `Already applied: ${applied || "nothing"}.`;
     }
-    return `Already applied: ${applied || "none confirmed"}. Unknown outcome: ${unknown}.`;
+    return `Already applied: ${applied || "none confirmed"}. ${UNKNOWN_OUTCOME}${unknown}.`;
   }
 
   async #absorb(drain: ScriptDrain, replaying: boolean): Promise<void> {
@@ -815,9 +816,7 @@ class ScriptPass {
     const inDoubt = [...this.#rows.values()].some((step) => step.status === "unknown");
     const status = inDoubt ? "in_doubt" : reason;
     const message =
-      reportsWrites || (inDoubt && reason !== "in_doubt")
-        ? `${cause.replace(/\.$/, "")}. ${this.#applied()}`
-        : cause;
+      reportsWrites || inDoubt ? `${cause.replace(/\.$/, "")}. ${this.#applied()}` : cause;
     this.guard();
     this.deps.scripts.finish(this.head.id, {
       status,

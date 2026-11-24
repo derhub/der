@@ -119,8 +119,9 @@ When `execute` returns `pending`, the Script keeps running. `proposedWrites` lis
 
 - An event waits while its session has an active Run, and is delivered when the session is idle, oldest first.
 - At most `eventChainLimit` event Runs follow one Run a human started (origin `http`, `web` or `telegram`) in a session. Only such a Run resets the count; a routine Run does not. Further events stay queued until then. `eventChainLimit` is a bot setting (default `3`), changed with `PATCH /api/bots/:botId`.
-- The Run's message is the event as JSON, with the Script result cut to `DER_SCRIPT_RESULT_BYTES`; a failed result's error message is cut the same way and ends in `[message truncated]`.
+- The Run's message is the event as JSON, with the Script result cut to `DER_SCRIPT_RESULT_BYTES`. A failed result, inline or in an event, serializes within that limit: a cut message ends in `[message truncated]`, and an in-doubt result keeps the names of its unknown-outcome writes (and counts those that do not fit). With no room left for `[message truncated]`, the message is the fixed marker `in_doubt` or `truncated`; only a limit smaller than that marker result (at most 80 bytes) is exceeded.
 - An event whose Run was admitted but never started (the server stopped in between) is started by the next delivery pass, or at startup in direct mode.
+- In direct mode, an event Run that was running when the server stopped is ended at startup as `interrupted` with code `run.server_restarted`, and the session's next event is then delivered.
 - An event Run has no human present and passes the same unattended gate as a routine Run.
 - Origin `event` cannot be posted through the HTTP API (`apps/server/src/http/router.ts`).
 

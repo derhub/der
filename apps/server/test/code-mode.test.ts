@@ -11,7 +11,7 @@ import {
   type Run,
 } from "@der/domain";
 import type { AnyTool } from "@tanstack/ai";
-import { createExecuteTool } from "#code-mode/execute";
+import { createExecuteTool, fitResult } from "#code-mode/execute";
 import { codeModeInstructions } from "#code-mode/instructions";
 import { createSearchTool } from "#code-mode/search";
 import { createFixtureCapabilities } from "#capabilities/fixture";
@@ -468,6 +468,44 @@ describe("cap what execute hands back", () => {
     60_000,
   );
 
+  it("fits a failed result into an 80-byte limit", async () => {
+    const { server } = await startDirectServer();
+    const owner = await admitOwningRun(server, "code-mode-truncate-80");
+
+    const result = await callTool(executeToolFor(server, owner.run, 80), {
+      script: 'throw new Error("y".repeat(200));',
+    });
+
+    expect({ result, bytes: new TextEncoder().encode(JSON.stringify(result)).byteLength }).toEqual({
+      result: { ok: false, error: { kind: "script", message: "[message truncated]" }, logs: [] },
+      bytes: 80,
+    });
+  }, 60_000);
+
+  it("fits a call to a 70,000-character unknown capability into the default limit", async () => {
+    const { server } = await startDirectServer();
+    const owner = await admitOwningRun(server, "code-mode-truncate-call");
+
+    const result = await callTool(executeToolFor(server, owner.run), {
+      script: 'return await step.run("notes." + "z".repeat(70_000), {});',
+    });
+
+    expect({
+      result,
+      fits: new TextEncoder().encode(JSON.stringify(result)).byteLength <= RESULT_BYTES,
+    }).toEqual({
+      result: {
+        ok: false,
+        error: {
+          kind: "capability",
+          message: expect.stringMatching(/^Unknown capability "notes\.z+ \[message truncated\]$/),
+        },
+        logs: [],
+      },
+      fits: true,
+    });
+  }, 60_000);
+
   it("cuts an oversized result to the byte budget and flags it truncated", async () => {
     const { server } = await startDirectServer();
     const owner = await admitOwningRun(server, "code-mode-truncate");
@@ -589,4 +627,64 @@ describe("drive a fixture capability through the execute tool", () => {
       },
     ]);
   }, 60_000);
+});
+
+describe("fit a failed result that ended in doubt", () => {
+  const ended = (message: string): ExecuteResult => ({
+    ok: false,
+    error: { kind: "capability", message },
+    logs: [],
+  });
+  const head = `${"x".repeat(300)}. Already applied: none confirmed. `;
+  const names = (count: number) =>
+    Array.from({ length: count }, (_, n) => `#${n + 1} notes.append`).join(", ");
+
+  it.each([
+    {
+      case: "every unknown write and the start of the stop reason",
+      count: 2,
+      limit: 200,
+      bytes: 200,
+      message: `${"x".repeat(64)} [message truncated] Unknown outcome: #1 notes.append, #2 notes.append.`,
+    },
+    {
+      case: "the unknown writes that fit and the count of the rest",
+      count: 5,
+      limit: 130,
+      bytes: 129,
+      message: "[message truncated] Unknown outcome: #1 notes.append, 4 omitted.",
+    },
+  ])("keeps $case within the limit", ({ count, limit, bytes, message }) => {
+    const result = fitResult(ended(`${head}Unknown outcome: ${names(count)}.`), limit, true);
+
+    expect({ result, bytes: new TextEncoder().encode(JSON.stringify(result)).byteLength }).toEqual({
+      result: ended(message),
+      bytes,
+    });
+  });
+
+  it.each([80, 81, 97, 120, 333, 1000])("never serializes past a limit of %i bytes", (limit) => {
+    const result = fitResult(
+      {
+        ok: false,
+        error: {
+          kind: "nondeterministic",
+          message: `${head}Unknown outcome: ${names(40)}.`,
+          call: "c".repeat(900),
+          line: 7,
+        },
+        logs: ["l".repeat(50), "m".repeat(50)],
+      },
+      limit,
+      true,
+    );
+
+    expect(new TextEncoder().encode(JSON.stringify(result)).byteLength).toBeLessThanOrEqual(limit);
+  });
+
+  it("returns the fixed in_doubt marker below the minimum limit", () => {
+    expect(fitResult(ended(`${head}Unknown outcome: ${names(2)}.`), 40, true)).toEqual(
+      ended("in_doubt"),
+    );
+  });
 });
