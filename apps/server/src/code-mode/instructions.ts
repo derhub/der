@@ -55,7 +55,7 @@ export function codeModeInstructions(catalog: Catalog): string {
     "Pending:",
     '- `{ status: "pending", executionId, proposedWrites }` means the Script is still running, usually because a write waits for an operator. `proposedWrites` lists those writes with their `position`, `capability` and `input`; it is empty when none waits. Tell the operator what is waiting, then end your turn. Do not call `execute` again for the same work.',
     '- When the Script ends, its outcome arrives as a new message: JSON with `event: "script.finished"`, the `executionId`, the `status` and the `result` in the shape above. Act on it then.',
-    "- If your `execute` call is cut off, call it again with the identical Script to reattach to an unfinished execution. After an execution ends, the same Script starts a new occurrence.",
+    "- If your `execute` call is cut off, call it again with the identical Script to get the same execution or its stored result; it does not run the Script again. To run it again on purpose, call `execute` again after you received its result.",
     "",
     "Example:",
     "```js",

@@ -34,6 +34,7 @@ interface ExecutionRow {
   readonly lease_owner: string | null;
   readonly lease_until: string | null;
   readonly detached_at: string | null;
+  readonly delivered_at: string | null;
 }
 
 interface StepRow {
@@ -63,7 +64,7 @@ function mapExecution(row: ExecutionRow): ScriptExecution {
     source: row.source,
     status: row.status,
     result: row.result_json === null ? null : (JSON.parse(row.result_json) as unknown),
-    deliveredAt: null,
+    deliveredAt: row.delivered_at,
   });
   return {
     id: parsed.id,
@@ -79,6 +80,7 @@ function mapExecution(row: ExecutionRow): ScriptExecution {
     leaseOwner: row.lease_owner,
     leaseUntil: row.lease_until as UtcTimestamp | null,
     detachedAt: row.detached_at as UtcTimestamp | null,
+    deliveredAt: parsed.deliveredAt,
   };
 }
 
@@ -121,7 +123,8 @@ export class SqliteScriptStore implements ScriptStore {
       const open = db
         .query<ExecutionRow, [string, string]>(
           `SELECT * FROM script_runs
-           WHERE run_id = ? AND digest = ? AND status IN ${ACTIVE}
+           WHERE run_id = ? AND digest = ?
+             AND (status IN ${ACTIVE} OR delivered_at IS NULL)
            ORDER BY occurrence DESC LIMIT 1`,
         )
         .get(input.runId, digest);
@@ -272,6 +275,16 @@ export class SqliteScriptStore implements ScriptStore {
       }
       return { execution, detached };
     });
+  }
+
+  markResultDelivered(id: ScriptRunId): void {
+    const now = formatUtcTimestamp(this.database.now());
+    this.database.db
+      .query(
+        `UPDATE script_runs SET delivered_at = ?
+         WHERE id = ? AND delivered_at IS NULL AND status NOT IN ${ACTIVE}`,
+      )
+      .run(now, id);
   }
 
   detach(id: ScriptRunId): boolean {

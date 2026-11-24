@@ -33,6 +33,7 @@ export interface ScriptExecution {
   readonly leaseOwner: string | null;
   readonly leaseUntil: UtcTimestamp | null;
   readonly detachedAt: UtcTimestamp | null;
+  readonly deliveredAt: UtcTimestamp | null;
 }
 
 export interface NewStep {
@@ -83,7 +84,10 @@ export interface FinishResult {
 }
 
 export interface ScriptStore {
-  /** Returns the unfinished execution of this source in the Run, or starts the next occurrence. */
+  /**
+   * Returns the latest execution of this source in the Run while it is unfinished or finished
+   * with its result not yet handed over (`markResultDelivered`); otherwise starts the next occurrence.
+   */
   acquire(input: AcquireScript): ScriptExecution;
   load(id: ScriptRunId): { execution: ScriptExecution; steps: readonly StoredStep[] };
   /** First writer wins per position; returns the stored rows for every requested position. */
@@ -94,6 +98,8 @@ export interface ScriptStore {
   markDelivered(id: ScriptRunId, positions: readonly number[]): readonly DeliveryMark[];
   /** Sets the terminal status once; later calls leave the first status and result. A detached execution gets its `script.finished` event in the same unit. */
   finish(id: ScriptRunId, end: ScriptEnd): FinishResult;
+  /** Records that the finished result reached the agent; the first call sets it, later calls change nothing. A no-op while unfinished. */
+  markResultDelivered(id: ScriptRunId): void;
   /** Returns true only on the call that set it, and only while the execution is unfinished. */
   detach(id: ScriptRunId): boolean;
   /** Succeeds when no other owner holds an unexpired lease. */

@@ -49,11 +49,12 @@ export function scriptStoreContract(open: () => Promise<ScriptStoreHarness>): vo
   }
 
   describe("acquire an execution", () => {
-    it("returns the unfinished execution of the same source and starts the next occurrence after it finished", async () => {
+    it("returns the unfinished execution of the same source and starts the next occurrence after its result was handed over", async () => {
       const { store, execution, runId, botId } = await start();
 
       const again = store.acquire({ runId, botId, source: "return 1", seed: 99 });
       store.finish(execution.id, { status: "completed", result: done });
+      store.markResultDelivered(execution.id);
       const next = store.acquire({ runId, botId, source: "return 1", seed: 99 });
 
       expect({
@@ -69,6 +70,63 @@ export function scriptStoreContract(open: () => Promise<ScriptStoreHarness>): vo
         occurrences: [1, 2],
         nextSeed: 99,
       });
+    });
+
+    it("returns the finished execution again until its result was handed over", async () => {
+      const { store, execution, runId, botId } = await start();
+      store.finish(execution.id, { status: "completed", result: done });
+
+      const again = store.acquire({ runId, botId, source: "return 1", seed: 99 });
+
+      expect({ id: again.id, status: again.status, result: again.result }).toEqual({
+        id: execution.id,
+        status: "completed",
+        result: done,
+      });
+    });
+
+    it("keeps returning an in_doubt execution until its result was handed over", async () => {
+      const { store, execution, runId, botId } = await start();
+      store.finish(execution.id, { status: "in_doubt", result: failed });
+
+      const again = store.acquire({ runId, botId, source: "return 1", seed: 99 });
+
+      expect(again.id).toBe(execution.id);
+    });
+
+    it("hands a result over once and leaves the first hand-over time on a repeat", async () => {
+      const { harness, store, execution } = await start();
+      store.finish(execution.id, { status: "completed", result: done });
+
+      store.markResultDelivered(execution.id);
+      const first = store.load(execution.id).execution.deliveredAt;
+      harness.advance(1000);
+      store.markResultDelivered(execution.id);
+      const second = store.load(execution.id).execution.deliveredAt;
+
+      expect([first === null, second]).toEqual([false, first]);
+    });
+
+    it("ignores a hand-over recorded while the execution is unfinished", async () => {
+      const { store, execution, runId, botId } = await start();
+
+      store.markResultDelivered(execution.id);
+      const again = store.acquire({ runId, botId, source: "return 1", seed: 99 });
+
+      expect([again.id, again.deliveredAt]).toEqual([execution.id, null]);
+    });
+
+    it("starts a new occurrence only for the source whose result was handed over", async () => {
+      const { store, execution, runId, botId } = await start();
+      const other = store.acquire({ runId, botId, source: "return 2", seed: 1 });
+      store.finish(execution.id, { status: "completed", result: done });
+      store.finish(other.id, { status: "completed", result: done });
+      store.markResultDelivered(execution.id);
+
+      const reused = store.acquire({ runId, botId, source: "return 2", seed: 1 });
+      const fresh = store.acquire({ runId, botId, source: "return 1", seed: 1 });
+
+      expect([reused.id, fresh.occurrence]).toEqual([other.id, 2]);
     });
   });
 
@@ -207,6 +265,7 @@ export function scriptStoreContract(open: () => Promise<ScriptStoreHarness>): vo
       const { store, execution, runId, botId } = await start();
 
       const outcome = store.finish(execution.id, { status: "in_doubt", result: failed });
+      store.markResultDelivered(execution.id);
       const next = store.acquire({ runId, botId, source: "return 1", seed: 1 });
 
       expect([outcome.execution.status, next.occurrence]).toEqual(["in_doubt", 2]);

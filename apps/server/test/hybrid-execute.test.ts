@@ -206,6 +206,96 @@ describe("execute a Script that waits on an Approval past the inline wait", () =
   }, 60_000);
 });
 
+const PUBLISHED = { ok: true, result: { published: true }, logs: [], truncated: false };
+
+function scriptRunStatus(server: RunningServer, executionId: string) {
+  return server.store.database.db
+    .query<{ status: string }, [string]>("SELECT status FROM script_runs WHERE id = ?")
+    .get(executionId)?.status;
+}
+
+async function approvePending(server: RunningServer, owner: Owner) {
+  await waitUntil(
+    async () => server.store.getLatestApprovalForRun(owner.run.id)?.decision.status === "pending",
+    { timeoutMs: 20_000, label: "approval pending" },
+  );
+  await approve(server, owner, server.store.getLatestApprovalForRun(owner.run.id)!.id);
+}
+
+async function finishedExecution(server: RunningServer, owner: Owner, executionId: string) {
+  await approvePending(server, owner);
+  await waitUntil(async () => scriptRunStatus(server, executionId) === "completed", {
+    timeoutMs: 20_000,
+    label: "execution completed",
+  });
+}
+
+describe("repeat an execute whose result was not received", () => {
+  it("returns the stored result once, applies the write once, and runs the Script again only after the result was returned", async () => {
+    const { server, host } = await startHybridServer();
+    const owner = await admitOwningRun(server, "hybrid-result-once");
+    const execute = executeToolFor(server, owner.run);
+    const pending = (await execute(PUBLISH)) as { executionId: string };
+    await finishedExecution(server, owner, pending.executionId);
+
+    const repeated = await execute(PUBLISH);
+    const publishedAfterRepeat = [...host.published];
+    const third = (await execute(PUBLISH)) as { status?: string; executionId?: string };
+
+    expect(repeated).toEqual(PUBLISHED);
+    expect(publishedAfterRepeat).toEqual(["release"]);
+    expect(third.status).toBe("pending");
+    expect(third.executionId).not.toBe(pending.executionId);
+    await finishedExecution(server, owner, third.executionId!);
+    expect(host.published).toEqual(["release", "release"]);
+  }, 60_000);
+
+  it("returns the stored result of an execute whose first call was aborted before the Script finished", async () => {
+    const { server, host } = await startHybridServer();
+    const owner = await admitOwningRun(server, "hybrid-result-aborted");
+    const controller = new AbortController();
+    const tool = createExecuteTool({
+      run: owner.run,
+      scriptRunStore: server.scriptRunStore,
+      scriptDriver: server.scriptDriver,
+      maxResultBytes: 65_536,
+      inlineWaitMs: 5_000,
+    });
+    const aborted = tool.execute!({ script: PUBLISH }, { signal: controller.signal });
+    await waitUntil(
+      async () => server.store.getLatestApprovalForRun(owner.run.id)?.decision.status === "pending",
+      { timeoutMs: 20_000, label: "approval pending" },
+    );
+    controller.abort();
+    await aborted;
+    await approvePending(server, owner);
+    await waitUntil(async () => host.published.length === 1, {
+      timeoutMs: 20_000,
+      label: "write applied",
+    });
+    await Bun.sleep(100);
+
+    const retried = await executeToolFor(server, owner.run)(PUBLISH);
+
+    expect(retried).toEqual(PUBLISHED);
+    expect(host.published).toEqual(["release"]);
+  }, 60_000);
+
+  it("still delivers the detached execution's script.finished event once", async () => {
+    const { server } = await startHybridServer();
+    const owner = await admitOwningRun(server, "hybrid-result-event");
+    const execute = executeToolFor(server, owner.run);
+    const pending = (await execute(PUBLISH)) as { executionId: string };
+    await finishedExecution(server, owner, pending.executionId);
+
+    await execute(PUBLISH);
+
+    expect(sessionEvents(server).map((row) => JSON.parse(row.payload_json).executionId)).toEqual([
+      pending.executionId,
+    ]);
+  }, 60_000);
+});
+
 describe("execute a Script that finishes as the inline wait ends", () => {
   it.each([0, 1, 3, 8, 15, 30])(
     "gives the result inline or as one event, never both, with a wait of %ims",

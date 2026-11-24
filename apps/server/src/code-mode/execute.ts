@@ -7,7 +7,7 @@ const executeInput = z.strictObject({ script: z.string().min(1) });
 
 export interface ExecuteToolDeps {
   readonly run: Run;
-  readonly scriptRunStore: Pick<ScriptStore, "acquire" | "detach" | "load">;
+  readonly scriptRunStore: Pick<ScriptStore, "acquire" | "detach" | "load" | "markResultDelivered">;
   readonly scriptDriver: ScriptDriver;
   readonly maxResultBytes: number;
   readonly inlineWaitMs: number;
@@ -74,7 +74,9 @@ export function fitResult(result: ExecuteResult, maxBytes: number): ExecuteResul
 /**
  * Waits `inlineWaitMs` for the Script's end, then detaches it. `detach` succeeds only
  * while the execution is unfinished, so either the inline result or the `script.finished`
- * event reaches the agent, never both and never neither.
+ * event reaches the agent, never both and never neither. A repeated call that finds a
+ * finished execution returns its stored result instead of running the Script again; the
+ * result counts as received once returned, and only then does the same Script run again.
  */
 async function executeAndWait(
   deps: ExecuteToolDeps,
@@ -89,9 +91,10 @@ async function executeAndWait(
     seed: crypto.getRandomValues(new Uint32Array(1))[0]!,
   });
   await driver.wait(execution.id, signal, deps.inlineWaitMs);
-  store.detach(execution.id);
+  const detachedNow = store.detach(execution.id);
   const settled = store.load(execution.id).execution;
-  if (settled.detachedAt === null && settled.result !== null) {
+  if (!detachedNow && settled.result !== null) {
+    store.markResultDelivered(execution.id);
     return settled.result;
   }
   return {
