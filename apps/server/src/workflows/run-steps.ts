@@ -1,5 +1,9 @@
+import * as z from "zod";
 import {
   DomainError,
+  engineKind,
+  id,
+  messagePart,
   runUsage,
   streamChunk,
   type Approval,
@@ -121,6 +125,97 @@ const TRANSIENT_ATTEMPT_FAILURES = new Set([
   "engine.cancelled",
 ]);
 
+const finalMessagePartsSchema = z.array(messagePart);
+const engineSessionInputSchema = z.object({
+  sessionId: id,
+  engine: engineKind,
+  vendorSessionId: z.string().min(1),
+  baseHash: z.string(),
+  contextHash: z.string(),
+  lastOrdinal: z.number().int().nonnegative(),
+});
+
+function serializeMessagePart(part: MessagePart): JsonValue {
+  switch (part.type) {
+    case "text":
+      return { type: part.type, text: part.text };
+    case "tool-call":
+      return {
+        type: part.type,
+        toolCallId: part.toolCallId,
+        toolName: part.toolName,
+        arguments: part.arguments,
+      };
+    case "tool-result":
+      return {
+        type: part.type,
+        toolCallId: part.toolCallId,
+        toolName: part.toolName,
+        outcome: part.outcome,
+        isError: part.isError,
+      };
+    case "data":
+      return { type: part.type, mimeType: part.mimeType, data: part.data };
+  }
+}
+
+function isAttemptFinishedMarker(chunk: JsonValue | undefined): boolean {
+  return (
+    isJsonRecord(chunk) &&
+    chunk["type"] === "CUSTOM" &&
+    chunk["name"] === ENGINE_ATTEMPT_FINISHED_EVENT
+  );
+}
+
+function parseAttemptFinishedEvent(event: RunEvent): RunStageResult | undefined {
+  if (!isAttemptFinishedMarker(event.chunk) || !isJsonRecord(event.chunk)) {
+    return undefined;
+  }
+  const value = isJsonRecord(event.chunk["value"]) ? event.chunk["value"] : undefined;
+  if (value === undefined) {
+    return undefined;
+  }
+  if (value["kind"] === "failed") {
+    return {
+      kind: "failed",
+      code: typeof value["code"] === "string" ? value["code"] : "engine.run_error",
+      detail: typeof value["detail"] === "string" ? value["detail"] : "Engine run failed.",
+    };
+  }
+  if (value["kind"] !== "completed") {
+    return undefined;
+  }
+  const parsedParts =
+    value["finalMessageParts"] !== undefined
+      ? finalMessagePartsSchema.safeParse(value["finalMessageParts"])
+      : undefined;
+  const parsedUsage = value["usage"] !== undefined ? runUsage.safeParse(value["usage"]) : undefined;
+  const parsedEngineSession =
+    value["engineSession"] !== undefined
+      ? engineSessionInputSchema.safeParse(value["engineSession"])
+      : undefined;
+  return {
+    kind: "completed",
+    ...(parsedParts?.success ? { finalMessageParts: parsedParts.data } : {}),
+    ...(parsedUsage?.success ? { usage: parsedUsage.data } : {}),
+    ...(parsedEngineSession?.success ? { engineSession: parsedEngineSession.data } : {}),
+  };
+}
+
+/** Returns the authoritative outcome persisted by a finished engine attempt, if any. */
+export async function readDurableAttemptOutcome(
+  store: Pick<RunStore, "replay">,
+  runId: RunId,
+): Promise<RunStageResult | undefined> {
+  for await (const event of store.replay(runId, 0)) {
+    const outcome = parseAttemptFinishedEvent(event);
+    if (outcome !== undefined) {
+      return outcome;
+    }
+  }
+  return undefined;
+}
+
 function isToolCallEnd(chunk: JsonValue): boolean {
   return (
     typeof chunk === "object" &&
@@ -160,6 +255,11 @@ export async function loadAndStartRunStep(
 }
 
 export async function executeEngineStage(deps: WorkflowDeps, run: Run): Promise<RunStageResult> {
+  const earlier = await readEarlierExecution(deps, run);
+  if (earlier.outcome !== undefined) {
+    return earlier.outcome;
+  }
+
   const kind = run.engine === "script" ? undefined : run.engine;
   const engine = kind === undefined ? undefined : deps.engines.get(kind);
   if (kind === undefined || !engine) {
@@ -170,10 +270,6 @@ export async function executeEngineStage(deps: WorkflowDeps, run: Run): Promise<
     };
   }
 
-  const earlier = await readEarlierExecution(deps, run);
-  if (earlier.outcome !== undefined) {
-    return earlier.outcome;
-  }
   if (earlier.keySuffix !== "") {
     // Tells stream readers to drop the abandoned attempt's output before the new attempt's.
     await deps.store.appendRunEvents(run.id, [
@@ -205,73 +301,21 @@ async function readEarlierExecution(
   deps: WorkflowDeps,
   run: Run,
 ): Promise<{ readonly outcome?: RunStageResult; readonly keySuffix: string }> {
-  const events: RunEvent[] = [];
+  let lastSequence = 0;
   for await (const event of deps.store.replay(run.id, 0)) {
-    events.push(event);
+    lastSequence = event.sequence;
+    const outcome = parseAttemptFinishedEvent(event);
+    if (outcome !== undefined) {
+      return { keySuffix: "", outcome };
+    }
   }
-  const last = events.at(-1);
-  if (last === undefined) {
-    return { keySuffix: "" };
-  }
-  const finished = events.find(
-    (event) =>
-      isJsonRecord(event.chunk) &&
-      event.chunk["type"] === "CUSTOM" &&
-      event.chunk["name"] === ENGINE_ATTEMPT_FINISHED_EVENT,
-  );
-  if (finished === undefined) {
-    return { keySuffix: `:replay-${last.sequence}` };
-  }
-
-  const chunk = isJsonRecord(finished.chunk) ? finished.chunk : {};
-  const value = isJsonRecord(chunk["value"]) ? chunk["value"] : {};
-  if (value["kind"] !== "completed") {
-    return {
-      keySuffix: "",
-      outcome: {
-        kind: "failed",
-        code: typeof value["code"] === "string" ? value["code"] : "engine.run_error",
-        detail: typeof value["detail"] === "string" ? value["detail"] : "Engine run failed.",
-      },
-    };
-  }
-  const suffix =
-    typeof value["suffix"] === "string"
-      ? value["suffix"]
-      : chunkAttemptSuffix(run.id, finished.chunkKey);
-  const text = events
-    .filter((event) => chunkAttemptSuffix(run.id, event.chunkKey) === suffix)
-    .flatMap((event) =>
-      isJsonRecord(event.chunk) &&
-      event.chunk["type"] === "TEXT_MESSAGE_CONTENT" &&
-      typeof event.chunk["delta"] === "string"
-        ? [event.chunk["delta"]]
-        : [],
-    )
-    .join("");
-  const parsedUsage = value["usage"] !== undefined ? runUsage.safeParse(value["usage"]) : undefined;
-  const usage = parsedUsage?.success ? parsedUsage.data : undefined;
-  return {
-    keySuffix: "",
-    outcome: {
-      kind: "completed",
-      ...(text.length > 0 ? { finalMessageParts: [{ type: "text", text }] } : {}),
-      ...(usage !== undefined ? { usage } : {}),
-    },
-  };
+  return { keySuffix: lastSequence === 0 ? "" : `:replay-${lastSequence}` };
 }
 
 function isJsonRecord(
   value: JsonValue | undefined,
 ): value is { readonly [key: string]: JsonValue } {
   return typeof value === "object" && value !== null && !Array.isArray(value);
-}
-
-/** Engine chunk keys carry an optional `:replay-<seq>` suffix naming the attempt. */
-function chunkAttemptSuffix(runId: RunId, chunkKey: string): string {
-  const rest = chunkKey.startsWith(`${runId}:`) ? chunkKey.slice(runId.length + 1) : chunkKey;
-  const at = rest.indexOf(":replay-");
-  return at >= 0 ? rest.slice(at) : "";
 }
 
 async function runEngineAttempt(
@@ -321,8 +365,8 @@ async function runEngineAttempt(
 
   const appendAttemptFinished = async (
     outcome:
-      | { readonly kind: "completed"; readonly usage?: RunUsage }
-      | { readonly kind: "failed"; readonly code: string; readonly detail: string },
+      | Extract<RunStageResult, { kind: "completed" }>
+      | Extract<RunStageResult, { kind: "failed" }>,
   ) => {
     const currentStatus = (await deps.store.getRun(run.id))?.status;
     if (
@@ -335,6 +379,9 @@ async function runEngineAttempt(
     const value: { [key: string]: JsonValue } = {
       kind: outcome.kind,
       suffix: keySuffix,
+      ...(outcome.kind === "completed" && outcome.finalMessageParts !== undefined
+        ? { finalMessageParts: outcome.finalMessageParts.map(serializeMessagePart) }
+        : {}),
       ...(outcome.kind === "completed" && outcome.usage !== undefined
         ? {
             usage: {
@@ -343,6 +390,18 @@ async function runEngineAttempt(
               cacheWriteTokens: outcome.usage.cacheWriteTokens,
               outputTokens: outcome.usage.outputTokens,
               reportedCostUsd: outcome.usage.reportedCostUsd,
+            },
+          }
+        : {}),
+      ...(outcome.kind === "completed" && outcome.engineSession !== undefined
+        ? {
+            engineSession: {
+              sessionId: outcome.engineSession.sessionId,
+              engine: outcome.engineSession.engine,
+              vendorSessionId: outcome.engineSession.vendorSessionId,
+              baseHash: outcome.engineSession.baseHash,
+              contextHash: outcome.engineSession.contextHash,
+              lastOrdinal: outcome.engineSession.lastOrdinal,
             },
           }
         : {}),
@@ -371,7 +430,7 @@ async function runEngineAttempt(
         // finishRun writes the terminal chunk with the status that wins, so an interruption
         // committing after the engine's own RUN_FINISHED cannot leave a contradicting stream.
         const chunk = streamChunk(event.chunk);
-        if (event.isTerminal || chunk === undefined) {
+        if (event.isTerminal || chunk === undefined || isAttemptFinishedMarker(event.chunk)) {
           continue;
         }
         pendingChunks.push({ chunkKey: `${event.chunkKey}${keySuffix}`, chunk });
@@ -388,12 +447,8 @@ async function runEngineAttempt(
         if (postInterrupted) {
           return postInterrupted;
         }
-        await appendAttemptFinished({
-          kind: "completed",
-          ...(event.usage !== undefined ? { usage: event.usage } : {}),
-        });
         const turn = deps.turns?.get(run.id);
-        return {
+        const outcome: Extract<RunStageResult, { kind: "completed" }> = {
           kind: "completed",
           ...(event.finalMessage ? { finalMessageParts: event.finalMessage.parts } : {}),
           ...(event.usage !== undefined ? { usage: event.usage } : {}),
@@ -401,6 +456,8 @@ async function runEngineAttempt(
             ? { engineSession: { ...turn, vendorSessionId: event.vendorSessionId } }
             : {}),
         };
+        await appendAttemptFinished(outcome);
+        return outcome;
       }
 
       const failInterrupted = await readInterruptedStage(event.detail);
@@ -540,7 +597,7 @@ export async function finalizeInterruptedUncertainStep(
   return finished.run;
 }
 
-function runEnd(outcome: RunStageResult): RunEnd {
+export function runEnd(outcome: RunStageResult): RunEnd {
   switch (outcome.kind) {
     case "completed":
       return {

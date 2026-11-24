@@ -90,7 +90,9 @@ import {
   createRoutineScheduleObject,
   createRunCoordinator,
   finishRunAndNotify,
+  readDurableAttemptOutcome,
   runDirectRun,
+  runEnd,
   type AnyRestateService,
   type ConfigureRoutineInput,
   type ConfigureRoutineResult,
@@ -108,25 +110,27 @@ import { createCatalogSearchCapability, createSearchTool } from "./code-mode/sea
 import { createEventDelivery, type DeliverEvents } from "./events/event-delivery";
 import { ScriptDriver } from "./scripts/script-driver";
 
-/** What a direct-mode restart does with an active Run: start it again, or end it. */
-type Recovery = "start" | "end";
+/** What a direct-mode restart does with an active Run. */
+type Recovery = "start" | "finish_durable" | "interrupt";
+type AttemptState = "unfinished" | "finished";
 
 /** A Script Run is resumable: its execution is durable and its driver picks it up again. */
 const RESUMABLE_RECOVERY = {
-  queued: "start",
-  running: "start",
-  waiting_approval: "start",
-} as const satisfies Record<ActiveRunStatus, Recovery>;
+  queued: { unfinished: "start", finished: "start" },
+  running: { unfinished: "start", finished: "start" },
+  waiting_approval: { unfinished: "start", finished: "start" },
+} as const satisfies Record<ActiveRunStatus, Record<AttemptState, Recovery>>;
 
 /**
- * Direct mode keeps no engine state across a restart, so a non-Script Run an engine already
- * started is ended for every origin; left active, it has no driver and holds its session.
+ * Direct mode keeps no engine state across a restart. An engine Run that already persisted a
+ * durable attempt outcome finishes from it; an unfinished queued Run starts, and an unfinished
+ * started Run is interrupted so it cannot hold its session without a driver.
  */
 const EPHEMERAL_RECOVERY = {
-  queued: "start",
-  running: "end",
-  waiting_approval: "end",
-} as const satisfies Record<ActiveRunStatus, Recovery>;
+  queued: { unfinished: "start", finished: "finish_durable" },
+  running: { unfinished: "interrupt", finished: "finish_durable" },
+  waiting_approval: { unfinished: "interrupt", finished: "finish_durable" },
+} as const satisfies Record<ActiveRunStatus, Record<AttemptState, Recovery>>;
 
 const EPHEMERAL_ORIGINS = {
   http: EPHEMERAL_RECOVERY,
@@ -134,7 +138,10 @@ const EPHEMERAL_ORIGINS = {
   telegram: EPHEMERAL_RECOVERY,
   routine: EPHEMERAL_RECOVERY,
   event: EPHEMERAL_RECOVERY,
-} as const satisfies Record<PersistedRunOrigin, Record<ActiveRunStatus, Recovery>>;
+} as const satisfies Record<
+  PersistedRunOrigin,
+  Record<ActiveRunStatus, Record<AttemptState, Recovery>>
+>;
 
 const RESUMABLE_ORIGINS = {
   http: RESUMABLE_RECOVERY,
@@ -142,7 +149,10 @@ const RESUMABLE_ORIGINS = {
   telegram: RESUMABLE_RECOVERY,
   routine: RESUMABLE_RECOVERY,
   event: RESUMABLE_RECOVERY,
-} as const satisfies Record<PersistedRunOrigin, Record<ActiveRunStatus, Recovery>>;
+} as const satisfies Record<
+  PersistedRunOrigin,
+  Record<ActiveRunStatus, Record<AttemptState, Recovery>>
+>;
 
 const DIRECT_RUN_RECOVERY = {
   codex: EPHEMERAL_ORIGINS,
@@ -152,7 +162,7 @@ const DIRECT_RUN_RECOVERY = {
   script: RESUMABLE_ORIGINS,
 } as const satisfies Record<
   RunEngineKind,
-  Record<PersistedRunOrigin, Record<ActiveRunStatus, Recovery>>
+  Record<PersistedRunOrigin, Record<ActiveRunStatus, Record<AttemptState, Recovery>>>
 >;
 
 export interface SeededFixtureRecords {
@@ -896,15 +906,32 @@ export async function startServer(options: CreateServerOptions = {}): Promise<Ru
           )
           .all(...activeRunStatus.options);
         for (const { id, origin, engine, status } of active) {
-          const recovery = DIRECT_RUN_RECOVERY[engine][origin][status];
-          if (recovery === "start") {
-            await directDriver.start?.(id);
-            continue;
+          const durableOutcome =
+            engine === "script" ? undefined : await readDurableAttemptOutcome(store, id);
+          const attempt: AttemptState = durableOutcome === undefined ? "unfinished" : "finished";
+          const recovery = DIRECT_RUN_RECOVERY[engine][origin][status][attempt];
+          switch (recovery) {
+            case "start":
+              await directDriver.start?.(id);
+              break;
+            case "finish_durable":
+              if (durableOutcome === undefined) {
+                throw new Error(
+                  `Direct recovery chose finish_durable without an outcome for ${id}`,
+                );
+              }
+              await finishRunAndNotify(
+                { store, onRunFinished: finishRun },
+                { runId: id, end: runEnd(durableOutcome) },
+              );
+              break;
+            case "interrupt":
+              await finishRunAndNotify(
+                { store, onRunFinished: finishRun },
+                { runId: id, end: { kind: "server_restarted" } },
+              );
+              break;
           }
-          await finishRunAndNotify(
-            { store, onRunFinished: finishRun },
-            { runId: id, end: { kind: "server_restarted" } },
-          );
         }
       };
       closeDirectDriver = () => directDriver.close();

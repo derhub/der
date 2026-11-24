@@ -1,9 +1,20 @@
 import { afterEach, describe, expect, it } from "bun:test";
-import { formatUtcTimestamp, type Engine, type JsonValue, type RunRequest } from "@der/domain";
+import {
+  formatUtcTimestamp,
+  type Engine,
+  type JsonValue,
+  type RunId,
+  type RunRequest,
+  type RunUsage,
+} from "@der/domain";
 import { openSqliteStore, type SqliteStore } from "@der/storage";
 import { createEventDelivery } from "#events/event-delivery";
 import { seedFixtureRecords, startServer, type RunningServer } from "#main";
-import { ENGINE_EXECUTION_FAILED_CODE } from "#workflows/index";
+import {
+  ENGINE_EXECUTION_FAILED_CODE,
+  executeEngineStage,
+  type TurnRecord,
+} from "#workflows/index";
 import { createTempDatabase, waitUntil } from "./fixtures/restate-harness";
 
 const cleanups: (() => Promise<void> | void)[] = [];
@@ -632,6 +643,248 @@ describe("recover an event Run admitted before a crash", () => {
     },
     30_000,
   );
+
+  it.each([
+    { withNextEvent: false, label: "preserves vendor session handover" },
+    { withNextEvent: true, label: "delivers the queued session event via the winner hook" },
+  ])(
+    "finishes a running Run as completed from its durable marker on direct startup and $label",
+    async ({ withNextEvent }) => {
+      const tempDb = createTempDatabase("der-marker-direct-recovery-");
+      const before = openSqliteStore({ filename: tempDb.dbPath });
+      const { bot, session } = seedFixtureRecords(before);
+      const { run, initialMessage } = await before.admit({
+        botId: bot.id,
+        sessionId: session.id,
+        origin: "http",
+        idempotencyKey: `marker-direct-${withNextEvent}`,
+        input: { parts: [{ type: "text", text: "work" }] },
+      });
+      const running = await before.markRunRunning(run.id);
+      const usage: RunUsage = {
+        inputTokens: 15,
+        cachedInputTokens: 2,
+        cacheWriteTokens: 5,
+        outputTokens: 30,
+        reportedCostUsd: 0.02,
+      };
+      const turns = new Map<RunId, TurnRecord>([
+        [
+          run.id,
+          {
+            sessionId: session.id,
+            engine: "fixture",
+            baseHash: "base-direct",
+            contextHash: "ctx-direct",
+            lastOrdinal: initialMessage.ordinal,
+          },
+        ],
+      ]);
+      await executeEngineStage(
+        {
+          store: before,
+          turns,
+          engines: new Map([
+            [
+              "fixture",
+              {
+                kind: "fixture",
+                resumable: true,
+                async *run(activeRun) {
+                  yield {
+                    type: "chunk",
+                    chunkKey: `${activeRun.id}:delta:1`,
+                    chunk: {
+                      type: "TEXT_MESSAGE_CONTENT",
+                      messageId: `msg_${activeRun.id}`,
+                      delta: "Interim. ",
+                    },
+                  };
+                  yield {
+                    type: "completed",
+                    finalMessage: { parts: [{ type: "text", text: "Done." }] },
+                    usage,
+                    vendorSessionId: "vendor-direct-1",
+                  };
+                },
+              },
+            ],
+          ]),
+          approvalTimeoutMs: 60_000,
+        },
+        running,
+      );
+      if (withNextEvent) {
+        before.enqueueSessionEvent({
+          id: "evt-after-marker",
+          botId: bot.id,
+          sessionId: session.id,
+          kind: "script.finished",
+          payload: { n: 1 },
+        });
+      }
+      before.close();
+
+      const startedRunIds: string[] = [];
+      const server = await startServer({
+        config: {
+          host: "127.0.0.1",
+          port: 0,
+          restateMode: "direct",
+          databasePath: tempDb.dbPath,
+          memoryProjectionDir: `${tempDb.dir}/memory`,
+          skillsRootDir: `${tempDb.dir}/skills`,
+          workspaceRootDir: `${tempDb.dir}/workspaces`,
+          enabledEngines: ["fixture"],
+          scriptSweepIntervalMs: 60_000,
+          seedFixture: true,
+        },
+        engines: new Map([
+          [
+            "fixture",
+            {
+              kind: "fixture",
+              async *run(activeRun) {
+                startedRunIds.push(activeRun.id);
+                yield {
+                  type: "completed",
+                  finalMessage: { parts: [{ type: "text", text: "event reply" }] },
+                };
+              },
+            },
+          ],
+        ]),
+      });
+      cleanups.push(async () => {
+        await server.close();
+        tempDb.cleanup();
+      });
+
+      await waitUntil(
+        () =>
+          server.store.getRun(run.id)?.status !== "running" &&
+          server.store.listPendingSessionEvents().length === 0,
+        { timeoutMs: 3_000, label: "marker-bearing Run settled on direct startup" },
+      );
+
+      const recovered = server.store.getRun(run.id);
+      const reply = server.store
+        .listMessages(session.id)
+        .find((message) => message.runId === run.id && message.role === "assistant");
+      const terminal = server.store
+        .readRunEventsAfter(run.id, 0, 100)
+        .filter((event) => event.isTerminal)
+        .map((event) => (event.chunk as { type: string }).type);
+      const handedOver = server.store.getEngineSession(session.id, "fixture");
+
+      expect({
+        status: recovered?.status,
+        usage: recovered?.usage,
+        replyParts: reply?.parts,
+        terminal,
+        invokedMarkerRun: startedRunIds.includes(run.id),
+        pendingEvents: server.store.listPendingSessionEvents().length,
+        ...(withNextEvent ? {} : { vendorSessionId: handedOver?.vendorSessionId }),
+      }).toEqual({
+        status: "completed",
+        usage,
+        replyParts: [{ type: "text", text: "Done." }],
+        terminal: ["RUN_FINISHED"],
+        invokedMarkerRun: false,
+        pendingEvents: 0,
+        ...(withNextEvent ? {} : { vendorSessionId: "vendor-direct-1" }),
+      });
+    },
+    30_000,
+  );
+
+  it("finishes a running Run as failed from its durable failure marker on direct startup instead of interrupting it", async () => {
+    const tempDb = createTempDatabase("der-marker-failed-recovery-");
+    const before = openSqliteStore({ filename: tempDb.dbPath });
+    const { bot, session } = seedFixtureRecords(before);
+    const { run } = await before.admit({
+      botId: bot.id,
+      sessionId: session.id,
+      origin: "http",
+      idempotencyKey: "marker-failed-1",
+      input: { parts: [{ type: "text", text: "work" }] },
+    });
+    const running = await before.markRunRunning(run.id);
+    await executeEngineStage(
+      {
+        store: before,
+        engines: new Map([
+          [
+            "fixture",
+            {
+              kind: "fixture",
+              async *run() {
+                yield {
+                  type: "failed",
+                  code: "engine.fixture_failed",
+                  detail: "Permanent engine error.",
+                };
+              },
+            },
+          ],
+        ]),
+        approvalTimeoutMs: 60_000,
+      },
+      running,
+    );
+    before.close();
+
+    let calls = 0;
+    const server = await startServer({
+      config: {
+        host: "127.0.0.1",
+        port: 0,
+        restateMode: "direct",
+        databasePath: tempDb.dbPath,
+        memoryProjectionDir: `${tempDb.dir}/memory`,
+        skillsRootDir: `${tempDb.dir}/skills`,
+        workspaceRootDir: `${tempDb.dir}/workspaces`,
+        enabledEngines: ["fixture"],
+        scriptSweepIntervalMs: 60_000,
+        seedFixture: true,
+      },
+      engines: new Map([
+        [
+          "fixture",
+          {
+            kind: "fixture",
+            async *run() {
+              calls += 1;
+              yield { type: "completed" };
+            },
+          },
+        ],
+      ]),
+    });
+    cleanups.push(async () => {
+      await server.close();
+      tempDb.cleanup();
+    });
+
+    const terminal = server.store
+      .readRunEventsAfter(run.id, 0, 100)
+      .filter((event) => event.isTerminal)
+      .map((event) => {
+        const chunk = event.chunk as { type: string; code?: string; message?: string };
+        return { type: chunk.type, code: chunk.code, message: chunk.message };
+      });
+    expect({
+      status: server.store.getRun(run.id)?.status,
+      terminal,
+      calls,
+    }).toEqual({
+      status: "failed",
+      terminal: [
+        { type: "RUN_ERROR", code: "engine.fixture_failed", message: "Permanent engine error." },
+      ],
+      calls: 0,
+    });
+  }, 30_000);
 
   it.each(["throw-sync", "reject-mid-stream"] as const)(
     "ends a direct Run as failed with engine.execution_failed and delivers the next event when the engine fails (%s)",

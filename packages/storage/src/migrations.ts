@@ -46,10 +46,6 @@ const scriptRunKeyMigrationPath = resolve(
   import.meta.dirname,
   "../migrations/012-script-run-key.sql",
 );
-const cleanActiveRunTerminalsMigrationPath = resolve(
-  import.meta.dirname,
-  "../migrations/013-clean-active-run-terminals.sql",
-);
 
 export const CORE_MIGRATION: StorageMigration = {
   version: "001-core",
@@ -112,11 +108,6 @@ export const SCRIPT_RUN_KEY_MIGRATION: StorageMigration = {
   disableForeignKeys: true,
 };
 
-export const CLEAN_ACTIVE_RUN_TERMINALS_MIGRATION: StorageMigration = {
-  version: "013-clean-active-run-terminals",
-  sql: readFileSync(cleanActiveRunTerminalsMigrationPath, "utf8"),
-};
-
 export const CORE_MIGRATIONS: readonly StorageMigration[] = [
   CORE_MIGRATION,
   OUTBOX_DESTINATIONS_MIGRATION,
@@ -129,7 +120,6 @@ export const CORE_MIGRATIONS: readonly StorageMigration[] = [
   BOT_POLICY_MIGRATION,
   SESSION_EVENTS_MIGRATION,
   SCRIPT_RUN_KEY_MIGRATION,
-  CLEAN_ACTIVE_RUN_TERMINALS_MIGRATION,
 ];
 
 export function applyMigrations(

@@ -13,11 +13,14 @@ import {
   type EngineEvent,
   type PersistedRunOrigin,
   type Run,
+  type RunId,
   type RunOrigin,
+  type RunUsage,
 } from "@der/domain";
 import { openSqliteScriptStore, openSqliteStore, type SqliteStore } from "@der/storage";
 import { startServer } from "#main";
 import { ScriptDriver } from "#scripts/script-driver";
+import { executeEngineStage, type TurnRecord } from "#workflows/index";
 import { createTempDatabase, waitUntil } from "./fixtures/restate-harness";
 
 /** Where the process stopped. Each state is one the server persists on its way. */
@@ -25,6 +28,8 @@ const CRASH_STATES = [
   "admitted",
   "admitted and delivered",
   "running",
+  "engine attempt completed",
+  "engine attempt failed",
   "waiting on an engine Approval",
   "Script waiting on an Approval",
   "Script write in flight",
@@ -70,10 +75,19 @@ function writeCatalog(log: WriteLog): CapabilityCatalog {
   return catalog;
 }
 
-function completingEngine(): Engine {
+const MARKER_USAGE: RunUsage = {
+  inputTokens: 11,
+  cachedInputTokens: 3,
+  cacheWriteTokens: 4,
+  outputTokens: 22,
+  reportedCostUsd: 0.0125,
+};
+
+function completingEngine(calledRunIds?: Set<string>): Engine {
   return {
     kind: "fixture",
     async *run(run: Run): AsyncIterable<EngineEvent> {
+      calledRunIds?.add(run.id);
       yield {
         type: "chunk",
         chunkKey: `${run.id}:started`,
@@ -119,7 +133,7 @@ async function persistCrashState(
   state: CrashState,
   sessionId: string,
   nextEvent: boolean,
-): Promise<void> {
+): Promise<RunId> {
   const event = { botId: "bot-1", sessionId, kind: "script.finished" } as const;
   let run: Run;
   if (origin === "event") {
@@ -147,24 +161,79 @@ async function persistCrashState(
     store.enqueueSessionEvent({ ...event, id: `${sessionId}:evt-2`, payload: { n: 2 } });
   }
   if (state === "admitted") {
-    return;
+    return run.id;
   }
   if (origin === "event") {
     store.markSessionEventDelivered(`${sessionId}:evt-1`, run.id);
   }
   if (state === "admitted and delivered") {
-    return;
+    return run.id;
   }
-  await store.markRunRunning(run.id);
+  const running = await store.markRunRunning(run.id);
   await store.appendRunEvents(run.id, [
     { chunkKey: `${run.id}:started`, chunk: streamChunk({ type: "RUN_STARTED", runId: run.id }) },
   ]);
   if (state === "running") {
-    return;
+    return run.id;
+  }
+  if (state === "engine attempt completed" || state === "engine attempt failed") {
+    const turns = new Map<RunId, TurnRecord>([
+      [
+        run.id,
+        {
+          sessionId,
+          engine: "fixture",
+          baseHash: `base-${sessionId}`,
+          contextHash: `ctx-${sessionId}`,
+          lastOrdinal: 1,
+        },
+      ],
+    ]);
+    await executeEngineStage(
+      {
+        store,
+        turns,
+        engines: new Map([
+          [
+            "fixture",
+            {
+              kind: "fixture",
+              resumable: true,
+              async *run(activeRun) {
+                yield {
+                  type: "chunk",
+                  chunkKey: `${activeRun.id}:delta:interim`,
+                  chunk: {
+                    type: "TEXT_MESSAGE_CONTENT",
+                    messageId: `msg_${activeRun.id}`,
+                    delta: "Interim. ",
+                  },
+                };
+                yield state === "engine attempt completed"
+                  ? {
+                      type: "completed",
+                      finalMessage: { parts: [{ type: "text", text: `Final ${sessionId}.` }] },
+                      usage: MARKER_USAGE,
+                      vendorSessionId: `vendor-${sessionId}`,
+                    }
+                  : {
+                      type: "failed",
+                      code: "engine.scripted",
+                      detail: `Failed ${sessionId}.`,
+                    };
+              },
+            },
+          ],
+        ]),
+        approvalTimeoutMs: 60_000,
+      },
+      running,
+    );
+    return run.id;
   }
   if (state === "completed") {
     await store.finishRun({ runId: run.id, end: { kind: "complete" } });
-    return;
+    return run.id;
   }
   if (state === "waiting on an engine Approval") {
     await store.requestApproval({
@@ -182,7 +251,7 @@ async function persistCrashState(
       awakeable: `direct_awk_${run.id}`,
       deadline: formatUtcTimestamp(new Date(Date.now() + 60_000)),
     });
-    return;
+    return run.id;
   }
   const script = SCRIPTS[state]!;
   const source = script.source.replaceAll('text: "', `text: "${sessionId}:`);
@@ -219,6 +288,7 @@ async function persistCrashState(
     { timeoutMs: 5_000, label: `the Script reached "${state}"` },
   );
   await driver.close();
+  return run.id;
 }
 
 async function recoverAndSettle(
@@ -235,19 +305,28 @@ async function recoverAndSettle(
     allowedEngines: ["fixture"],
     eventChainLimit: 100,
   });
+  const seeded: {
+    readonly sessionId: string;
+    readonly runId: RunId;
+    readonly state: CrashState;
+    readonly nextEvent: boolean;
+  }[] = [];
   for (const [index, crash] of crashes.entries()) {
-    before.createSession({ id: `sess-${index}`, botId: "bot-1", title: `${index}` });
-    await persistCrashState(
+    const sessionId = `sess-${index}`;
+    before.createSession({ id: sessionId, botId: "bot-1", title: `${index}` });
+    const runId = await persistCrashState(
       before,
       log,
       crash.origin,
       crash.state,
-      `sess-${index}`,
+      sessionId,
       crash.nextEvent,
     );
+    seeded.push({ sessionId, runId, state: crash.state, nextEvent: crash.nextEvent });
   }
   before.close();
 
+  const calledRunIds = new Set<string>();
   const server = await startServer({
     config: {
       host: "127.0.0.1",
@@ -261,7 +340,7 @@ async function recoverAndSettle(
       scriptSweepIntervalMs: 60_000,
     },
     catalog: writeCatalog(log),
-    engines: new Map([["fixture", completingEngine()]]),
+    engines: new Map([["fixture", completingEngine(calledRunIds)]]),
   });
   const { store } = server;
   const runs = () =>
@@ -300,12 +379,57 @@ async function recoverAndSettle(
     const repeated = [...new Set(log.applied)].filter(
       (write) => log.applied.filter((applied) => applied === write).length > 1,
     );
+    const markerViolations: string[] = [];
+    for (const item of seeded) {
+      if (item.state === "engine attempt completed") {
+        const stored = store.getRun(item.runId);
+        const reply = store
+          .listMessages(item.sessionId)
+          .find((message) => message.runId === item.runId && message.role === "assistant");
+        const handedOver = store.getEngineSession(item.sessionId, "fixture");
+        if (stored?.status !== "completed") {
+          markerViolations.push(`${item.sessionId} completed marker ended as ${stored?.status}`);
+        }
+        if (JSON.stringify(stored?.usage) !== JSON.stringify(MARKER_USAGE)) {
+          markerViolations.push(`${item.sessionId} usage lost: ${JSON.stringify(stored?.usage)}`);
+        }
+        if (
+          JSON.stringify(reply?.parts) !==
+          JSON.stringify([{ type: "text", text: `Final ${item.sessionId}.` }])
+        ) {
+          markerViolations.push(
+            `${item.sessionId} reply mismatch: ${JSON.stringify(reply?.parts)}`,
+          );
+        }
+        if (calledRunIds.has(item.runId)) {
+          markerViolations.push(`${item.sessionId} re-invoked engine for completed marker`);
+        }
+        if (!item.nextEvent && handedOver?.vendorSessionId !== `vendor-${item.sessionId}`) {
+          markerViolations.push(
+            `${item.sessionId} engineSession lost: ${handedOver?.vendorSessionId ?? "null"}`,
+          );
+        }
+      } else if (item.state === "engine attempt failed") {
+        const stored = store.getRun(item.runId);
+        const terminal = store.readRunEventsAfter(item.runId, 0, 100).find((ev) => ev.isTerminal)
+          ?.chunk as { type?: string; code?: string } | undefined;
+        if (stored?.status !== "failed" || terminal?.code !== "engine.scripted") {
+          markerViolations.push(
+            `${item.sessionId} failed marker ended as ${stored?.status} (${terminal?.code ?? "none"})`,
+          );
+        }
+        if (calledRunIds.has(item.runId)) {
+          markerViolations.push(`${item.sessionId} re-invoked engine for failed marker`);
+        }
+      }
+    }
     return {
       undriven: runs()
         .filter((run) => ACTIVE.has(run.status))
         .map((run) => `${run.session_id} ${run.origin} ${run.status}`),
       heldEvents: store.listPendingSessionEvents().map((event) => event.id),
       repeatedWrites: repeated,
+      markerViolations,
     };
   } finally {
     await server.close();
@@ -527,6 +651,7 @@ describe("property: direct-mode recovery after a crash", () => {
             undriven: [],
             heldEvents: [],
             repeatedWrites: [],
+            markerViolations: [],
           });
         },
       ),

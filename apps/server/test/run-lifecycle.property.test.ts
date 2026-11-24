@@ -14,8 +14,10 @@ import { startServer } from "#main";
 import { createRunCoordinator } from "#workflows/coordinator";
 import { createDirectWorkflowDriver } from "#workflows/direct-workflow";
 import {
+  executeEngineStage,
   finalizeDirectRunStep,
   finalizeInterruptedUncertainStep,
+  loadAndStartRunStep,
   persistPendingApprovalStep,
 } from "#workflows/run-steps";
 import { createTempDatabase, waitUntil } from "./fixtures/restate-harness";
@@ -42,6 +44,11 @@ type Step =
       readonly kind: "engine";
       readonly run: number;
       readonly chunks: readonly ChunkSpec[];
+      readonly end: "completed" | "failed";
+    }
+  | {
+      readonly kind: "engineStage";
+      readonly run: number;
       readonly end: "completed" | "failed";
     }
   | {
@@ -79,6 +86,14 @@ const step: fc.Arbitrary<Step> = fc.oneof(
   {
     weight: 3,
     arbitrary: fc.record({
+      kind: fc.constant("engineStage"),
+      run: runIndex,
+      end: fc.constantFrom("completed", "failed"),
+    }),
+  },
+  {
+    weight: 3,
+    arbitrary: fc.record({
       kind: fc.constant("finish"),
       run: runIndex,
       outcome: fc.constantFrom("completed", "failed", "interrupted"),
@@ -94,7 +109,7 @@ const step: fc.Arbitrary<Step> = fc.oneof(
       status: fc.constantFrom("approved", "denied"),
     }),
   },
-  { weight: 1, arbitrary: fc.constant({ kind: "restart" as const }) },
+  { weight: 2, arbitrary: fc.constant({ kind: "restart" as const }) },
 );
 
 const scenario = fc.record({
@@ -209,7 +224,21 @@ async function restartDirect(dbPath: string, dir: string): Promise<void> {
   }
 }
 
-async function apply(store: SqliteStore, runs: readonly Run[], at: Step, n: number): Promise<void> {
+const STAGE_USAGE = {
+  inputTokens: 7,
+  cachedInputTokens: 1,
+  cacheWriteTokens: 2,
+  outputTokens: 13,
+  reportedCostUsd: 0.005,
+} as const;
+
+async function apply(
+  store: SqliteStore,
+  runs: readonly Run[],
+  at: Step,
+  n: number,
+  pendingCompletedMarkers: Set<string>,
+): Promise<void> {
   if (at.kind === "restart") {
     return;
   }
@@ -234,6 +263,59 @@ async function apply(store: SqliteStore, runs: readonly Run[], at: Step, n: numb
       } finally {
         driver.close();
       }
+      pendingCompletedMarkers.delete(run.id);
+      return;
+    }
+    case "engineStage": {
+      const started = await loadAndStartRunStep(deps, run.id);
+      if (started.alreadyTerminal) {
+        return;
+      }
+      const hadMarkerBefore = store
+        .readRunEventsAfter(run.id, 0, 10_000)
+        .some(
+          (event) =>
+            typeof event.chunk === "object" &&
+            event.chunk !== null &&
+            !Array.isArray(event.chunk) &&
+            event.chunk["type"] === "CUSTOM" &&
+            event.chunk["name"] === "der.engine-attempt-finished",
+        );
+      await executeEngineStage(
+        {
+          ...deps,
+          engines: new Map([
+            [
+              "fixture",
+              {
+                kind: "fixture",
+                async *run(activeRun) {
+                  yield {
+                    type: "chunk",
+                    chunkKey: `${activeRun.id}:stage-interim`,
+                    chunk: {
+                      type: "TEXT_MESSAGE_CONTENT",
+                      messageId: `msg_${activeRun.id}`,
+                      delta: "interim ",
+                    },
+                  };
+                  yield at.end === "completed"
+                    ? {
+                        type: "completed",
+                        finalMessage: { parts: [{ type: "text", text: "stage done" }] },
+                        usage: STAGE_USAGE,
+                      }
+                    : { type: "failed", code: "engine.scripted", detail: "stage failed" };
+                },
+              },
+            ],
+          ]),
+        },
+        started.run,
+      );
+      if (!hadMarkerBefore && at.end === "completed") {
+        pendingCompletedMarkers.add(run.id);
+      }
       return;
     }
     case "finish":
@@ -246,6 +328,7 @@ async function apply(store: SqliteStore, runs: readonly Run[], at: Step, n: numb
               ? { kind: "failed", code: "engine.scripted", detail: "scripted failure" }
               : { kind: "interrupted", detail: "scripted interruption" },
       });
+      pendingCompletedMarkers.delete(run.id);
       return;
     case "interruptUncertain":
       await finalizeInterruptedUncertainStep(deps, {
@@ -253,6 +336,7 @@ async function apply(store: SqliteStore, runs: readonly Run[], at: Step, n: numb
         effectId: `eff_${n}`,
         detail: "scripted uncertain outcome",
       });
+      pendingCompletedMarkers.delete(run.id);
       return;
     case "requestApproval":
       await persistPendingApprovalStep(deps, {
@@ -315,13 +399,34 @@ async function runScenario(input: {
       runs.push(run);
     }
     const ids = runs.map((run) => run.id);
+    const pendingCompletedMarkers = new Set<string>();
     for (const [n, at] of input.steps.entries()) {
       if (at.kind === "restart") {
+        const expectedCompleted = [...pendingCompletedMarkers].filter((id) =>
+          ACTIVE.has(store.getRun(id)!.status),
+        );
         store.close();
         await restartDirect(tempDb.dbPath, tempDb.dir);
         store = openSqliteStore({ filename: tempDb.dbPath });
+        for (const id of expectedCompleted) {
+          const recovered = store.getRun(id)!;
+          const reply = store
+            .listMessages(recovered.sessionId)
+            .find((message) => message.runId === id && message.role === "assistant");
+          if (
+            recovered.status !== "completed" ||
+            JSON.stringify(recovered.usage) !== JSON.stringify(STAGE_USAGE) ||
+            JSON.stringify(reply?.parts) !== JSON.stringify([{ type: "text", text: "stage done" }])
+          ) {
+            return [
+              `after step ${n} (restart)`,
+              `marker-bearing Run ${id} recovered as ${recovered.status} with usage ${JSON.stringify(recovered.usage)} and reply ${JSON.stringify(reply?.parts)}`,
+            ];
+          }
+          pendingCompletedMarkers.delete(id);
+        }
       } else {
-        await apply(store, runs, at, n).catch(() => undefined);
+        await apply(store, runs, at, n, pendingCompletedMarkers).catch(() => undefined);
       }
       const violations = streamViolations(store, ids);
       if (violations.length > 0) {

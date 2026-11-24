@@ -2,10 +2,20 @@ import { afterEach, describe, expect, it } from "bun:test";
 import { mkdirSync } from "node:fs";
 import { join } from "node:path";
 import type { CoordinatorDriver } from "#workflows/coordinator";
-import { finalizeInterruptedUncertainStep } from "#workflows/run-steps";
-import type { Run, RunEvent } from "@der/domain";
+import {
+  executeEngineStage,
+  finalizeDirectRunStep,
+  finalizeInterruptedUncertainStep,
+  type TurnRecord,
+} from "#workflows/run-steps";
+import type { Engine, EngineEvent, MessagePart, Run, RunEvent, RunId, RunUsage } from "@der/domain";
 import type { CommandRunner, CommandSpawnHandle } from "@der/runtime/sandbox";
-import { SqliteStore, type FinishRunInput, type FinishRunOutcome } from "@der/storage";
+import {
+  openSqliteStore,
+  SqliteStore,
+  type FinishRunInput,
+  type FinishRunOutcome,
+} from "@der/storage";
 import { MEMORY_ROUTINE_SLOTS_MIGRATION } from "@der/storage/memory";
 import { startServer, type RunningServer } from "#main";
 import { createTempDatabase, waitUntil } from "./fixtures/restate-harness";
@@ -805,4 +815,189 @@ describe("leave the successor's vendor session alone", () => {
       "vendor-1",
     ]);
   }, 60_000);
+});
+
+describe("replay a durable engine-attempt-finished marker", () => {
+  async function seedActiveRun() {
+    const tempDb = createTempDatabase("der-marker-replay-");
+    const store = openSqliteStore({ filename: tempDb.dbPath });
+    cleanups.push(() => {
+      store.close();
+      tempDb.cleanup();
+    });
+    store.createBot({
+      id: "bot-marker",
+      name: "Marker Bot",
+      persona: "",
+      defaultEngine: "claude-code",
+      allowedEngines: ["claude-code"],
+    });
+    store.createSession({ id: "sess-marker", botId: "bot-marker", title: "Marker" });
+    const { run, initialMessage } = await store.admit({
+      botId: "bot-marker",
+      sessionId: "sess-marker",
+      origin: "http",
+      idempotencyKey: "marker-1",
+      input: { parts: [{ type: "text", text: "do work" }] },
+    });
+    const running = await store.markRunRunning(run.id);
+    return { store, run: running, initialMessage };
+  }
+
+  it("preserves exact finalMessageParts, all five usage fields, and vendor session handover instead of concatenating interim deltas", async () => {
+    const { store, run, initialMessage } = await seedActiveRun();
+    let calls = 0;
+    const usage: RunUsage = {
+      inputTokens: 11,
+      cachedInputTokens: 3,
+      cacheWriteTokens: 4,
+      outputTokens: 22,
+      reportedCostUsd: 0.0125,
+    };
+    const expectedParts: MessagePart[] = [{ type: "text", text: "Done." }];
+    const engine: Engine = {
+      kind: "claude-code",
+      resumable: true,
+      async *run(activeRun): AsyncIterable<EngineEvent> {
+        calls += 1;
+        yield {
+          type: "chunk",
+          chunkKey: `${activeRun.id}:delta:1`,
+          chunk: {
+            type: "TEXT_MESSAGE_CONTENT",
+            messageId: `msg_${activeRun.id}`,
+            delta: "Requesting approval. ",
+          },
+        };
+        yield {
+          type: "chunk",
+          chunkKey: `${activeRun.id}:delta:2`,
+          chunk: {
+            type: "TEXT_MESSAGE_CONTENT",
+            messageId: `msg_${activeRun.id}`,
+            delta: "Done.",
+          },
+        };
+        yield {
+          type: "completed",
+          finalMessage: { parts: expectedParts },
+          usage,
+          vendorSessionId: "vendor-handover-1",
+        };
+      },
+    };
+    const turns = new Map<RunId, TurnRecord>([
+      [
+        run.id,
+        {
+          sessionId: run.sessionId,
+          engine: "claude-code",
+          baseHash: "base-hash-1",
+          contextHash: "context-hash-1",
+          lastOrdinal: initialMessage.ordinal,
+        },
+      ],
+    ]);
+    const deps = {
+      store,
+      turns,
+      engines: new Map([["claude-code" as const, engine]]),
+      approvalTimeoutMs: 60_000,
+    };
+
+    const original = await executeEngineStage(deps, run);
+    const replayed = await executeEngineStage({ ...deps, turns: new Map() }, run);
+    const finishedRun = await finalizeDirectRunStep(deps, { run, outcome: replayed });
+    const assistant = store
+      .listMessages(run.sessionId)
+      .find((message) => message.role === "assistant");
+    const handedOver = store.getEngineSession(run.sessionId, "claude-code");
+
+    expect({
+      calls,
+      replayed,
+      status: finishedRun.status,
+      usage: finishedRun.usage,
+      assistantParts: assistant?.parts,
+      handedOver: handedOver
+        ? {
+            sessionId: handedOver.sessionId,
+            engine: handedOver.engine,
+            vendorSessionId: handedOver.vendorSessionId,
+            baseHash: handedOver.baseHash,
+            contextHash: handedOver.contextHash,
+            lastOrdinal: handedOver.lastOrdinal,
+          }
+        : null,
+    }).toEqual({
+      calls: 1,
+      replayed: original,
+      status: "completed",
+      usage,
+      assistantParts: expectedParts,
+      handedOver: {
+        sessionId: run.sessionId,
+        engine: "claude-code",
+        vendorSessionId: "vendor-handover-1",
+        baseHash: "base-hash-1",
+        contextHash: "context-hash-1",
+        lastOrdinal: 2,
+      },
+    });
+  });
+
+  it("preserves finalMessageParts when the engine completes without streaming text deltas", async () => {
+    const { store, run } = await seedActiveRun();
+    let calls = 0;
+    const expectedParts: MessagePart[] = [
+      { type: "text", text: "Silent reply." },
+      { type: "data", mimeType: "application/json", data: { ok: true } },
+    ];
+    const engine: Engine = {
+      kind: "claude-code",
+      async *run(): AsyncIterable<EngineEvent> {
+        calls += 1;
+        yield { type: "completed", finalMessage: { parts: expectedParts } };
+      },
+    };
+    const deps = {
+      store,
+      engines: new Map([["claude-code" as const, engine]]),
+      approvalTimeoutMs: 60_000,
+    };
+
+    await executeEngineStage(deps, run);
+    const replayed = await executeEngineStage(deps, run);
+
+    expect({ calls, replayed }).toEqual({
+      calls: 1,
+      replayed: { kind: "completed", finalMessageParts: expectedParts },
+    });
+  });
+
+  it("replays a persisted marker even when the Run's engine is no longer registered", async () => {
+    const { store, run } = await seedActiveRun();
+    const expectedParts: MessagePart[] = [{ type: "text", text: "Durable answer." }];
+    const engine: Engine = {
+      kind: "claude-code",
+      async *run(): AsyncIterable<EngineEvent> {
+        yield { type: "completed", finalMessage: { parts: expectedParts } };
+      },
+    };
+
+    await executeEngineStage(
+      {
+        store,
+        engines: new Map([["claude-code" as const, engine]]),
+        approvalTimeoutMs: 60_000,
+      },
+      run,
+    );
+    const replayed = await executeEngineStage(
+      { store, engines: new Map(), approvalTimeoutMs: 60_000 },
+      run,
+    );
+
+    expect(replayed).toEqual({ kind: "completed", finalMessageParts: expectedParts });
+  });
 });
