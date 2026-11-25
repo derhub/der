@@ -327,6 +327,8 @@ export interface ChatWorkspaceProps {
   readonly session: Session;
   readonly actor: string;
   readonly onAnnounce: (message: string) => void;
+  /** Called when a Run of this session starts or settles, as either can change its waiting events. */
+  readonly onRunActivity?: () => void;
 }
 
 const USAGE_RETRY_DELAY_MS = 1_000;
@@ -595,6 +597,7 @@ export function ChatWorkspace({
   session,
   actor,
   onAnnounce,
+  onRunActivity,
 }: ChatWorkspaceProps) {
   const defaultEngine: EngineKind = session.engine ?? bot.defaultEngine;
   const [selectedEngine, setSelectedEngine] = useState<EngineKind>(defaultEngine);
@@ -603,7 +606,7 @@ export function ChatWorkspace({
   const [historyLoading, setHistoryLoading] = useState(false);
   const [activeRun, setActiveRun] = useState<Run | null>(null);
   const [sessionRuns, setSessionRuns] = useState<Run[]>([]);
-  const [activeApproval, setActiveApproval] = useState<Approval | null>(null);
+  const [activeApprovals, setActiveApprovals] = useState<readonly Approval[]>([]);
   const [streamStatus, setStreamStatus] = useState<RunStreamStatus>("idle");
   const [committedCursor, setCommittedCursor] = useState(0);
   const [problem, setProblem] = useState<ProblemDetails | null>(null);
@@ -647,7 +650,7 @@ export function ChatWorkspace({
       try {
         const detail = await api.getRun(runId);
         setActiveRun(detail.run);
-        setActiveApproval(detail.approval);
+        setActiveApprovals(detail.approvals);
         if (isTerminalRunStatus(detail.run.status)) {
           writePersistedCursor(session.id, null);
         }
@@ -664,7 +667,7 @@ export function ChatWorkspace({
       setFailedDraft(null);
       setProblem(null);
       setActiveRun(admission.run);
-      setActiveApproval(null);
+      setActiveApprovals([]);
       setCommittedCursor(0);
       cursorMapRef.current.set(admission.run.id, 0);
       writePersistedCursor(session.id, { runId: admission.run.id, cursor: 0 });
@@ -673,8 +676,9 @@ export function ChatWorkspace({
           ? `Resumed existing run ${admission.run.id}.`
           : `Started run ${admission.run.id}.`,
       );
+      onRunActivity?.();
     },
-    [onAnnounce, session.id],
+    [onAnnounce, onRunActivity, session.id],
   );
 
   const handleCursorAdvance = useCallback(
@@ -693,11 +697,12 @@ export function ChatWorkspace({
   const handleApprovalSignal = useCallback(
     (eventName: string, _payload: unknown, runId: string) => {
       void refreshRunState(runId);
+      onRunActivity?.();
       if (eventName === "approval.requested") {
         onAnnounce(`Approval required for run ${runId}.`);
       }
     },
-    [onAnnounce, refreshRunState],
+    [onAnnounce, onRunActivity, refreshRunState],
   );
 
   const handleRunSettled = useCallback(
@@ -726,8 +731,9 @@ export function ChatWorkspace({
         });
       };
       watchUsage(USAGE_RETRY_LIMIT);
+      onRunActivity?.();
     },
-    [refreshHistory, refreshRunState, refreshSessionRuns],
+    [onRunActivity, refreshHistory, refreshRunState, refreshSessionRuns],
   );
 
   const connection = useMemo(
@@ -863,8 +869,7 @@ export function ChatWorkspace({
     }
   }
 
-  async function handleApprovalDecision(decision: "approved" | "denied") {
-    if (!activeApproval) return;
+  async function handleApprovalDecision(activeApproval: Approval, decision: "approved" | "denied") {
     const resolvedActor = actor.trim().length > 0 ? actor.trim() : "operator";
     setDecidingApproval(true);
     setProblem(null);
@@ -876,7 +881,9 @@ export function ChatWorkspace({
         status: decision,
         actor: resolvedActor,
       });
-      setActiveApproval(updated);
+      setActiveApprovals((approvals) =>
+        approvals.map((approval) => (approval.id === updated.id ? updated : approval)),
+      );
       onAnnounce(`Recorded ${decision} decision for approval ${updated.id}.`);
       await refreshRunState(updated.runId);
       if (!chat.isLoading) {
@@ -961,9 +968,10 @@ export function ChatWorkspace({
         />
       ) : null}
 
-      {activeApproval ? (
+      {activeApprovals.map((activeApproval) => (
         <Card
           variant={activeApproval.decision.status === "pending" ? "yellow" : "default"}
+          key={activeApproval.id}
           data-approval-id={activeApproval.id}
         >
           <div {...stylex.props(styles.approvalBody)}>
@@ -1041,7 +1049,7 @@ export function ChatWorkspace({
                   label="Deny effect"
                   icon={<XIcon {...stylex.props(styles.iconSm)} aria-hidden="true" />}
                   isDisabled={decidingApproval}
-                  onClick={() => void handleApprovalDecision("denied")}
+                  onClick={() => void handleApprovalDecision(activeApproval, "denied")}
                 />
                 <Button
                   variant="primary"
@@ -1049,13 +1057,13 @@ export function ChatWorkspace({
                   label={decidingApproval ? "Submitting..." : "Approve effect"}
                   icon={<CheckIcon {...stylex.props(styles.iconSm)} aria-hidden="true" />}
                   isDisabled={decidingApproval}
-                  onClick={() => void handleApprovalDecision("approved")}
+                  onClick={() => void handleApprovalDecision(activeApproval, "approved")}
                 />
               </div>
             ) : null}
           </div>
         </Card>
-      ) : null}
+      ))}
 
       {usageRuns.length > 0 ? (
         <div {...stylex.props(styles.columnGap05)}>

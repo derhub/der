@@ -242,6 +242,14 @@ describe("resume SSE stream with deduplication and terminal 204", () => {
           }),
           formatSseEvent({
             id: 3,
+            data: {
+              type: "CUSTOM",
+              name: "der.engine-attempt-finished",
+              value: { kind: "completed", suffix: "" },
+            },
+          }),
+          formatSseEvent({
+            id: 4,
             data: { type: "RUN_FINISHED", runId: "run-9", threadId: "sess-1" },
           }),
         ]);

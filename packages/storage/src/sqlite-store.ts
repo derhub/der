@@ -33,13 +33,21 @@ import {
   type Routine,
   type RoutineId,
   type RoutineStore,
+  type FinishRunInput,
+  type FinishRunOutcome,
+  type ActiveRun,
   type Run,
   type RunAdmission,
   type RunEvent,
+  type RunEventInput,
   type RunId,
   type RunRequest,
   type RunStore,
+  type RunStreamState,
   type Session,
+  type SessionEvent,
+  type SessionEventStore,
+  type NewSessionEvent,
   type SessionId,
   type SessionStore,
   type Store,
@@ -48,12 +56,22 @@ import {
 } from "@der/domain";
 import { compiledParsers } from "@der/domain/compiled";
 import {
+  countEventChain,
+  countPendingSessionEvents,
+  enqueueSessionEvent,
+  getActiveRun,
+  listPendingSessionEvents,
+  markSessionEventDelivered,
+} from "./session-events";
+import {
   beginEffect as beginEffectCommand,
   completeEffect as completeEffectCommand,
   decideApproval,
   getApproval as getApprovalQuery,
   findWriteInDoubt as findWriteInDoubtQuery,
   getEffect as getEffectQuery,
+  listPendingApprovalsForRun,
+  listPendingScriptApprovalsPastDeadline,
   getLatestApprovalForRun as getLatestApprovalForRunQuery,
   markEffectUnknown as markEffectUnknownCommand,
   requestApproval as requestApprovalCommand,
@@ -87,19 +105,14 @@ import {
   type RoutineRow,
   type SessionRow,
 } from "./rows";
+import { finishRun as finishRunCommand, startRun } from "./run-lifecycle";
 import {
   admitRun,
   appendRunEvents as appendRunEventsCommand,
-  finishRun as finishRunCommand,
   getRun as getRunQuery,
   getRunStreamState as getRunStreamStateQuery,
   listSessionRuns as listSessionRunsQuery,
-  markRunRunning as markRunRunningCommand,
   readRunEventsAfter as readRunEventsAfterQuery,
-  type FinishRunInput,
-  type FinishRunOutcome,
-  type RunEventInput,
-  type RunStreamState,
 } from "./runs";
 
 export type {
@@ -109,7 +122,7 @@ export type {
 } from "./approvals-effects";
 export type { CreateRoutineInput };
 export type { UpsertChannelBindingInput } from "./channel-outbox";
-export type { FinishRunInput, FinishRunOutcome, RunEventInput, RunStreamState } from "./runs";
+export type { FinishRunInput, FinishRunOutcome, RunEventInput, RunStreamState };
 
 export interface SqliteStoreOptions extends SqliteDatabaseOptions {
   readonly maxEventBatchSize?: number;
@@ -128,7 +141,8 @@ export class SqliteStore
     ApprovalEffectStore,
     OutboxStore,
     RoutineStore,
-    EngineSessionStore
+    EngineSessionStore,
+    SessionEventStore
 {
   readonly database: SqliteDatabase;
   private readonly maxEventBatchSize: number;
@@ -168,8 +182,8 @@ export class SqliteStore
 
     return this.database.inTransaction((db) => {
       db.query(
-        `INSERT INTO bots (id, name, persona, default_engine, allowed_engines_json, workspace_path, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+        `INSERT INTO bots (id, name, persona, default_engine, allowed_engines_json, workspace_path, capability_policy_json, event_chain_limit, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       ).run(
         botId,
         parsed.data.name,
@@ -177,6 +191,8 @@ export class SqliteStore
         parsed.data.defaultEngine,
         JSON.stringify(parsed.data.allowedEngines),
         parsed.data.workspacePath ?? null,
+        JSON.stringify(parsed.data.capabilityPolicy),
+        parsed.data.eventChainLimit,
         now,
         now,
       );
@@ -244,9 +260,13 @@ export class SqliteStore
           ? parsed.data.workspacePath
           : (existing.workspacePath ?? null);
 
+      const nextPolicy = parsed.data.capabilityPolicy ?? existing.capabilityPolicy;
+      const nextChainLimit = parsed.data.eventChainLimit ?? existing.eventChainLimit;
+
       db.query(
         `UPDATE bots
-         SET name = ?, persona = ?, default_engine = ?, allowed_engines_json = ?, workspace_path = ?, updated_at = ?
+         SET name = ?, persona = ?, default_engine = ?, allowed_engines_json = ?, workspace_path = ?,
+             capability_policy_json = ?, event_chain_limit = ?, updated_at = ?
          WHERE id = ?`,
       ).run(
         nextName,
@@ -254,6 +274,8 @@ export class SqliteStore
         nextDefault,
         JSON.stringify(nextAllowed),
         nextWorkspacePath,
+        JSON.stringify(nextPolicy),
+        nextChainLimit,
         now,
         botId,
       );
@@ -327,10 +349,37 @@ export class SqliteStore
   listSessions(botId: BotId): Session[] {
     const rows = this.database.db
       .query<SessionRow, [string]>(
-        "SELECT * FROM sessions WHERE bot_id = ? ORDER BY created_at ASC, id ASC",
+        `SELECT s.*, (
+           SELECT COUNT(*) FROM session_events e WHERE e.session_id = s.id AND e.state = 'pending'
+         ) AS pending_event_count
+         FROM sessions s WHERE s.bot_id = ? ORDER BY s.created_at ASC, s.id ASC`,
       )
       .all(botId);
     return rows.map(mapSessionRow);
+  }
+
+  enqueueSessionEvent(input: NewSessionEvent): SessionEvent {
+    return this.database.inTransaction((db) => enqueueSessionEvent(db, input, this.nowUtc()));
+  }
+
+  listPendingSessionEvents(): SessionEvent[] {
+    return listPendingSessionEvents(this.database.db);
+  }
+
+  markSessionEventDelivered(eventId: string, runId: RunId): void {
+    markSessionEventDelivered(this.database.db, eventId, runId);
+  }
+
+  countPendingSessionEvents(sessionId: SessionId): number {
+    return countPendingSessionEvents(this.database.db, sessionId);
+  }
+
+  countEventChain(sessionId: SessionId): number {
+    return countEventChain(this.database.db, sessionId);
+  }
+
+  getActiveRun(sessionId: SessionId): ActiveRun | undefined {
+    return getActiveRun(this.database.db, sessionId);
   }
 
   createRoutine(input: CreateRoutineInput): Routine {
@@ -431,7 +480,7 @@ export class SqliteStore
   }
 
   markRunRunning(runId: RunId, checkpoint?: JsonValue | null): Promise<Run> {
-    return markRunRunningCommand(this.database, runId, checkpoint);
+    return startRun(this.database, runId, checkpoint);
   }
 
   appendRunEvents(runId: RunId, events: readonly RunEventInput[]): Promise<RunEvent[]> {
@@ -475,6 +524,14 @@ export class SqliteStore
     return getLatestApprovalForRunQuery(this.database, runId);
   }
 
+  listPendingApprovalsForRun(runId: RunId): readonly Approval[] {
+    return listPendingApprovalsForRun(this.database, runId);
+  }
+
+  listPendingScriptApprovalsPastDeadline(at: UtcTimestamp): readonly Approval[] {
+    return listPendingScriptApprovalsPastDeadline(this.database, at);
+  }
+
   decide(
     decision: ApprovalResolutionInput,
     channelIntake?: ChannelIntakeMetadata,
@@ -484,7 +541,7 @@ export class SqliteStore
 
   beginEffect(
     identity: EffectIdentity,
-    options?: { readonly approvalId?: ApprovalId },
+    options?: { readonly approvalId?: ApprovalId; readonly scriptExecutionId?: string },
   ): Promise<BeginEffectOutcome> {
     return beginEffectCommand(this.database, identity, options);
   }

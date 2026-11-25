@@ -16,7 +16,7 @@ export function memoryCapabilities(memory: HttpMemoryPort) {
       }),
       effect: "read",
       approval: "none",
-      example: "await der.memory.read({})",
+      example: 'await step.run("memory.read", {})',
       async execute(input, ctx) {
         const botId = callerBotId(ctx, "memory.read");
         const record = await memory.read(botId, input.version);
@@ -46,7 +46,7 @@ export function memoryCapabilities(memory: HttpMemoryPort) {
       output: z.object({ memory: memoryRecord }),
       effect: "write",
       approval: "always",
-      example: 'await der.memory.write({ markdown: "# Notes" })',
+      example: 'await step.run("memory.write", { markdown: "# Notes" })',
       async execute(input, ctx) {
         const botId = callerBotId(ctx, "memory.write");
         const written = await memory.write({

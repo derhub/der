@@ -58,6 +58,8 @@ const fixtures = {
     persona: "Concise self-hosted coworker.",
     defaultEngine: "codex" as const,
     allowedEngines: ["codex" as const, "claude-code" as const],
+    capabilityPolicy: { "mcp.github": "ask" as const },
+    eventChainLimit: 3,
     createdAt: "2026-11-22T15:00:00Z",
     updatedAt: "2026-11-22T15:00:00Z",
   },
@@ -391,6 +393,7 @@ describe("keep Memory schema and capability entry points distinct", () => {
         yield fixtures.runEvent;
       },
       finishRun: async () => ({
+        won: true,
         run: fixtures.run,
         terminalEvent: fixtures.runEvent,
         outboxEvents: [],

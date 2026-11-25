@@ -71,7 +71,7 @@ async function wasAbortedByTimeout(adminUrl: string, service: string): Promise<b
   return (body.rows[0]?.aborted ?? 0) > 0;
 }
 
-const PUBLISH = `return await der.notes.publish({ text: "release" });`;
+const PUBLISH = `return await step.run("notes.publish", { text: "release" });`;
 
 async function createScriptRoutine(server: RunningServer, script: string) {
   return server.routineSchedule.configure("rt-restate", {
@@ -117,7 +117,7 @@ describe("a script routine under Restate", () => {
     const host = createNoteHost();
     const server = await startRestateServer(tempDb, await allocateLocalTcpNumber(), host, true);
     cleanups.push(() => server.close());
-    await createScriptRoutine(server, `return await der.notes.read({ key: "a" });`);
+    await createScriptRoutine(server, `return await step.run("notes.read", { key: "a" });`);
 
     const tick = await fire(server, "2026-06-01");
     const run = await waitUntil(
@@ -169,7 +169,7 @@ describe("a script routine under Restate", () => {
     const replacement = await startRestateServer(tempDb, restateListen, host, false);
     cleanups.push(() => replacement.close());
 
-    await replacement.coordinator.decide({
+    await replacement.commands.decideApproval({
       approvalId: approval.id,
       botId: replacement.store.getRun(runId)!.botId,
       sessionId: replacement.store.getRun(runId)!.sessionId,
@@ -246,7 +246,7 @@ describe("a script routine under Restate", () => {
 
     expect(server.store.getRun(runId)?.status).toBe("waiting_approval");
     expect(approvalCount(server, runId)).toBe(1);
-    await server.coordinator.decide({
+    await server.commands.decideApproval({
       approvalId: approval.id,
       botId: server.seededFixture!.bot.id,
       sessionId: server.seededFixture!.session.id,

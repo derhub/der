@@ -39,7 +39,7 @@ export function routineCapabilities(deps: RoutineCapabilityDeps) {
       output: z.object({ routines: z.array(routine) }),
       effect: "read",
       approval: "none",
-      example: "await der.routines.list({})",
+      example: 'await step.run("routines.list", {})',
       async execute(_input, ctx) {
         const botId = callerBotId(ctx, "routines.list");
         return { routines: [...(await deps.routines.listRoutines(botId))] };
@@ -60,8 +60,7 @@ export function routineCapabilities(deps: RoutineCapabilityDeps) {
       output: configured,
       effect: "write",
       approval: "always",
-      example:
-        'await der.routines.create({ sessionId: "sess-1", name: "Daily", cron: "0 9 * * *", script: "return await der.routines.list({})" })',
+      example: `await step.run("routines.create", { sessionId: "sess-1", name: "Daily", cron: "0 9 * * *", script: ${JSON.stringify('return await step.run("routines.list", {})')} })`,
       async execute(input, ctx) {
         const botId = callerBotId(ctx, "routines.create");
         const bot = await deps.bots.getBot(botId);
@@ -112,7 +111,7 @@ export function routineCapabilities(deps: RoutineCapabilityDeps) {
       output: configured,
       effect: "write",
       approval: "always",
-      example: 'await der.routines.update({ routineId: "rt-1", enabled: false })',
+      example: 'await step.run("routines.update", { routineId: "rt-1", enabled: false })',
       async execute(input, ctx) {
         const { routineId } = input;
         const botId = callerBotId(ctx, "routines.update");

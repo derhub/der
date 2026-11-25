@@ -3,25 +3,20 @@ import { utcTimestamp } from "../protocol/timestamp";
 import { id, jsonValue, runEngineKind } from "./common";
 import { message, messagePart } from "./message";
 
-export const runOrigin = z.enum(["http", "web", "routine"]);
+export const runOrigin = z.enum(["http", "web", "routine", "event"]);
 export type RunOrigin = z.infer<typeof runOrigin>;
 
-export const persistedRunOrigin = z.enum(["http", "web", "telegram", "routine"]);
+export const persistedRunOrigin = z.enum(["http", "web", "telegram", "routine", "event"]);
 export type PersistedRunOrigin = z.infer<typeof persistedRunOrigin>;
 
-export const runStatus = z.enum([
-  "queued",
-  "running",
-  "waiting_approval",
-  "completed",
-  "failed",
-  "interrupted",
-  "cancelled",
-]);
-export type RunStatus = z.infer<typeof runStatus>;
+export const activeRunStatus = z.enum(["queued", "running", "waiting_approval"]);
+export type ActiveRunStatus = z.infer<typeof activeRunStatus>;
 
 export const terminalRunStatus = z.enum(["completed", "failed", "interrupted", "cancelled"]);
 export type TerminalRunStatus = z.infer<typeof terminalRunStatus>;
+
+export const runStatus = z.enum([...activeRunStatus.options, ...terminalRunStatus.options]);
+export type RunStatus = z.infer<typeof runStatus>;
 
 export const channelIntakeMetadata = z.object({
   integration: z.enum(["telegram", "fixture"]),

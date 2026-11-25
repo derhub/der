@@ -21,6 +21,7 @@ import type {
 import type { Message, MessagePart } from "../schemas/message";
 import type { Routine, RoutineTarget } from "../schemas/routine";
 import type {
+  ActiveRunStatus,
   ChannelIntakeMetadata,
   ContextMode,
   Run,
@@ -29,9 +30,10 @@ import type {
   RunRequest,
   RunStatus,
   RunUsage,
-  TerminalRunStatus,
 } from "../schemas/run";
 import type { CreateSessionInput, Session } from "../schemas/session";
+import type { NewSessionEvent, SessionEvent } from "../schemas/session-event";
+import type { StreamChunk } from "../protocol/run-stream";
 import type { UtcTimestamp } from "../protocol/timestamp";
 
 export type MaybePromise<T> = T | Promise<T>;
@@ -57,29 +59,54 @@ export interface SessionStore {
   listMessages(sessionId: SessionId, options?: MessagePage): MaybePromise<Message[]>;
 }
 
+export interface SessionEventStore {
+  enqueueSessionEvent(input: NewSessionEvent): SessionEvent;
+  listPendingSessionEvents(): SessionEvent[];
+  markSessionEventDelivered(eventId: string, runId: RunId): void;
+  countPendingSessionEvents(sessionId: SessionId): number;
+  countEventChain(sessionId: SessionId): number;
+  getActiveRun(sessionId: SessionId): ActiveRun | undefined;
+}
+
+/** A Run that has not ended. */
+export type ActiveRun = Run & { readonly status: ActiveRunStatus };
+
 export interface RunEventInput {
   readonly chunkKey: string;
-  readonly chunk: JsonValue;
-  readonly isTerminal?: boolean;
+  readonly chunk: StreamChunk;
 }
+
+/**
+ * How a Run ends. The Run lifecycle derives the status and the terminal chunk from it:
+ * `complete` ends `completed` with `RUN_FINISHED`; the others end with `RUN_ERROR`.
+ */
+export type RunEnd =
+  | {
+      readonly kind: "complete";
+      readonly finalMessageParts?: readonly MessagePart[];
+      readonly usage?: RunUsage;
+      /**
+       * The finish that first makes the Run terminal replaces the session's engine sessions with
+       * this one, at the reply's ordinal when there is one, or with none when absent. A finish of a
+       * Run that is already terminal writes nothing.
+       */
+      readonly engineSession?: EngineSessionInput;
+    }
+  | { readonly kind: "fail"; readonly code: string; readonly detail: string }
+  | { readonly kind: "interrupt"; readonly detail: string; readonly effectId?: EffectId }
+  | { readonly kind: "server_restarted" };
 
 export interface FinishRunInput {
   readonly runId: RunId;
-  readonly status: TerminalRunStatus;
-  readonly terminalEvent: RunEventInput;
-  readonly finalMessageParts?: readonly MessagePart[];
-  readonly detail?: string;
-  readonly checkpoint?: JsonValue | null;
-  readonly usage?: RunUsage;
-  /**
-   * The finish that first makes the Run terminal replaces the session's engine sessions with this
-   * one, at the reply's ordinal when there is one, or with none when absent. A finish of a Run
-   * that is already terminal writes nothing.
-   */
-  readonly engineSession?: EngineSessionInput;
+  readonly end: RunEnd;
 }
 
+/**
+ * The first finish of an active Run writes its status and terminal chunk together and wins. A later
+ * finish writes nothing and loses: `run` and `terminalEvent` are then the stored ones.
+ */
 export interface FinishRunOutcome {
+  readonly won: boolean;
   readonly run: Run;
   readonly terminalEvent: RunEvent;
   readonly finalMessage?: Message;
@@ -137,11 +164,12 @@ export interface ApprovalEffectStore {
   ): Promise<Approval>;
   beginEffect(
     identity: EffectIdentity,
-    options?: { readonly approvalId?: ApprovalId },
+    options?: { readonly approvalId?: ApprovalId; readonly scriptExecutionId?: string },
   ): Promise<BeginEffectOutcome>;
   completeEffect(effectId: EffectId, outcome: JsonValue): Promise<EffectRecord>;
   markEffectUnknown(effectId: EffectId): Promise<EffectRecord>;
   getEffect(identity: EffectIdentity): MaybePromise<EffectRecord | undefined>;
+  listPendingApprovalsForRun?(runId: RunId): MaybePromise<readonly Approval[]>;
   findWriteInDoubt(runId: RunId): MaybePromise<EffectRecord | undefined>;
 }
 

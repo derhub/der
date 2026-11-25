@@ -1,4 +1,4 @@
-import type { JsonValue } from "@der/domain";
+import type { JsonValue } from "../schemas/common";
 
 const encoder = new TextEncoder();
 

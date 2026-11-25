@@ -7,6 +7,7 @@ export {
   type CapabilityContext,
   type Catalog,
 } from "./capability";
+export { resolvePolicy } from "./capability-policy";
 export type { Engine } from "./engine";
 export {
   defineIntegration,
@@ -18,6 +19,21 @@ export {
 } from "./integration";
 export type { Memory } from "./memory";
 export type { Sandbox } from "./sandbox";
+export type {
+  AcquireScript,
+  DeliveryMark,
+  FinishResult,
+  NewStep,
+  ScriptEnd,
+  ScriptExecution,
+  ScriptRunId,
+  ScriptStore,
+  StepDecision,
+  StepEffect,
+  StepOutcome,
+  StepStatus,
+  StoredStep,
+} from "./script-store";
 export type {
   ApprovalEffectStore,
   BeginEffectOutcome,
@@ -35,9 +51,12 @@ export type {
   RequestApprovalInput,
   RequestApprovalOutcome,
   RoutineStore,
+  RunEnd,
+  ActiveRun,
   RunEventInput,
   RunStore,
   RunStreamState,
+  SessionEventStore,
   SessionStore,
   Store,
 } from "./store";

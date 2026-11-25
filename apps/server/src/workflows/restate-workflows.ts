@@ -2,6 +2,7 @@ import * as restate from "@restatedev/restate-sdk/fetch";
 import * as clients from "@restatedev/restate-sdk-clients";
 import {
   DomainError,
+  fingerprintJson,
   type Approval,
   type ApprovalId,
   type ApprovalResolutionInput,
@@ -11,7 +12,6 @@ import {
   type RunRequest,
 } from "@der/domain";
 import { compiledParsers } from "@der/domain/compiled";
-import { fingerprintJson } from "@der/storage";
 import type { AwakeableHandle, CoordinatorDriver, RunCoordinator } from "./coordinator";
 import type {
   ApprovalDecisionPayload,

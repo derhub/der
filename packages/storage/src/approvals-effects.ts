@@ -1,6 +1,7 @@
 import {
   CLOUD_EVENT_SPEC_VERSION,
   CLOUD_EVENT_TYPES,
+  canonicalizeJson,
   formatUtcTimestamp,
   type Approval,
   type ApprovalId,
@@ -18,11 +19,12 @@ import {
   type UtcTimestamp,
 } from "@der/domain";
 import { compiledParsers } from "@der/domain/compiled";
-import { canonicalizeJson } from "./canonical";
 import { insertOutboxForBindings } from "./channel-outbox";
+import { recordApprovalDecided, recordApprovalRequested } from "./run-lifecycle";
 import type { SqliteDatabase } from "./database";
 import { conflictError, notFoundError, validationError } from "./errors";
 import {
+  isActiveRunStatus,
   mapApprovalRow,
   mapEffectRow,
   mapOutboxEventRow,
@@ -139,11 +141,7 @@ export async function requestApproval(
       now,
     );
 
-    db.query(
-      `UPDATE runs
-       SET status = 'waiting_approval', updated_at = ?
-       WHERE id = ? AND status IN ('queued', 'running')`,
-    ).run(now, input.runId);
+    recordApprovalRequested(db, input.runId, input.awakeable, now);
 
     const sessionBindings = db
       .query<ChannelBindingRow, [string, string]>(
@@ -212,6 +210,27 @@ export function getLatestApprovalForRun(
   return row ? mapApprovalRow(row) : undefined;
 }
 
+export function listPendingApprovalsForRun(database: SqliteDatabase, runId: RunId): Approval[] {
+  return database.db
+    .query<ApprovalRow, [RunId]>(
+      "SELECT * FROM approvals WHERE run_id = ? AND status = 'pending' ORDER BY created_at, rowid",
+    )
+    .all(runId)
+    .map(mapApprovalRow);
+}
+
+export function listPendingScriptApprovalsPastDeadline(
+  database: SqliteDatabase,
+  at: UtcTimestamp,
+): Approval[] {
+  return database.db
+    .query<ApprovalRow, [UtcTimestamp]>(
+      "SELECT * FROM approvals WHERE status = 'pending' AND awakeable LIKE 'script:%' AND deadline <= ? ORDER BY deadline, rowid",
+    )
+    .all(at)
+    .map(mapApprovalRow);
+}
+
 export async function decideApproval(
   database: SqliteDatabase,
   decision: ApprovalResolutionInput,
@@ -268,6 +287,7 @@ export async function decideApproval(
            WHERE id = ? AND status = 'pending'`,
         ).run(row.deadline, now, input.approvalId);
 
+        if (row.awakeable.startsWith("script:")) recordApprovalDecided(db, row.run_id, now);
         return { kind: "expired", deadline: row.deadline };
       }
 
@@ -290,12 +310,8 @@ export async function decideApproval(
         );
       }
 
-      if (input.status === "approved") {
-        db.query(
-          `UPDATE runs
-           SET status = 'running', updated_at = ?
-           WHERE id = ? AND status = 'waiting_approval'`,
-        ).run(now, row.run_id);
+      if (input.status === "approved" || row.awakeable.startsWith("script:")) {
+        recordApprovalDecided(db, row.run_id, now);
       }
 
       const updated = db
@@ -341,7 +357,7 @@ export async function decideApproval(
 export async function beginEffect(
   database: SqliteDatabase,
   identity: EffectIdentity,
-  options?: { readonly approvalId?: ApprovalId },
+  options?: { readonly approvalId?: ApprovalId; readonly scriptExecutionId?: string },
 ): Promise<BeginEffectOutcome> {
   const valid = compiledParsers.effectIdentity.parse(identity);
   const canonicalArgsJson = canonicalizeJson(valid.canonicalArguments);
@@ -408,6 +424,31 @@ export async function beginEffect(
       return { kind: "ambiguous", effect: mapped };
     }
 
+    if (options?.scriptExecutionId !== undefined) {
+      const run = db.query<RunRow, [RunId]>("SELECT * FROM runs WHERE id = ?").get(valid.runId);
+      const detached =
+        db
+          .query("SELECT 1 FROM script_runs WHERE id = ? AND detached_at IS NOT NULL")
+          .get(options.scriptExecutionId) !== null;
+      if (run === null || (!detached && !isActiveRunStatus(run.status))) {
+        throw conflictError(
+          "effect.run_ended",
+          "Run has ended",
+          `Run ${valid.runId} has ended.`,
+          instance,
+        );
+      }
+      const doubtful = findWriteInDoubtRow(db, valid.runId, options.scriptExecutionId);
+      if (doubtful !== null) {
+        throw conflictError(
+          "effect.prior_write_in_doubt",
+          "A write in this Run has an unknown outcome",
+          `A write in this Run has an unknown outcome (${doubtful.operation_id}).`,
+          instance,
+        );
+      }
+    }
+
     const effectId = `eff_${crypto.randomUUID()}`;
     db.query(
       `INSERT INTO effects
@@ -444,7 +485,7 @@ export async function completeEffect(
     db.query(
       `UPDATE effects
        SET status = 'completed', outcome_json = ?, updated_at = ?
-       WHERE id = ?`,
+       WHERE id = ? AND status = 'started'`,
     ).run(JSON.stringify(outcome), now, effectId);
 
     const updated = db
@@ -471,7 +512,7 @@ export async function markEffectUnknown(
     db.query(
       `UPDATE effects
        SET status = 'unknown', outcome_json = NULL, updated_at = ?
-       WHERE id = ?`,
+       WHERE id = ? AND status = 'started'`,
     ).run(now, effectId);
 
     const updated = db
@@ -502,11 +543,17 @@ export function getEffect(
   return row ? mapEffectRow(row) : undefined;
 }
 
-export function findWriteInDoubt(database: SqliteDatabase, runId: RunId): EffectRecord | undefined {
-  const row = database.db
-    .query<EffectRow, [string, string]>(
+function findWriteInDoubtRow(
+  db: SqliteDatabase["db"],
+  runId: RunId,
+  exceptScriptId?: string,
+): EffectRow | null {
+  const prefix = exceptScriptId === undefined ? null : `${exceptScriptId}:`;
+  return db
+    .query<EffectRow, [string, string, string | null, string | null, string | null]>(
       `SELECT e.* FROM effects e
        WHERE e.run_id = ? AND e.operation_kind = ?
+         AND (? IS NULL OR substr(e.attempt_id, 1, length(?)) <> ?)
          AND (
            e.status = 'unknown'
            OR (
@@ -522,6 +569,10 @@ export function findWriteInDoubt(database: SqliteDatabase, runId: RunId): Effect
        ORDER BY e.started_at, e.id
        LIMIT 1`,
     )
-    .get(runId, "capability");
+    .get(runId, "capability", prefix, prefix, prefix);
+}
+
+export function findWriteInDoubt(database: SqliteDatabase, runId: RunId): EffectRecord | undefined {
+  const row = findWriteInDoubtRow(database.db, runId);
   return row ? mapEffectRow(row) : undefined;
 }

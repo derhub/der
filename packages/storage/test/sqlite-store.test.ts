@@ -3,16 +3,25 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "bun:test";
-import { DomainError, type RunEvent } from "@der/domain";
+import {
+  canonicalizeJson,
+  DomainError,
+  fingerprintJson,
+  streamChunk,
+  type FinishRunInput,
+  type JsonValue,
+  type RunEvent,
+  type RunStatus,
+} from "@der/domain";
 import {
   applyMigrations,
-  canonicalizeJson,
   CAPABILITY_OPERATION_KIND_MIGRATION,
   CORE_MIGRATION,
-  fingerprintJson,
   openSqliteStore,
   OUTBOX_DESTINATIONS_MIGRATION,
+  SCRIPT_ROUTINES_MIGRATION,
   SCRIPT_RUNS_MIGRATION,
+  SCRIPT_STEPS_MIGRATION,
   type SqliteStore,
   type StorageMigration,
 } from "@der/storage";
@@ -116,6 +125,10 @@ describe("configure SQLite WAL, foreign keys, busy timeout, and migration seam",
         "006-script-routines",
         "007-run-usage",
         "008-engine-sessions",
+        "009-script-steps",
+        "010-bot-policy",
+        "011-session-events",
+        "012-script-run-key",
       ]);
     } finally {
       store.close();
@@ -140,6 +153,10 @@ describe("configure SQLite WAL, foreign keys, busy timeout, and migration seam",
         "006-script-routines",
         "007-run-usage",
         "008-engine-sessions",
+        "009-script-steps",
+        "010-bot-policy",
+        "011-session-events",
+        "012-script-run-key",
       ]);
     } finally {
       reopened.close();
@@ -609,22 +626,27 @@ describe("append bounded run events and replay exclusively after cursor", () => 
       });
 
       const batch = await store.appendRunEvents(run.id, [
-        { chunkKey: `${run.id}:1`, chunk: { type: "RUN_STARTED", runId: run.id } },
-        { chunkKey: `${run.id}:2`, chunk: { type: "TEXT_MESSAGE_CONTENT", delta: "hel" } },
-        { chunkKey: `${run.id}:3`, chunk: { type: "TEXT_MESSAGE_CONTENT", delta: "lo" } },
-        { chunkKey: `${run.id}:2`, chunk: { type: "TEXT_MESSAGE_CONTENT", delta: "hel" } },
+        { chunkKey: `${run.id}:1`, chunk: streamChunk({ type: "RUN_STARTED", runId: run.id }) },
         {
-          chunkKey: `${run.id}:4`,
-          chunk: { type: "RUN_FINISHED", runId: run.id },
-          isTerminal: true,
+          chunkKey: `${run.id}:2`,
+          chunk: streamChunk({ type: "TEXT_MESSAGE_CONTENT", delta: "hel" }),
+        },
+        {
+          chunkKey: `${run.id}:3`,
+          chunk: streamChunk({ type: "TEXT_MESSAGE_CONTENT", delta: "lo" }),
+        },
+        {
+          chunkKey: `${run.id}:2`,
+          chunk: streamChunk({ type: "TEXT_MESSAGE_CONTENT", delta: "hel" }),
         },
       ]);
+      await store.finishRun({ runId: run.id, end: { kind: "complete" } });
 
-      expect(batch.map((event) => event.sequence)).toEqual([1, 2, 3, 2, 4]);
+      expect(batch.map((event) => event.sequence)).toEqual([1, 2, 3, 2]);
       expect(store.getRunStreamState(run.id)).toEqual({
         highWaterMark: 4,
         terminalSequence: 4,
-        status: "queued",
+        status: "completed",
       });
 
       const replayed: RunEvent[] = [];
@@ -636,7 +658,10 @@ describe("append bounded run events and replay exclusively after cursor", () => 
       await expectDomainRejection(
         () =>
           store.appendRunEvents(run.id, [
-            { chunkKey: `${run.id}:5`, chunk: { type: "TEXT_MESSAGE_CONTENT", delta: "late" } },
+            {
+              chunkKey: `${run.id}:5`,
+              chunk: streamChunk({ type: "TEXT_MESSAGE_CONTENT", delta: "late" }),
+            },
           ]),
         { status: 409, code: "run.already_terminal" },
       );
@@ -859,13 +884,10 @@ describe("persist approvals, transactional outbox rows, and exact-operation effe
 
       const finished = await store.finishRun({
         runId: run.id,
-        status: "completed",
-        terminalEvent: {
-          chunkKey: `${run.id}:terminal`,
-          chunk: { type: "RUN_FINISHED", runId: run.id },
+        end: {
+          kind: "complete",
+          finalMessageParts: [{ type: "text", text: "Completed after expiry." }],
         },
-        finalMessageParts: [{ type: "text", text: "Completed after expiry." }],
-        detail: "Routine finished cleanly.",
       });
 
       expect(finished.run.status).toBe("completed");
@@ -1010,12 +1032,10 @@ describe("persist approvals, transactional outbox rows, and exact-operation effe
       });
       const finished = await store.finishRun({
         runId: run.id,
-        status: "completed",
-        terminalEvent: {
-          chunkKey: `${run.id}:terminal`,
-          chunk: { type: "RUN_FINISHED", runId: run.id },
+        end: {
+          kind: "complete",
+          finalMessageParts: [{ type: "text", text: "Webhook payload ready." }],
         },
-        finalMessageParts: [{ type: "text", text: "Webhook payload ready." }],
       });
       expect(finished.outboxEvents.map((event) => event.bindingId)).toContain("bind-webhook");
     } finally {
@@ -1070,6 +1090,194 @@ describe("persist approvals, transactional outbox rows, and exact-operation effe
       expect(legacyEffect?.id).toBe("eff-legacy-1");
       expect(legacyEffect?.identity.operationKind).toBe("legacy");
       expect(legacyEffect?.identity.operationId).toBe("light.turn_on");
+    } finally {
+      store.close();
+    }
+  });
+});
+
+describe("bot policy", () => {
+  const ts = "2026-11-22T15:00:00.000Z";
+
+  it("reads a bot created before migration 008 with an empty policy and a chain limit of 3", () => {
+    const dbPath = createTempDbPath();
+    const legacyDb = new Database(dbPath, { create: true, strict: true });
+    legacyDb.exec("PRAGMA foreign_keys = ON;");
+    applyMigrations(legacyDb, [
+      CORE_MIGRATION,
+      OUTBOX_DESTINATIONS_MIGRATION,
+      CAPABILITY_OPERATION_KIND_MIGRATION,
+      SCRIPT_RUNS_MIGRATION,
+      SCRIPT_ROUTINES_MIGRATION,
+      SCRIPT_STEPS_MIGRATION,
+    ]);
+    legacyDb
+      .query(
+        `INSERT INTO bots (id, name, persona, default_engine, allowed_engines_json, workspace_path, created_at, updated_at)
+         VALUES ('bot-old', 'Old Bot', 'Concise', 'fixture', '["fixture"]', NULL, ?, ?)`,
+      )
+      .run(ts, ts);
+    legacyDb.close();
+
+    const store = openSqliteStore({ filename: dbPath });
+    try {
+      expect(store.getBot("bot-old")).toMatchObject({
+        id: "bot-old",
+        capabilityPolicy: {},
+        eventChainLimit: 3,
+      });
+    } finally {
+      store.close();
+    }
+  });
+
+  it("stores the policy and chain limit on create and keeps them across an unrelated update", () => {
+    const store = openSqliteStore({ filename: createTempDbPath() });
+    try {
+      const created = store.createBot({
+        id: "bot-p",
+        name: "P",
+        persona: "",
+        defaultEngine: "fixture",
+        allowedEngines: ["fixture"],
+        capabilityPolicy: { "mcp.github": "deny", "notes.publish": "allow" },
+        eventChainLimit: 5,
+      });
+      expect(created).toMatchObject({
+        capabilityPolicy: { "mcp.github": "deny", "notes.publish": "allow" },
+        eventChainLimit: 5,
+      });
+
+      const renamed = store.updateBot("bot-p", { name: "Q" });
+      expect(renamed).toMatchObject({
+        name: "Q",
+        capabilityPolicy: { "mcp.github": "deny", "notes.publish": "allow" },
+        eventChainLimit: 5,
+      });
+
+      const replaced = store.updateBot("bot-p", {
+        capabilityPolicy: { notes: "ask" },
+        eventChainLimit: 0,
+      });
+      expect(store.getBot("bot-p")).toEqual(replaced);
+      expect(replaced).toMatchObject({ capabilityPolicy: { notes: "ask" }, eventChainLimit: 0 });
+    } finally {
+      store.close();
+    }
+  });
+
+  it("rejects a policy key that is not a capability id or namespace", () => {
+    const store = openSqliteStore({ filename: createTempDbPath() });
+    try {
+      let thrown: unknown;
+      try {
+        store.createBot({
+          name: "P",
+          persona: "",
+          defaultEngine: "fixture",
+          allowedEngines: ["fixture"],
+          capabilityPolicy: { "notes.": "allow" },
+          eventChainLimit: 3,
+        });
+      } catch (error) {
+        thrown = error;
+      }
+      expect(thrown).toBeInstanceOf(DomainError);
+      expect(thrown).toMatchObject({ code: "bot.invalid_input", status: 400 });
+    } finally {
+      store.close();
+    }
+  });
+});
+
+describe("finish a Run once", () => {
+  const completion = (runId: string): FinishRunInput => ({
+    runId,
+    end: { kind: "complete", finalMessageParts: [{ type: "text", text: "done" }] },
+  });
+  const interruption = (runId: string): FinishRunInput => ({
+    runId,
+    end: { kind: "interrupt", detail: "outcome unknown", effectId: "eff-1" },
+  });
+
+  it.each<{
+    order: string;
+    first: (runId: string) => FinishRunInput;
+    second: (runId: string) => FinishRunInput;
+    stored: { status: RunStatus; checkpoint: JsonValue; terminal: string; replies: string[] };
+  }>([
+    {
+      order: "a completion, then an interruption",
+      first: completion,
+      second: interruption,
+      stored: {
+        status: "completed",
+        checkpoint: null,
+        terminal: "RUN_FINISHED",
+        replies: ["done"],
+      },
+    },
+    {
+      order: "an interruption, then a completion",
+      first: interruption,
+      second: completion,
+      stored: {
+        status: "interrupted",
+        checkpoint: { interruptedEffectId: "eff-1", recordedAt: "2026-11-22T16:00:00.000Z" },
+        terminal: "RUN_ERROR",
+        replies: [],
+      },
+    },
+  ])("keeps the first of $order and reports that the second lost", async (testCase) => {
+    const store = openSqliteStore({
+      filename: createTempDbPath(),
+      now: () => new Date("2026-11-22T16:00:00Z"),
+    });
+    try {
+      const { bot, session } = seedFixture(store);
+      const { run } = await store.admit({
+        botId: bot.id,
+        sessionId: session.id,
+        origin: "web",
+        idempotencyKey: "req-finish-once",
+        input: { parts: [{ type: "text", text: "Finish once" }] },
+      });
+
+      const first = await store.finishRun(testCase.first(run.id));
+      const second = await store.finishRun(testCase.second(run.id));
+
+      const events: RunEvent[] = [];
+      for await (const event of store.replay(run.id, 0)) events.push(event);
+      const stored = store.getRun(run.id);
+      expect({
+        first: { won: first.won, status: first.run.status },
+        second: {
+          won: second.won,
+          status: second.run.status,
+          terminal: (second.terminalEvent.chunk as { type: string }).type,
+          outbox: second.outboxEvents.length,
+        },
+        stored: {
+          status: stored?.status,
+          checkpoint: stored?.checkpoint,
+          terminal: events
+            .filter((event) => event.isTerminal)
+            .map((event) => (event.chunk as { type: string }).type),
+          replies: store
+            .listMessages(session.id)
+            .filter((message) => message.role === "assistant")
+            .map((message) => (message.parts[0] as { text: string }).text),
+        },
+      }).toEqual({
+        first: { won: true, status: testCase.stored.status },
+        second: {
+          won: false,
+          status: testCase.stored.status,
+          terminal: testCase.stored.terminal,
+          outbox: 0,
+        },
+        stored: { ...testCase.stored, terminal: [testCase.stored.terminal] },
+      });
     } finally {
       store.close();
     }

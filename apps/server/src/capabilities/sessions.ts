@@ -13,7 +13,7 @@ export function sessionCapabilities(
       output: z.object({ sessions: z.array(session) }),
       effect: "read",
       approval: "none",
-      example: "await der.sessions.list({})",
+      example: 'await step.run("sessions.list", {})',
       async execute(_input, ctx) {
         const botId = callerBotId(ctx, "sessions.list");
         return { sessions: [...(await sessions.listSessions(botId))] };
@@ -30,7 +30,7 @@ export function sessionCapabilities(
       output: z.object({ messages: z.array(message) }),
       effect: "read",
       approval: "none",
-      example: 'await der.sessions.messages({ sessionId: "sess-1", limit: 20 })',
+      example: 'await step.run("sessions.messages", { sessionId: "sess-1", limit: 20 })',
       async execute(input, ctx) {
         const botId = callerBotId(ctx, "sessions.messages");
         const found = await sessions.getSession(input.sessionId);

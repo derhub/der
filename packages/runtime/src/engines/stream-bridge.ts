@@ -31,7 +31,7 @@ export function checkRunReadinessGate(
     };
   }
 
-  if (run.origin === "routine") {
+  if (run.origin === "routine" || run.origin === "event") {
     const unattended = assertUnattendedEligible(readiness);
     if (!unattended.allowed) {
       return {

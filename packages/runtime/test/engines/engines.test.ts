@@ -625,6 +625,31 @@ describe("adapt Codex, Claude Code, and Antigravity ACP engines in contained san
 });
 
 describe("enforce eligibility gates, cancellation, transport loss, and non-resumable engine processes", () => {
+  it("blocks an event run when unattended eligibility is unverified", async () => {
+    const fakeSandbox = createFakeSandboxProvider({
+      onSpawn: () => createScriptedSpawnHandle({ lines: [] }),
+    });
+    const engine = createCodexEngine({
+      model: "gpt-5.3-codex",
+      sandboxProvider: fakeSandbox.provider,
+      diagnose: async () => makeReadyReadiness("codex", { unattended: "unverified" }),
+      loadRunInput: async () => ({
+        messages: [{ role: "user", content: "A script finished" }],
+      }),
+    });
+
+    const events = await collectEvents(engine.run(makeRun({ engine: "codex", origin: "event" })));
+
+    expect(events).toEqual([
+      {
+        type: "failed",
+        code: "engine.unattended_blocked",
+        detail: expect.stringContaining("unverified"),
+      },
+    ]);
+    expect(fakeSandbox.spawnedCommands).toHaveLength(0);
+  });
+
   it("blocks routine runs when unattended eligibility is unverified and blocks all runs when isolation is unverified", async () => {
     const fakeSandbox = createFakeSandboxProvider({
       onSpawn: () => createScriptedSpawnHandle({ lines: [] }),

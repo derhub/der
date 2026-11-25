@@ -1,4 +1,4 @@
-import { render, screen, waitFor, within } from "@testing-library/react";
+import { act, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { describe, expect, it } from "vite-plus/test";
 import { formatSseEvent, PROBLEM_DETAILS_MEDIA_TYPE, type Message } from "@der/domain";
@@ -30,14 +30,22 @@ function createSseResponse(frames: readonly string[]): Response {
   });
 }
 
-function createFakeServerFetch(options: { readonly scriptRoutine?: boolean } = {}) {
+function createFakeServerFetch(
+  options: { readonly scriptRoutine?: boolean; readonly multipleApprovals?: boolean } = {},
+) {
   const routineTarget = options.scriptRoutine
-    ? { engine: "script", prompt: null, script: "return await der.notes.read({ key: 'a' });" }
+    ? {
+        engine: "script",
+        prompt: null,
+        script: "return await step.run('notes.read', { key: 'a' });",
+      }
     : { engine: "fixture", prompt: "direct: hourly ok", script: null };
   const admittedKeys: string[] = [];
   const approvalDecisions: Array<{ approvalId: string; body: Record<string, unknown> }> = [];
   const memoryWrites: Array<Record<string, unknown>> = [];
   const routinePatches: Array<Record<string, unknown>> = [];
+  const botPatches: Array<Record<string, unknown>> = [];
+  let botPolicy: Record<string, string> = {};
 
   let runPostCount = 0;
   let approvalStatus: "pending" | "approved" | "denied" = "pending";
@@ -115,20 +123,27 @@ function createFakeServerFetch(options: { readonly scriptRoutine?: boolean } = {
       });
     }
 
+    const fixtureBot = () => ({
+      id: "bot-fixture",
+      name: "Fixture Bot",
+      persona: "Credential-free deterministic coworker.",
+      defaultEngine: "fixture",
+      allowedEngines: ["fixture", "codex"],
+      capabilityPolicy: botPolicy,
+      eventChainLimit: 3,
+      createdAt: "2026-01-01T00:00:00.000Z",
+      updatedAt: "2026-01-01T00:00:00.000Z",
+    });
+
     if (method === "GET" && url.pathname === "/api/bots") {
-      return Response.json({
-        bots: [
-          {
-            id: "bot-fixture",
-            name: "Fixture Bot",
-            persona: "Credential-free deterministic coworker.",
-            defaultEngine: "fixture",
-            allowedEngines: ["fixture", "codex"],
-            createdAt: "2026-01-01T00:00:00.000Z",
-            updatedAt: "2026-01-01T00:00:00.000Z",
-          },
-        ],
-      });
+      return Response.json({ bots: [fixtureBot()] });
+    }
+
+    if (method === "PATCH" && url.pathname === "/api/bots/bot-fixture") {
+      const body = parseJsonRequestBody(init);
+      botPatches.push(body);
+      botPolicy = body["capabilityPolicy"] as Record<string, string>;
+      return Response.json(fixtureBot());
     }
 
     if (method === "GET" && url.pathname === "/api/bots/bot-fixture/sessions") {
@@ -139,6 +154,7 @@ function createFakeServerFetch(options: { readonly scriptRoutine?: boolean } = {
             botId: "bot-fixture",
             title: "Fixture Session",
             engine: "fixture",
+            pendingEventCount: runPostCount >= 2 ? 1 : 0,
             createdAt: "2026-01-01T00:00:00.000Z",
             updatedAt: "2026-01-01T00:00:00.000Z",
           },
@@ -254,6 +270,36 @@ function createFakeServerFetch(options: { readonly scriptRoutine?: boolean } = {
     }
 
     if (method === "GET" && url.pathname === "/api/runs/run-1") {
+      const approval = {
+        id: "apr-1",
+        botId: "bot-fixture",
+        sessionId: "sess-fixture",
+        runId: "run-1",
+        effect: {
+          runId: "run-1",
+          operationKind: "capability",
+          operationId: "fixture.apply",
+          canonicalArguments: { target: "lamp-1", mode: "apply" },
+          attemptId: "attempt-1",
+        },
+        prompt: "Approve fixture.apply for lamp-1?",
+        awakeable: "awk-1",
+        deadline: "2026-01-01T00:05:00.000Z",
+        decision:
+          approvalStatus === "pending"
+            ? {
+                status: "pending",
+                awakeable: "awk-1",
+                deadline: "2026-01-01T00:05:00.000Z",
+              }
+            : {
+                status: approvalStatus,
+                actor: "operator",
+                decidedAt: "2026-01-01T00:00:03.000Z",
+              },
+        createdAt: "2026-01-01T00:00:01.000Z",
+        updatedAt: "2026-01-01T00:00:02.000Z",
+      };
       return Response.json({
         run: {
           id: "run-1",
@@ -268,36 +314,23 @@ function createFakeServerFetch(options: { readonly scriptRoutine?: boolean } = {
           updatedAt: "2026-01-01T00:00:02.000Z",
           finishedAt: approvalStatus === "pending" ? null : "2026-01-01T00:00:03.000Z",
         },
-        approval: {
-          id: "apr-1",
-          botId: "bot-fixture",
-          sessionId: "sess-fixture",
-          runId: "run-1",
-          effect: {
-            runId: "run-1",
-            operationKind: "capability",
-            operationId: "fixture.apply",
-            canonicalArguments: { target: "lamp-1", mode: "apply" },
-            attemptId: "attempt-1",
-          },
-          prompt: "Approve fixture.apply for lamp-1?",
-          awakeable: "awk-1",
-          deadline: "2026-01-01T00:05:00.000Z",
-          decision:
-            approvalStatus === "pending"
-              ? {
-                  status: "pending",
-                  awakeable: "awk-1",
-                  deadline: "2026-01-01T00:05:00.000Z",
-                }
-              : {
-                  status: approvalStatus,
-                  actor: "operator",
-                  decidedAt: "2026-01-01T00:00:03.000Z",
+        approval,
+        approvals:
+          approvalStatus === "pending" && options.multipleApprovals
+            ? [
+                approval,
+                {
+                  ...approval,
+                  id: "apr-2",
+                  prompt: "Approve fixture.apply for lamp-2?",
+                  effect: {
+                    ...approval.effect,
+                    canonicalArguments: { target: "lamp-2", mode: "apply" },
+                    attemptId: "attempt-2",
+                  },
                 },
-          createdAt: "2026-01-01T00:00:01.000Z",
-          updatedAt: "2026-01-01T00:00:02.000Z",
-        },
+              ]
+            : [],
       });
     }
 
@@ -472,10 +505,328 @@ function createFakeServerFetch(options: { readonly scriptRoutine?: boolean } = {
     approvalDecisions,
     memoryWrites,
     routinePatches,
+    botPatches,
   };
 }
 
+function sessionOf(botId: string, id: string, title: string, pendingEventCount: number) {
+  return {
+    id,
+    botId,
+    title,
+    engine: "fixture",
+    pendingEventCount,
+    createdAt: "2026-01-01T00:00:00.000Z",
+    updatedAt: "2026-01-01T00:00:00.000Z",
+  };
+}
+
+type ListedSession = ReturnType<typeof sessionOf>;
+
+/**
+ * The fixture server with a second bot, "bot-other". `respond` answers each session listing by
+ * bot and 1-based listing number; a listing it leaves `undefined` waits in `held` until the test
+ * answers it, and rejects as fetch does once its request is aborted. Each answer settles its
+ * `read` once the console has read the body. With `holdRunEvents`, run-1's stream stays open
+ * after RUN_STARTED until `endRun`.
+ */
+function createSessionListsFetch(
+  respond: (botId: string, listing: number) => ListedSession[] | undefined,
+  options: { readonly holdRunEvents?: boolean; readonly ignoreAbort?: boolean } = {},
+) {
+  const server = createFakeServerFetch();
+  const listings = new Map<string, number>();
+  const held: {
+    botId: string;
+    listing: number;
+    answer: (sessions: ListedSession[]) => Promise<void>;
+  }[] = [];
+  const reads: Promise<void>[] = [];
+  let endRun = () => {};
+  let runEventsOpened = false;
+  const answered = (sessions: ListedSession[]) => {
+    const response = Response.json({ sessions });
+    const json = response.json.bind(response);
+    let markRead = () => {};
+    const read = new Promise<void>((resolve) => {
+      markRead = resolve;
+    });
+    response.json = async () => {
+      const body: unknown = await json();
+      markRead();
+      return body;
+    };
+    reads.push(read);
+    return { response, read };
+  };
+  const fetcher: typeof fetch = async (input, init) => {
+    const rawUrl =
+      typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
+    const url = new URL(rawUrl, "http://127.0.0.1:5173");
+    if (url.pathname === "/api/bots") {
+      const { bots } = (await (await server.fetcher(input, init)).json()) as { bots: object[] };
+      return Response.json({
+        bots: [...bots, { ...bots[0], id: "bot-other", name: "Other Bot" }],
+      });
+    }
+    const listed = /^\/api\/bots\/([^/]+)\/sessions$/.exec(url.pathname);
+    if (listed && (init?.method ?? "GET") === "GET") {
+      const botId = listed[1]!;
+      const listing = (listings.get(botId) ?? 0) + 1;
+      listings.set(botId, listing);
+      const sessions = respond(botId, listing);
+      if (sessions !== undefined) {
+        return answered(sessions).response;
+      }
+      return new Promise<Response>((resolve, reject) => {
+        if (!options.ignoreAbort) {
+          init?.signal?.addEventListener("abort", () =>
+            reject(new DOMException("The operation was aborted.", "AbortError")),
+          );
+        }
+        held.push({
+          botId,
+          listing,
+          answer: (next) => {
+            const { response, read } = answered(next);
+            resolve(response);
+            return read;
+          },
+        });
+      });
+    }
+    if (options.holdRunEvents && url.pathname === "/api/runs/run-1/events") {
+      runEventsOpened = true;
+      const encoder = new TextEncoder();
+      const body = new ReadableStream<Uint8Array>({
+        start(controller) {
+          controller.enqueue(
+            encoder.encode(
+              formatSseEvent({
+                id: 1,
+                data: { type: "RUN_STARTED", runId: "run-1", threadId: "sess-fixture" },
+              }),
+            ),
+          );
+          endRun = () => {
+            try {
+              controller.enqueue(
+                encoder.encode(
+                  formatSseEvent({
+                    id: 2,
+                    data: { type: "RUN_FINISHED", runId: "run-1", threadId: "sess-fixture" },
+                  }),
+                ),
+              );
+              controller.close();
+            } catch {
+              // The console already closed the stream.
+            }
+          };
+          init?.signal?.addEventListener("abort", () => endRun());
+        },
+      });
+      return new Response(body, {
+        status: 200,
+        headers: { "content-type": "text/event-stream; charset=utf-8" },
+      });
+    }
+    return server.fetcher(input, init);
+  };
+  return {
+    fetcher,
+    held,
+    reads,
+    endRun: () => endRun(),
+    runEventsOpened: () => runEventsOpened,
+  };
+}
+
+/** Waits until the console has read `read` and applied whatever it does with it. */
+async function settled(read: Promise<unknown>) {
+  await read;
+  await act(() => new Promise((resolve) => setTimeout(resolve, 0)));
+}
+
+function pendingEventCount(sessionTitle: string): number {
+  const sidebar = screen.getByRole("complementary", { name: "Bots and sessions" });
+  const heading = within(sidebar).getByRole("heading", { name: /^Sessions \(/ });
+  const section = heading.closest("section");
+  const button = section
+    ? within(section)
+        .queryAllByRole("button")
+        .find((candidate) => candidate.textContent?.includes(sessionTitle))
+    : undefined;
+  const badge = button?.querySelector("[data-pending-events]");
+  if (!badge) {
+    return 0;
+  }
+  const match = /\d+/.exec(badge.textContent ?? "");
+  return match ? Number(match[0]) : Number.NaN;
+}
+
+describe("keep the session list current", () => {
+  it("shows the waiting badge after the pending count changes with no operator action", async () => {
+    const server = createFakeServerFetch();
+    let pending = 0;
+    const fetcher: typeof fetch = async (input, init) => {
+      const rawUrl =
+        typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
+      if (new URL(rawUrl, "http://127.0.0.1:5173").pathname === "/api/bots/bot-fixture/sessions") {
+        return Response.json({
+          sessions: [sessionOf("bot-fixture", "sess-fixture", "Fixture Session", pending)],
+        });
+      }
+      return server.fetcher(input, init);
+    };
+    render(<App fetcher={fetcher} sessionRefreshMs={20} />);
+
+    await screen.findByText("Fixture session ready.");
+    const before = pendingEventCount("Fixture Session");
+    pending = 1;
+
+    await waitFor(() => expect(pendingEventCount("Fixture Session")).toBe(1));
+    expect(before).toBe(0);
+  });
+
+  it("drops a session list that arrives after its bot is no longer selected", async () => {
+    const user = userEvent.setup();
+    const server = createSessionListsFetch(
+      (botId, listing) => {
+        if (botId === "bot-other") {
+          return listing === 1 ? [sessionOf(botId, "sess-other", "Other Session", 0)] : undefined;
+        }
+        return listing === 1 ? [sessionOf(botId, "sess-fixture", "Fixture Session", 0)] : undefined;
+      },
+      { ignoreAbort: true },
+    );
+    render(<App fetcher={server.fetcher} sessionRefreshMs={20} />);
+
+    await screen.findAllByText("Fixture Session");
+    await waitFor(() =>
+      expect(server.held.some((entry) => entry.botId === "bot-fixture")).toBe(true),
+    );
+    await user.click(screen.getByRole("button", { name: /^Other Bot/ }));
+    await screen.findAllByText("Other Session");
+    const fixtureHeld = server.held.filter((entry) => entry.botId === "bot-fixture");
+    await Promise.all(
+      fixtureHeld.map((entry) =>
+        settled(entry.answer([sessionOf("bot-fixture", "sess-fixture", "Fixture Session", 1)])),
+      ),
+    );
+
+    expect({
+      fixture: screen.queryAllByText("Fixture Session").length,
+      other: screen.queryAllByText("Other Session").length > 0,
+    }).toEqual({ fixture: 0, other: true });
+  });
+
+  it("keeps refreshing the selected bot while a listing for the previous bot never answers", async () => {
+    const user = userEvent.setup();
+    let otherPending = 0;
+    const server = createSessionListsFetch((botId, listing) => {
+      if (botId === "bot-other") {
+        return [sessionOf("bot-other", "sess-other", "Other Session", otherPending)];
+      }
+      return listing === 1 ? [sessionOf(botId, "sess-fixture", "Fixture Session", 0)] : undefined;
+    });
+    render(<App fetcher={server.fetcher} sessionRefreshMs={20} />);
+
+    await screen.findAllByText("Fixture Session");
+    await waitFor(() => expect(server.held.length).toBeGreaterThan(0));
+    await user.click(screen.getByRole("button", { name: /^Other Bot/ }));
+    await screen.findAllByText("Other Session");
+    otherPending = 1;
+
+    await waitFor(() => expect(pendingEventCount("Other Session")).toBe(1));
+  });
+
+  it("drops an older listing of the same bot that answers after a newer one", async () => {
+    const user = userEvent.setup();
+    const server = createSessionListsFetch(
+      (botId, listing) => {
+        if (botId !== "bot-fixture") {
+          return [sessionOf(botId, "sess-other", "Other Session", 0)];
+        }
+        if (listing === 1) {
+          return [sessionOf(botId, "sess-fixture", "Fixture Session", 0)];
+        }
+        if (listing === 3) {
+          return [sessionOf(botId, "sess-fixture", "Fixture Session", 2)];
+        }
+        return undefined;
+      },
+      { ignoreAbort: true },
+    );
+    render(<App fetcher={server.fetcher} sessionRefreshMs={20} />);
+
+    await screen.findAllByText("Fixture Session");
+    await waitFor(() => expect(server.held.some((entry) => entry.listing === 2)).toBe(true));
+    await user.click(screen.getByRole("button", { name: "Refresh" }));
+    await waitFor(() => expect(pendingEventCount("Fixture Session")).toBe(2));
+    await settled(
+      server.held
+        .find((entry) => entry.listing === 2)!
+        .answer([sessionOf("bot-fixture", "sess-fixture", "Fixture Session", 1)]),
+    );
+
+    expect(pendingEventCount("Fixture Session")).toBe(2);
+  });
+
+  it("drops the session list a previous bot's Run asks for after another bot is selected", async () => {
+    const user = userEvent.setup();
+    const server = createSessionListsFetch(
+      (botId) =>
+        botId === "bot-other"
+          ? [sessionOf(botId, "sess-other", "Other Session", 0)]
+          : [sessionOf(botId, "sess-fixture", "Fixture Session", 0)],
+      { holdRunEvents: true },
+    );
+    render(<App fetcher={server.fetcher} />);
+
+    await screen.findByText("Fixture session ready.");
+    await user.type(screen.getByPlaceholderText("Send an instruction to Fixture Bot..."), "lamp-1");
+    await user.click(screen.getByRole("button", { name: "Send" }));
+    await user.click(await screen.findByRole("button", { name: "Retry with same key" }));
+    await waitFor(() => expect(server.runEventsOpened()).toBe(true));
+    await user.click(screen.getByRole("button", { name: /^Other Bot/ }));
+    await screen.findAllByText("Other Session");
+    server.endRun();
+    await settled(Promise.all(server.reads));
+
+    expect({
+      fixture: screen.queryAllByText("Fixture Session").length,
+      other: screen.queryAllByText("Other Session").length > 0,
+    }).toEqual({ fixture: 0, other: true });
+  });
+});
+
 describe("operate der through the Web operator console", () => {
+  it("renders the exact arguments for both pending Approvals of the active Run", async () => {
+    const user = userEvent.setup();
+    const server = createFakeServerFetch({ multipleApprovals: true });
+    render(<App fetcher={server.fetcher} />);
+
+    await user.type(
+      await screen.findByPlaceholderText("Send an instruction to Fixture Bot..."),
+      "lamp-1",
+    );
+    await user.click(screen.getByRole("button", { name: "Send" }));
+    await user.click(await screen.findByRole("button", { name: "Retry with same key" }));
+
+    const first = await screen.findByText("Approve fixture.apply for lamp-1?");
+    const second = await screen.findByText("Approve fixture.apply for lamp-2?");
+    const firstArgs = JSON.parse(
+      first.closest("[data-approval-id]")?.querySelector("pre")?.textContent ?? "null",
+    );
+    const secondArgs = JSON.parse(
+      second.closest("[data-approval-id]")?.querySelector("pre")?.textContent ?? "null",
+    );
+    expect(firstArgs).toMatchObject({ target: "lamp-1" });
+    expect(secondArgs).toMatchObject({ target: "lamp-2" });
+    expect(screen.getAllByRole("button", { name: "Approve effect" })).toHaveLength(2);
+  });
+
   it("retries failed run submission with the same Idempotency-Key, streams native chunks, and approves an exact effect", async () => {
     const user = userEvent.setup();
     const server = createFakeServerFetch();
@@ -522,6 +873,48 @@ describe("operate der through the Web operator console", () => {
     );
   });
 
+  it("shows the waiting badge once a Run of the selected bot changes the pending count", async () => {
+    const user = userEvent.setup();
+    const server = createFakeServerFetch();
+    render(<App fetcher={server.fetcher} />);
+
+    await screen.findByText("Fixture session ready.");
+    const before = pendingEventCount("Fixture Session");
+    await user.type(screen.getByPlaceholderText("Send an instruction to Fixture Bot..."), "lamp-1");
+    await user.click(screen.getByRole("button", { name: "Send" }));
+    await user.click(await screen.findByRole("button", { name: "Retry with same key" }));
+
+    await waitFor(() => expect(pendingEventCount("Fixture Session")).toBe(1));
+    expect(before).toBe(0);
+  });
+
+  it("saves a policy rule from the bot dialog and shows it again on reopen", async () => {
+    const user = userEvent.setup();
+    const server = createFakeServerFetch();
+    render(<App fetcher={server.fetcher} />);
+
+    await screen.findByText("Fixture session ready.");
+    await user.click(screen.getByRole("button", { name: "Edit bot Fixture Bot" }));
+    await user.click(screen.getByRole("button", { name: "Add policy rule" }));
+    await user.type(screen.getByLabelText("Policy selector 1"), "mcp.github");
+    await user.click(screen.getByRole("combobox", { name: /Policy decision 1/ }));
+    await user.keyboard("{ArrowDown}{Enter}");
+    await user.click(screen.getByRole("button", { name: "Save changes" }));
+
+    await waitFor(() => {
+      expect(server.botPatches).toHaveLength(1);
+    });
+    expect(server.botPatches[0]?.["capabilityPolicy"]).toEqual({ "mcp.github": "deny" });
+
+    await user.click(await screen.findByRole("button", { name: "Edit bot Fixture Bot" }));
+    expect((screen.getByLabelText("Policy selector 1") as HTMLInputElement).value).toBe(
+      "mcp.github",
+    );
+    expect(screen.getByRole("combobox", { name: /Policy decision 1/ }).textContent).toContain(
+      "deny",
+    );
+  });
+
   it("shows the Script of a script routine where a prompt routine shows its prompt", async () => {
     const user = userEvent.setup();
     const server = createFakeServerFetch({ scriptRoutine: true });
@@ -530,7 +923,7 @@ describe("operate der through the Web operator console", () => {
     await screen.findByText("Fixture session ready.");
     await user.click(screen.getByRole("tab", { name: "Routines" }));
 
-    await screen.findByText("return await der.notes.read({ key: 'a' });");
+    await screen.findByText("return await step.run('notes.read', { key: 'a' });");
     expect(screen.getByText("Script")).toBeTruthy();
   });
 
@@ -625,7 +1018,7 @@ describe("operate der through the Web operator console", () => {
                   type: "tool-call",
                   toolCallId: "tc-2",
                   toolName: "execute",
-                  arguments: { script: 'return await der.notes.append("buy milk");' },
+                  arguments: { script: 'return await step.run("notes.append", "buy milk");' },
                 },
                 {
                   type: "tool-result",
@@ -683,7 +1076,7 @@ describe("operate der through the Web operator console", () => {
     expect(screen.getByText("append note")).toBeTruthy();
     expect(screen.getByText("notes.append")).toBeTruthy();
     expect(screen.getByText("execute")).toBeTruthy();
-    expect(screen.getByText('return await der.notes.append("buy milk");')).toBeTruthy();
+    expect(screen.getByText('return await step.run("notes.append", "buy milk");')).toBeTruthy();
     expect(screen.getAllByText("denied: Operator denied notes.append.").length).toBeGreaterThan(0);
 
     await user.click(screen.getByRole("button", { name: "New session" }));

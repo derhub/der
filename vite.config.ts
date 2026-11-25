@@ -1,4 +1,5 @@
 import { defineConfig } from "vite-plus";
+import { lintConfig } from "./lint.config";
 
 export default defineConfig({
   fmt: {
@@ -6,27 +7,7 @@ export default defineConfig({
     semi: true,
     ignorePatterns: ["dist/**", "**/dist/**", "bun.lock"],
   },
-  lint: {
-    ignorePatterns: ["dist/**", "**/dist/**", "node_modules/**"],
-    options: {
-      typeAware: true,
-      typeCheck: true,
-    },
-    rules: {
-      "no-restricted-imports": [
-        "error",
-        {
-          patterns: [
-            {
-              regex: "(^|/)src(/|$)",
-              message:
-                "Do not import through a src path. Import a package by name (@der/<pkg>[/<entry>]), apps/server by its #-prefixed imports map, and apps/web by the @/ alias.",
-            },
-          ],
-        },
-      ],
-    },
-  },
+  lint: lintConfig,
   pack: {
     entry: {
       index: "src/index.ts",

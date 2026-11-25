@@ -8,6 +8,8 @@ export {
 export {
   createDirectWorkflow,
   createDirectWorkflowDriver,
+  ENGINE_EXECUTION_FAILED_CODE,
+  runDirectRun,
   type DirectWorkflowDriver,
   type DirectWorkflowDriverOptions,
 } from "./direct-workflow";
@@ -48,9 +50,12 @@ export {
   executeEngineStage,
   finalizeDirectRunStep,
   finalizeInterruptedUncertainStep,
+  finishRunAndNotify,
   loadAndStartRunStep,
   persistPendingApprovalStep,
+  readDurableAttemptOutcome,
   reconcileApprovalExpiryStep,
+  runEnd,
   type ApprovalDecisionPayload,
   type AwaitApprovalInput,
   type AwaitApprovalOutcome,

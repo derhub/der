@@ -1,6 +1,11 @@
+import * as z from "zod";
 import {
   DomainError,
-  formatUtcTimestamp,
+  engineKind,
+  id,
+  messagePart,
+  runUsage,
+  streamChunk,
   type Approval,
   type ApprovalEffectStore,
   type ApprovalId,
@@ -17,7 +22,9 @@ import {
   type MessagePart,
   type Run,
   type RunAdmission,
+  type RunEnd,
   type RunEvent,
+  type RunEventInput,
   type RunId,
   type RunRequest,
   type RunStore,
@@ -25,7 +32,6 @@ import {
   type UtcTimestamp,
   type Workflow,
 } from "@der/domain";
-import { readRunUsage } from "@der/runtime/engines";
 import type { ScriptRoutineDeps } from "./script-routine-stage";
 
 export interface AwaitApprovalInput {
@@ -69,12 +75,19 @@ export interface WorkflowDeps {
   readonly scriptRoutines?: () => ScriptRoutineDeps;
 }
 
-async function finishRunAndNotify(
-  deps: Pick<WorkflowDeps, "store" | "onRunFinished">,
+type RunFinishDeps = Pick<WorkflowDeps, "onRunFinished"> & {
+  readonly store: Pick<RunStore, "finishRun">;
+};
+
+/** Only the finish that ended the Run notifies; a later one returns the stored Run unchanged. */
+export async function finishRunAndNotify(
+  deps: Pick<RunFinishDeps, "store" | "onRunFinished">,
   input: FinishRunInput,
 ): Promise<FinishRunOutcome> {
   const finished = await deps.store.finishRun(input);
-  await deps.onRunFinished?.(finished.run);
+  if (finished.won) {
+    await deps.onRunFinished?.(finished.run);
+  }
   return finished;
 }
 
@@ -105,6 +118,103 @@ export interface ApprovalDecisionPayload {
 
 const DEFAULT_EVENT_BATCH_SIZE = 8;
 const ATTEMPT_RESET_EVENT = "der.attempt-reset";
+const ENGINE_ATTEMPT_FINISHED_EVENT = "der.engine-attempt-finished";
+const TRANSIENT_ATTEMPT_FAILURES = new Set([
+  "engine.resume_unavailable",
+  "engine.transport_lost",
+  "engine.cancelled",
+]);
+
+const finalMessagePartsSchema = z.array(messagePart);
+const engineSessionInputSchema = z.object({
+  sessionId: id,
+  engine: engineKind,
+  vendorSessionId: z.string().min(1),
+  baseHash: z.string(),
+  contextHash: z.string(),
+  lastOrdinal: z.number().int().nonnegative(),
+});
+
+function serializeMessagePart(part: MessagePart): JsonValue {
+  switch (part.type) {
+    case "text":
+      return { type: part.type, text: part.text };
+    case "tool-call":
+      return {
+        type: part.type,
+        toolCallId: part.toolCallId,
+        toolName: part.toolName,
+        arguments: part.arguments,
+      };
+    case "tool-result":
+      return {
+        type: part.type,
+        toolCallId: part.toolCallId,
+        toolName: part.toolName,
+        outcome: part.outcome,
+        isError: part.isError,
+      };
+    case "data":
+      return { type: part.type, mimeType: part.mimeType, data: part.data };
+  }
+}
+
+function isAttemptFinishedMarker(chunk: JsonValue | undefined): boolean {
+  return (
+    isJsonRecord(chunk) &&
+    chunk["type"] === "CUSTOM" &&
+    chunk["name"] === ENGINE_ATTEMPT_FINISHED_EVENT
+  );
+}
+
+function parseAttemptFinishedEvent(event: RunEvent): RunStageResult | undefined {
+  if (!isAttemptFinishedMarker(event.chunk) || !isJsonRecord(event.chunk)) {
+    return undefined;
+  }
+  const value = isJsonRecord(event.chunk["value"]) ? event.chunk["value"] : undefined;
+  if (value === undefined) {
+    return undefined;
+  }
+  if (value["kind"] === "failed") {
+    return {
+      kind: "failed",
+      code: typeof value["code"] === "string" ? value["code"] : "engine.run_error",
+      detail: typeof value["detail"] === "string" ? value["detail"] : "Engine run failed.",
+    };
+  }
+  if (value["kind"] !== "completed") {
+    return undefined;
+  }
+  const parsedParts =
+    value["finalMessageParts"] !== undefined
+      ? finalMessagePartsSchema.safeParse(value["finalMessageParts"])
+      : undefined;
+  const parsedUsage = value["usage"] !== undefined ? runUsage.safeParse(value["usage"]) : undefined;
+  const parsedEngineSession =
+    value["engineSession"] !== undefined
+      ? engineSessionInputSchema.safeParse(value["engineSession"])
+      : undefined;
+  return {
+    kind: "completed",
+    ...(parsedParts?.success ? { finalMessageParts: parsedParts.data } : {}),
+    ...(parsedUsage?.success ? { usage: parsedUsage.data } : {}),
+    ...(parsedEngineSession?.success ? { engineSession: parsedEngineSession.data } : {}),
+  };
+}
+
+/** Returns the authoritative outcome persisted by a finished engine attempt, if any. */
+export async function readDurableAttemptOutcome(
+  store: Pick<RunStore, "replay">,
+  runId: RunId,
+): Promise<RunStageResult | undefined> {
+  for await (const event of store.replay(runId, 0)) {
+    const outcome = parseAttemptFinishedEvent(event);
+    if (outcome !== undefined) {
+      return outcome;
+    }
+  }
+  return undefined;
+}
 
 function isToolCallEnd(chunk: JsonValue): boolean {
   return (
@@ -145,6 +255,11 @@ export async function loadAndStartRunStep(
 }
 
 export async function executeEngineStage(deps: WorkflowDeps, run: Run): Promise<RunStageResult> {
+  const earlier = await readEarlierExecution(deps, run);
+  if (earlier.outcome !== undefined) {
+    return earlier.outcome;
+  }
+
   const kind = run.engine === "script" ? undefined : run.engine;
   const engine = kind === undefined ? undefined : deps.engines.get(kind);
   if (kind === undefined || !engine) {
@@ -155,16 +270,12 @@ export async function executeEngineStage(deps: WorkflowDeps, run: Run): Promise<
     };
   }
 
-  const earlier = await readEarlierExecution(deps, run);
-  if (earlier.outcome !== undefined) {
-    return earlier.outcome;
-  }
   if (earlier.keySuffix !== "") {
     // Tells stream readers to drop the abandoned attempt's output before the new attempt's.
     await deps.store.appendRunEvents(run.id, [
       {
         chunkKey: `${run.id}:attempt-reset${earlier.keySuffix}`,
-        chunk: { type: "CUSTOM", name: ATTEMPT_RESET_EVENT },
+        chunk: streamChunk({ type: "CUSTOM", name: ATTEMPT_RESET_EVENT }),
       },
     ]);
   }
@@ -182,68 +293,29 @@ export async function executeEngineStage(deps: WorkflowDeps, run: Run): Promise<
 
 /**
  * What an earlier execution of this Run's engine step left in the run events. A persisted
- * terminal chunk means the engine already answered: its outcome is replayed instead of calling
- * the engine again. Otherwise a non-empty log gets a key suffix so the new attempt's chunks never
- * dedupe against the abandoned attempt's.
+ * `der.engine-attempt-finished` marker means the engine already finished an attempt: its outcome
+ * is replayed instead of calling the engine again. Otherwise a non-empty log gets a key suffix so
+ * the new attempt's chunks never dedupe against the abandoned attempt's.
  */
 async function readEarlierExecution(
   deps: WorkflowDeps,
   run: Run,
 ): Promise<{ readonly outcome?: RunStageResult; readonly keySuffix: string }> {
-  const events: RunEvent[] = [];
+  let lastSequence = 0;
   for await (const event of deps.store.replay(run.id, 0)) {
-    events.push(event);
+    lastSequence = event.sequence;
+    const outcome = parseAttemptFinishedEvent(event);
+    if (outcome !== undefined) {
+      return { keySuffix: "", outcome };
+    }
   }
-  const last = events.at(-1);
-  if (last === undefined) {
-    return { keySuffix: "" };
-  }
-  const terminal = events.find((event) => event.isTerminal === true);
-  if (terminal === undefined) {
-    return { keySuffix: `:replay-${last.sequence}` };
-  }
-
-  const chunk = isJsonRecord(terminal.chunk) ? terminal.chunk : {};
-  if (chunk["type"] !== "RUN_FINISHED") {
-    return {
-      keySuffix: "",
-      outcome: {
-        kind: "failed",
-        code: typeof chunk["code"] === "string" ? chunk["code"] : "engine.run_error",
-        detail: typeof chunk["message"] === "string" ? chunk["message"] : "Engine run failed.",
-      },
-    };
-  }
-  const suffix = attemptKeySuffix(run.id, terminal.chunkKey);
-  const text = events
-    .filter((event) => attemptKeySuffix(run.id, event.chunkKey) === suffix)
-    .flatMap((event) =>
-      isJsonRecord(event.chunk) &&
-      event.chunk["type"] === "TEXT_MESSAGE_CONTENT" &&
-      typeof event.chunk["delta"] === "string"
-        ? [event.chunk["delta"]]
-        : [],
-    )
-    .join("");
-  const usage = readRunUsage(chunk);
-  return {
-    keySuffix: "",
-    outcome: {
-      kind: "completed",
-      ...(text.length > 0 ? { finalMessageParts: [{ type: "text", text }] } : {}),
-      ...(usage !== undefined ? { usage } : {}),
-    },
-  };
+  return { keySuffix: lastSequence === 0 ? "" : `:replay-${lastSequence}` };
 }
 
-function isJsonRecord(value: JsonValue): value is { readonly [key: string]: JsonValue } {
+function isJsonRecord(
+  value: JsonValue | undefined,
+): value is { readonly [key: string]: JsonValue } {
   return typeof value === "object" && value !== null && !Array.isArray(value);
-}
-
-/** Engine chunk keys are `<runId>:<seq>:<TYPE><suffix>`; the suffix names the attempt. */
-function attemptKeySuffix(runId: RunId, chunkKey: string): string | undefined {
-  const match = /^\d+:[A-Z_]+(.*)$/.exec(chunkKey.slice(runId.length + 1));
-  return match?.[1];
 }
 
 async function runEngineAttempt(
@@ -253,11 +325,7 @@ async function runEngineAttempt(
   keySuffix: string,
 ): Promise<RunStageResult> {
   const batchSize = deps.eventBatchSize ?? DEFAULT_EVENT_BATCH_SIZE;
-  const pendingChunks: {
-    readonly chunkKey: string;
-    readonly chunk: JsonValue;
-    readonly isTerminal?: boolean;
-  }[] = [];
+  const pendingChunks: RunEventInput[] = [];
 
   const readInterruptedStage = async (
     fallbackDetail?: string,
@@ -295,6 +363,62 @@ async function runEngineAttempt(
     await deps.store.appendRunEvents(run.id, batch);
   };
 
+  const appendAttemptFinished = async (
+    outcome:
+      | Extract<RunStageResult, { kind: "completed" }>
+      | Extract<RunStageResult, { kind: "failed" }>,
+  ) => {
+    const currentStatus = (await deps.store.getRun(run.id))?.status;
+    if (
+      currentStatus !== "queued" &&
+      currentStatus !== "running" &&
+      currentStatus !== "waiting_approval"
+    ) {
+      return;
+    }
+    const value: { [key: string]: JsonValue } = {
+      kind: outcome.kind,
+      suffix: keySuffix,
+      ...(outcome.kind === "completed" && outcome.finalMessageParts !== undefined
+        ? { finalMessageParts: outcome.finalMessageParts.map(serializeMessagePart) }
+        : {}),
+      ...(outcome.kind === "completed" && outcome.usage !== undefined
+        ? {
+            usage: {
+              inputTokens: outcome.usage.inputTokens,
+              cachedInputTokens: outcome.usage.cachedInputTokens,
+              cacheWriteTokens: outcome.usage.cacheWriteTokens,
+              outputTokens: outcome.usage.outputTokens,
+              reportedCostUsd: outcome.usage.reportedCostUsd,
+            },
+          }
+        : {}),
+      ...(outcome.kind === "completed" && outcome.engineSession !== undefined
+        ? {
+            engineSession: {
+              sessionId: outcome.engineSession.sessionId,
+              engine: outcome.engineSession.engine,
+              vendorSessionId: outcome.engineSession.vendorSessionId,
+              baseHash: outcome.engineSession.baseHash,
+              contextHash: outcome.engineSession.contextHash,
+              lastOrdinal: outcome.engineSession.lastOrdinal,
+            },
+          }
+        : {}),
+      ...(outcome.kind === "failed" ? { code: outcome.code, detail: outcome.detail } : {}),
+    };
+    await deps.store.appendRunEvents(run.id, [
+      {
+        chunkKey: `${run.id}:engine-attempt-finished${keySuffix}`,
+        chunk: streamChunk({
+          type: "CUSTOM",
+          name: ENGINE_ATTEMPT_FINISHED_EVENT,
+          value,
+        }),
+      },
+    ]);
+  };
+
   try {
     for await (const event of engine.run(run)) {
       const interrupted = await readInterruptedStage();
@@ -303,11 +427,13 @@ async function runEngineAttempt(
       }
 
       if (event.type === "chunk") {
-        pendingChunks.push({
-          chunkKey: `${event.chunkKey}${keySuffix}`,
-          chunk: event.chunk,
-          ...(event.isTerminal !== undefined ? { isTerminal: event.isTerminal } : {}),
-        });
+        // finishRun writes the terminal chunk with the status that wins, so an interruption
+        // committing after the engine's own RUN_FINISHED cannot leave a contradicting stream.
+        const chunk = streamChunk(event.chunk);
+        if (event.isTerminal || chunk === undefined || isAttemptFinishedMarker(event.chunk)) {
+          continue;
+        }
+        pendingChunks.push({ chunkKey: `${event.chunkKey}${keySuffix}`, chunk });
         if (pendingChunks.length >= batchSize || isToolCallEnd(event.chunk)) {
           await flush();
         }
@@ -322,7 +448,7 @@ async function runEngineAttempt(
           return postInterrupted;
         }
         const turn = deps.turns?.get(run.id);
-        return {
+        const outcome: Extract<RunStageResult, { kind: "completed" }> = {
           kind: "completed",
           ...(event.finalMessage ? { finalMessageParts: event.finalMessage.parts } : {}),
           ...(event.usage !== undefined ? { usage: event.usage } : {}),
@@ -330,11 +456,20 @@ async function runEngineAttempt(
             ? { engineSession: { ...turn, vendorSessionId: event.vendorSessionId } }
             : {}),
         };
+        await appendAttemptFinished(outcome);
+        return outcome;
       }
 
       const failInterrupted = await readInterruptedStage(event.detail);
       if (failInterrupted) {
         return failInterrupted;
+      }
+      if (!TRANSIENT_ATTEMPT_FAILURES.has(event.code)) {
+        await appendAttemptFinished({
+          kind: "failed",
+          code: event.code,
+          detail: event.detail,
+        });
       }
       return {
         kind: "failed",
@@ -358,7 +493,25 @@ async function runEngineAttempt(
   }
 
   await flush();
+  await appendAttemptFinished({ kind: "completed" });
   return { kind: "completed" };
+}
+
+export function approvalRequestedEvent(approval: Approval): RunEventInput {
+  return {
+    chunkKey: `${approval.runId}:approval:${approval.id}:requested`,
+    chunk: streamChunk({
+      type: "CUSTOM",
+      name: "approval.requested",
+      value: {
+        approvalId: approval.id,
+        operationKind: approval.effect.operationKind,
+        operationId: approval.effect.operationId,
+        prompt: approval.prompt,
+        deadline: approval.deadline,
+      },
+    }),
+  };
 }
 
 export async function persistPendingApprovalStep(
@@ -381,22 +534,7 @@ export async function persistPendingApprovalStep(
     deadline: input.deadline,
   });
 
-  await deps.store.appendRunEvents(input.run.id, [
-    {
-      chunkKey: `${input.run.id}:approval:${result.approval.id}:requested`,
-      chunk: {
-        type: "CUSTOM",
-        name: "approval.requested",
-        value: {
-          approvalId: result.approval.id,
-          operationKind: input.effect.operationKind,
-          operationId: input.effect.operationId,
-          prompt: input.prompt,
-          deadline: result.approval.deadline,
-        },
-      },
-    },
-  ]);
+  await deps.store.appendRunEvents(input.run.id, [approvalRequestedEvent(result.approval)]);
 
   return {
     approvalId: result.approval.id,
@@ -445,35 +583,40 @@ export async function reconcileApprovalExpiryStep(
 }
 
 export async function finalizeInterruptedUncertainStep(
-  deps: Pick<WorkflowDeps, "store" | "now" | "onRunFinished">,
+  deps: RunFinishDeps,
   input: {
     readonly run: Run;
     readonly effectId: EffectId;
     readonly detail: string;
   },
 ): Promise<Run> {
-  const now = deps.now ? deps.now() : new Date();
   const finished = await finishRunAndNotify(deps, {
     runId: input.run.id,
-    status: "interrupted",
-    terminalEvent: {
-      chunkKey: `${input.run.id}:terminal`,
-      chunk: {
-        type: "RUN_ERROR",
-        message: input.detail,
-        code: "effect.outcome_uncertain",
-        runId: input.run.id,
-        threadId: input.run.sessionId,
-      },
-    },
-    detail: input.detail,
-    checkpoint: {
-      interruptedEffectId: input.effectId,
-      recordedAt: formatUtcTimestamp(now),
-    },
+    end: { kind: "interrupt", detail: input.detail, effectId: input.effectId },
   });
-
   return finished.run;
+}
+
+export function runEnd(outcome: RunStageResult): RunEnd {
+  switch (outcome.kind) {
+    case "completed":
+      return {
+        kind: "complete",
+        ...(outcome.finalMessageParts !== undefined
+          ? { finalMessageParts: outcome.finalMessageParts }
+          : {}),
+        ...(outcome.usage !== undefined ? { usage: outcome.usage } : {}),
+        ...(outcome.engineSession !== undefined ? { engineSession: outcome.engineSession } : {}),
+      };
+    case "interrupted":
+      return {
+        kind: "interrupt",
+        detail: outcome.detail,
+        ...(outcome.effectId !== undefined ? { effectId: outcome.effectId } : {}),
+      };
+    case "failed":
+      return { kind: "fail", code: outcome.code, detail: outcome.detail };
+  }
 }
 
 export async function finalizeDirectRunStep(
@@ -483,76 +626,9 @@ export async function finalizeDirectRunStep(
     readonly outcome: RunStageResult;
   },
 ): Promise<Run> {
-  const current = await deps.store.getRun(input.run.id);
-  if (current?.status === "interrupted") {
-    return current;
-  }
-
-  if (input.outcome.kind === "interrupted") {
-    const now = deps.now ? deps.now() : new Date();
-    const finished = await finishRunAndNotify(deps, {
-      runId: input.run.id,
-      status: "interrupted",
-      terminalEvent: {
-        chunkKey: `${input.run.id}:terminal`,
-        chunk: {
-          type: "RUN_ERROR",
-          message: input.outcome.detail,
-          code: "effect.outcome_uncertain",
-          runId: input.run.id,
-          threadId: input.run.sessionId,
-        },
-      },
-      detail: input.outcome.detail,
-      ...(input.outcome.effectId !== undefined
-        ? {
-            checkpoint: {
-              interruptedEffectId: input.outcome.effectId,
-              recordedAt: formatUtcTimestamp(now),
-            },
-          }
-        : {}),
-    });
-    return finished.run;
-  }
-
-  if (input.outcome.kind === "completed") {
-    const finished = await finishRunAndNotify(deps, {
-      runId: input.run.id,
-      status: "completed",
-      terminalEvent: {
-        chunkKey: `${input.run.id}:terminal`,
-        chunk: {
-          type: "RUN_FINISHED",
-          threadId: input.run.sessionId,
-          runId: input.run.id,
-        },
-      },
-      ...(input.outcome.finalMessageParts !== undefined
-        ? { finalMessageParts: input.outcome.finalMessageParts }
-        : {}),
-      ...(input.outcome.usage !== undefined ? { usage: input.outcome.usage } : {}),
-      ...(input.outcome.engineSession !== undefined
-        ? { engineSession: input.outcome.engineSession }
-        : {}),
-    });
-    return finished.run;
-  }
-
   const finished = await finishRunAndNotify(deps, {
     runId: input.run.id,
-    status: "failed",
-    terminalEvent: {
-      chunkKey: `${input.run.id}:terminal`,
-      chunk: {
-        type: "RUN_ERROR",
-        message: input.outcome.detail,
-        code: input.outcome.code,
-        runId: input.run.id,
-        threadId: input.run.sessionId,
-      },
-    },
-    detail: input.outcome.detail,
+    end: runEnd(input.outcome),
   });
   return finished.run;
 }

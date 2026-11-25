@@ -1,23 +1,24 @@
 import * as z from "zod";
-import type { ExecuteResult, JsonValue, Run } from "@der/domain";
-import { isTerminalScriptRunStatus, ScriptRunBusyError, type SqliteScriptRuns } from "@der/storage";
+import type { ExecuteResult, JsonValue, Run, ScriptStore } from "@der/domain";
 import type { AnyTool } from "@tanstack/ai";
-import type { ScriptRuns } from "../scripts/script-workflow";
+import type { ScriptDriver } from "../scripts/script-driver";
+import { boundResult } from "./result-boundary";
 
-const executeInput = z.strictObject({ script: z.string().min(1) });
+const executeInput = z.strictObject({ script: z.string().min(1), key: z.string().optional() });
 
 export interface ExecuteToolDeps {
   readonly run: Run;
-  readonly scriptRunStore: Pick<SqliteScriptRuns, "acquire" | "markDelivered">;
-  readonly scriptRuns: ScriptRuns;
+  readonly scriptRunStore: Pick<ScriptStore, "acquire" | "detach" | "load">;
+  readonly scriptDriver: ScriptDriver;
   readonly maxResultBytes: number;
+  readonly inlineWaitMs: number;
 }
 
-const encoder = new TextEncoder();
-const decoder = new TextDecoder();
-const ANOTHER_SCRIPT_RUNNING =
-  "Another Script is still running in this run. Wait for it to finish, or send the same Script again to get its result.";
-const LOGS_TRUNCATED = "[logs truncated]";
+export interface ExecutePending {
+  readonly status: "pending";
+  readonly executionId: string;
+  readonly proposedWrites: readonly { position: number; capability: string; input: JsonValue }[];
+}
 
 function failure(
   kind: Extract<ExecuteResult, { ok: false }>["error"]["kind"],
@@ -30,63 +31,71 @@ function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
-function cutUtf8(text: string, maxBytes: number): string {
-  const bytes = encoder.encode(text);
-  if (bytes.byteLength <= maxBytes) {
-    return text;
-  }
-  return decoder.decode(bytes.subarray(0, maxBytes)).replace(/�+$/, "");
-}
-
-function fitLogs(logs: readonly string[], maxBytes: number): { logs: string[]; cut: boolean } {
-  const kept: string[] = [];
-  let used = 0;
-  for (const line of logs) {
-    used += encoder.encode(line).byteLength;
-    if (used > maxBytes) {
-      return { logs: kept, cut: true };
-    }
-    kept.push(line);
-  }
-  return { logs: kept, cut: false };
-}
-
-export function fitResult(result: ExecuteResult, maxBytes: number): ExecuteResult {
-  const { logs, cut } = fitLogs(result.logs, maxBytes);
-  if (!result.ok) {
-    return { ...result, logs: cut ? [...logs, LOGS_TRUNCATED] : logs };
-  }
-  const serialized = JSON.stringify(result.result) ?? "null";
-  const tooLarge = encoder.encode(serialized).byteLength > maxBytes;
-  const value: JsonValue = tooLarge ? cutUtf8(serialized, maxBytes) : result.result;
-  return {
-    ok: true,
-    result: value,
-    logs,
-    truncated: result.truncated || tooLarge || cut,
-  };
-}
-
-async function runScript(deps: ExecuteToolDeps, script: string, signal: AbortSignal) {
-  const { scriptRun } = await deps.scriptRunStore.acquire({
+/**
+ * Waits `inlineWaitMs` for the Script's end, then detaches it. `detach` succeeds only
+ * while the execution is unfinished, so either the inline result or the `script.finished`
+ * event reaches the agent, never both and never neither. The same Script and key in the
+ * same Run always name one execution: a repeat reattaches while it runs and returns its
+ * stored result once finished, so a lost response never runs a write twice.
+ */
+async function executeAndWait(
+  deps: ExecuteToolDeps,
+  script: string,
+  key: string | undefined,
+  signal: AbortSignal,
+): Promise<ExecuteResult | ExecutePending> {
+  const { scriptRunStore: store, scriptDriver: driver } = deps;
+  const execution = store.acquire({
     runId: deps.run.id,
     botId: deps.run.botId,
     source: script,
+    ...(key === undefined ? {} : { key }),
+    seed: crypto.getRandomValues(new Uint32Array(1))[0]!,
   });
-  let result = isTerminalScriptRunStatus(scriptRun.status) ? scriptRun.result : null;
-  if (result === null) {
-    await deps.scriptRuns.submit(scriptRun.id);
-    result = await deps.scriptRuns.attach(scriptRun.id, signal);
+  await driver.wait(execution.id, signal, deps.inlineWaitMs);
+  const detachedNow = store.detach(execution.id);
+  const settled = store.load(execution.id).execution;
+  if (!detachedNow && settled.result !== null) {
+    return settled.result;
   }
-  await deps.scriptRunStore.markDelivered(scriptRun.id);
-  return result;
+  return {
+    status: "pending",
+    executionId: execution.id,
+    proposedWrites: await driver.proposedWrites(execution.id),
+  };
 }
 
+async function runExecute(
+  deps: ExecuteToolDeps,
+  rawArgs: unknown,
+  signal: AbortSignal = new AbortController().signal,
+): Promise<ExecuteResult | ExecutePending> {
+  const parsed = executeInput.safeParse(rawArgs);
+  if (!parsed.success) {
+    return failure(
+      "script",
+      `execute takes { script: string, key?: string }: ${parsed.error.message}`,
+    );
+  }
+  try {
+    return await executeAndWait(deps, parsed.data.script, parsed.data.key, signal);
+  } catch (error) {
+    if (signal.aborted) {
+      return failure(
+        "cancelled",
+        "execute was aborted before the script finished; call execute with the same script and key to reattach",
+      );
+    }
+    return failure("capability", `execute failed: ${errorMessage(error)}`);
+  }
+}
+
+/** Every result `execute` returns, from any exit, crosses `boundResult` at `maxResultBytes`. */
 export function createExecuteTool(deps: ExecuteToolDeps): AnyTool {
   return {
     name: "execute",
     description:
-      "Run a JavaScript Script that calls capabilities as der.<namespace>.<name>(input). Blocks until the Script ends, including while an operator decides an approval. Never throws: check `ok` in the result. If this call is cut off, call it again with the identical script to pick the same run back up.",
+      'Run a JavaScript Script that calls capabilities as await step.run(id, input). Waits a few seconds for the Script to end and returns its result. A Script still running then, for example while an operator decides an approval, returns { status: "pending", executionId, proposedWrites } and its outcome arrives later as an event message. Never throws: check `ok` in a result. Calling execute again with the same script (and key) returns that same execution, running or finished, and never runs it twice; pass a new `key` to run the same script again on purpose.',
     inputSchema: {
       type: "object",
       properties: {
@@ -95,6 +104,11 @@ export function createExecuteTool(deps: ExecuteToolDeps): AnyTool {
           description:
             "Body of an async function. Use `return` to give back a JSON value. Await every capability call.",
         },
+        key: {
+          type: "string",
+          description:
+            "Optional. A new key runs the same script again as a new execution; omit it otherwise.",
+        },
       },
       required: ["script"],
       additionalProperties: false,
@@ -102,26 +116,9 @@ export function createExecuteTool(deps: ExecuteToolDeps): AnyTool {
     execute: async (
       rawArgs: unknown,
       context?: { readonly signal?: AbortSignal },
-    ): Promise<ExecuteResult> => {
-      const parsed = executeInput.safeParse(rawArgs);
-      if (!parsed.success) {
-        return failure("script", `execute takes { script: string }: ${parsed.error.message}`);
-      }
-      const signal = context?.signal ?? new AbortController().signal;
-      try {
-        return fitResult(await runScript(deps, parsed.data.script, signal), deps.maxResultBytes);
-      } catch (error) {
-        if (error instanceof ScriptRunBusyError) {
-          return failure("capability", ANOTHER_SCRIPT_RUNNING);
-        }
-        if (signal.aborted) {
-          return failure(
-            "cancelled",
-            "execute was aborted before the script finished; call execute with the same script to pick the run back up",
-          );
-        }
-        return failure("capability", `execute failed: ${errorMessage(error)}`);
-      }
+    ): Promise<ExecuteResult | ExecutePending> => {
+      const outcome = await runExecute(deps, rawArgs, context?.signal);
+      return "status" in outcome ? outcome : boundResult(outcome, deps.maxResultBytes).result;
     },
   };
 }

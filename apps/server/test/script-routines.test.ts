@@ -207,7 +207,7 @@ describe("a script routine fires", () => {
     await createScriptRoutine(
       server,
       { botId, sessionId },
-      `return await der.notes.read({ key: "a" });`,
+      `return await step.run("notes.read", { key: "a" });`,
     );
 
     const tick = await fire(server, "rt-script", "2026-06-01");
@@ -244,7 +244,7 @@ describe("a script routine fires", () => {
     const events = server.store.readRunEventsAfter(run.id, 0).map((event) => event.chunk);
     expect(events[1]).toMatchObject({ type: "TOOL_CALL_START", toolCallName: "execute" });
     expect(JSON.parse((events[2] as { delta: string }).delta)).toEqual({
-      script: `return await der.notes.read({ key: "a" });`,
+      script: `return await step.run("notes.read", { key: "a" });`,
     });
     expect(JSON.parse((events[4] as { content: string }).content)).toEqual({
       ok: true,
@@ -288,14 +288,14 @@ describe("approval on a routine script", () => {
     await createScriptRoutine(
       server,
       { botId, sessionId },
-      `return await der.notes.publish({ text: "release" });`,
+      `return await step.run("notes.publish", { text: "release" });`,
     );
     const decide = (
       approval: { readonly id: string },
       runId: string,
       status: "approved" | "denied",
     ) =>
-      server.coordinator.decide({
+      server.commands.decideApproval({
         approvalId: approval.id,
         botId,
         sessionId,
@@ -345,6 +345,69 @@ describe("approval on a routine script", () => {
   }, 60_000);
 });
 
+describe("resume a direct Script routine after a server restart", () => {
+  it("keeps the routine attached to the same execution and records one effect", async () => {
+    const database = createTempDatabase("der-script-routine-restart-");
+    const host = createNoteHost();
+    const config = {
+      host: "127.0.0.1",
+      port: 0,
+      restateMode: "direct" as const,
+      databasePath: database.dbPath,
+      enabledEngines: ["fixture" as const],
+      memoryProjectionDir: `${database.dir}/memory`,
+      skillsRootDir: `${database.dir}/skills`,
+      workspaceRootDir: `${database.dir}/workspaces`,
+    };
+    const options = { config, catalog: host.catalog };
+    const first = await startServer({ ...options, config: { ...config, seedFixture: true } });
+    let server: RunningServer | undefined = first;
+    cleanups.push(async () => {
+      await server?.close();
+      database.cleanup();
+    });
+    await createScriptRoutine(
+      first,
+      {
+        botId: first.seededFixture!.bot.id,
+        sessionId: first.seededFixture!.session.id,
+      },
+      'return await step.run("notes.publish", { text: "release" });',
+    );
+    const { runId } = await fire(first, "rt-script", "2026-06-01");
+    const pending = await waitUntil(
+      () => {
+        const [approval] = first.store.listPendingApprovalsForRun(runId!);
+        return approval ?? false;
+      },
+      { timeoutMs: 3000, label: "first routine Approval" },
+    );
+    await first.close();
+    server = undefined;
+
+    const reopened = await startServer(options);
+    server = reopened;
+    await reopened.commands.decideApproval({
+      approvalId: pending.id,
+      botId: pending.botId,
+      sessionId: pending.sessionId,
+      runId: pending.runId,
+      status: "approved",
+      actor: "operator",
+      decidedAt: formatUtcTimestamp(new Date()),
+    });
+    await waitUntil(() => reopened.store.getRun(pending.runId)?.status === "completed", {
+      timeoutMs: 3000,
+      label: "resumed routine Run completed",
+    });
+    expect(host.published).toEqual(["release"]);
+    expect(reopened.store.listPendingApprovalsForRun(pending.runId)).toEqual([]);
+    expect(
+      reopened.store.getEffect({ ...pending.effect, operationKind: "capability" })?.status,
+    ).toBe("completed");
+  });
+});
+
 describe("a script schedules a routine for an agent", () => {
   it("returns the routine from the routines endpoint once the create is approved", async () => {
     const { server, botId, sessionId } = await startDirectServer({ withNotes: false });
@@ -352,12 +415,12 @@ describe("a script schedules a routine for an agent", () => {
     const scriptRun = await submitScript(
       server,
       owner,
-      `return await der.routines.create({
+      `return await step.run("routines.create", {
         id: "rt-agent",
         sessionId: ${JSON.stringify(sessionId)},
         name: "Agent made",
         cron: "0 3 * * *",
-        script: "return await der.routines.list({})",
+        script: "return await step.run('routines.list', {})",
       });`,
     );
 
@@ -371,7 +434,7 @@ describe("a script schedules a routine for an agent", () => {
     expect(approval.effect.operationId).toBe("routines.create");
     expect(server.routines.listRoutines(botId)).toEqual([]);
 
-    await server.coordinator.decide({
+    await server.commands.decideApproval({
       approvalId: approval.id,
       botId,
       sessionId,
@@ -380,7 +443,7 @@ describe("a script schedules a routine for an agent", () => {
       actor: "operator",
       decidedAt: formatUtcTimestamp(new Date()),
     });
-    const result = await server.scriptRuns.attach(scriptRun.id, AbortSignal.timeout(30_000));
+    const result = await server.scriptDriver.wait(scriptRun.id, AbortSignal.timeout(30_000));
 
     expect(result.ok).toBe(true);
     const listed = (await (await fetch(`${server.url}/api/bots/${botId}/routines`)).json()) as {
@@ -396,7 +459,7 @@ describe("a script schedules a routine for an agent", () => {
         enabled: true,
         engine: "script",
         prompt: null,
-        script: "return await der.routines.list({})",
+        script: "return await step.run('routines.list', {})",
       },
     ]);
   }, 60_000);

@@ -3,12 +3,12 @@ import { defineCapability, sandboxRequest, sandboxResult, type Sandbox } from "@
 export function sandboxCapability(kind: "docker" | "wasmer", sandbox: Sandbox) {
   return defineCapability({
     id: `sandbox.${kind}`,
-    description: `Run a bounded command inside the ${kind} sandbox. Always asks for approval.`,
+    description: `Run a bounded command inside the ${kind} sandbox. A call may need an Approval; the bot's policy can allow it without one or refuse it.`,
     input: sandboxRequest,
     output: sandboxResult,
     effect: "write",
     approval: "always",
-    example: `await der.sandbox.${kind}({ command: "echo", args: ["hi"], timeoutMs: 5000, network: "none" })`,
+    example: `await step.run("sandbox.${kind}", { command: "echo", args: ["hi"], timeoutMs: 5000, network: "none" })`,
     execute: (input) => sandbox.execute(input),
   });
 }

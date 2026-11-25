@@ -1,5 +1,7 @@
 import {
+  activeRunStatus,
   effectOperationKind,
+  type ActiveRunStatus,
   type Approval,
   type ApprovalDecision,
   type Bot,
@@ -14,6 +16,7 @@ import {
   type Run,
   type RunEvent,
   type Session,
+  type SessionEvent,
 } from "@der/domain";
 import { compiledParsers } from "@der/domain/compiled";
 
@@ -30,6 +33,8 @@ export interface BotRow {
   readonly default_engine: string;
   readonly allowed_engines_json: string;
   readonly workspace_path: string | null;
+  readonly capability_policy_json: string;
+  readonly event_chain_limit: number;
   readonly created_at: string;
   readonly updated_at: string;
 }
@@ -39,8 +44,20 @@ export interface SessionRow {
   readonly bot_id: string;
   readonly title: string;
   readonly engine: string | null;
+  readonly pending_event_count?: number;
   readonly created_at: string;
   readonly updated_at: string;
+}
+
+export interface SessionEventRow {
+  readonly id: string;
+  readonly bot_id: string;
+  readonly session_id: string;
+  readonly kind: string;
+  readonly payload_json: string;
+  readonly state: string;
+  readonly run_id: string | null;
+  readonly created_at: string;
 }
 
 export interface RoutineRow {
@@ -181,6 +198,8 @@ export function mapBotRow(row: BotRow): Bot {
     defaultEngine: row.default_engine,
     allowedEngines: JSON.parse(row.allowed_engines_json) as unknown,
     ...(row.workspace_path !== null ? { workspacePath: row.workspace_path } : {}),
+    capabilityPolicy: JSON.parse(row.capability_policy_json) as unknown,
+    eventChainLimit: row.event_chain_limit,
     createdAt: row.created_at,
     updatedAt: row.updated_at,
   });
@@ -192,8 +211,24 @@ export function mapSessionRow(row: SessionRow): Session {
     botId: row.bot_id,
     title: row.title,
     ...(row.engine !== null ? { engine: row.engine } : {}),
+    ...(row.pending_event_count !== undefined
+      ? { pendingEventCount: row.pending_event_count }
+      : {}),
     createdAt: row.created_at,
     updatedAt: row.updated_at,
+  });
+}
+
+export function mapSessionEventRow(row: SessionEventRow): SessionEvent {
+  return compiledParsers.sessionEvent.parse({
+    id: row.id,
+    botId: row.bot_id,
+    sessionId: row.session_id,
+    kind: row.kind,
+    payload: JSON.parse(row.payload_json) as unknown,
+    state: row.state,
+    runId: row.run_id,
+    createdAt: row.created_at,
   });
 }
 
@@ -372,4 +407,11 @@ export function mapOutboxEventRow(row: OutboxEventRow): OutboxEvent {
     createdAt: row.created_at,
     updatedAt: row.updated_at,
   });
+}
+
+/** SQL list of the active statuses, for `status IN ${ACTIVE_RUN_STATUS_SQL}`. */
+export const ACTIVE_RUN_STATUS_SQL = `(${activeRunStatus.options.map((status) => `'${status}'`).join(", ")})`;
+
+export function isActiveRunStatus(status: string): status is ActiveRunStatus {
+  return (activeRunStatus.options as readonly string[]).includes(status);
 }

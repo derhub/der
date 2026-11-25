@@ -52,6 +52,7 @@ export const sessionRunsResponseSchema = z.object({
 export const runDetailResponseSchema = z.object({
   run,
   approval: approval.nullable(),
+  approvals: z.array(approval).default([]),
 });
 export type RunDetailResponse = z.infer<typeof runDetailResponseSchema>;
 

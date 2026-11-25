@@ -1,25 +1,22 @@
-export { canonicalizeJson, fingerprintJson } from "./canonical";
 export { isSqliteBusyError, SqliteDatabase, type SqliteDatabaseOptions } from "./database";
 export {
   applyMigrations,
+  BOT_POLICY_MIGRATION,
   CAPABILITY_OPERATION_KIND_MIGRATION,
   CORE_MIGRATION,
   CORE_MIGRATIONS,
   OUTBOX_DESTINATIONS_MIGRATION,
   SCRIPT_ROUTINES_MIGRATION,
   SCRIPT_RUNS_MIGRATION,
+  SCRIPT_STEPS_MIGRATION,
+  SESSION_EVENTS_MIGRATION,
   type StorageMigration,
 } from "./migrations";
 export {
-  digestScriptSource,
-  isTerminalScriptRunStatus,
-  openSqliteScriptRuns,
-  ScriptRunBusyError,
-  SqliteScriptRuns,
-  type AcquireScriptRunInput,
-  type AcquireScriptRunOutcome,
-  type SqliteScriptRunsOptions,
-} from "./script-runs";
+  openSqliteScriptStore,
+  SqliteScriptStore,
+  type SqliteScriptStoreOptions,
+} from "./script-store";
 export {
   openSqliteStore,
   SqliteStore,

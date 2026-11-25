@@ -13,6 +13,7 @@ import {
 } from "@astryxdesign/core/theme/tokens.stylex";
 import { neutralTheme } from "@astryxdesign/theme-neutral/built";
 import * as stylex from "@stylexjs/stylex";
+import { QueryClientProvider, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   ActivityIcon,
   BookOpenIcon,
@@ -22,13 +23,7 @@ import {
   RefreshCwIcon,
 } from "lucide-react";
 import { useCallback, useEffect, useMemo, useState } from "react";
-import type {
-  Bot,
-  CapabilityDescriptor,
-  EngineReadiness,
-  ProblemDetails,
-  Session,
-} from "@der/domain";
+import type { Bot, CapabilityDescriptor, EngineReadiness, Session } from "@der/domain";
 import { ChatWorkspace } from "@/components/chat-workspace";
 import { MemoryPanel } from "@/components/memory-panel";
 import { OperatorSidebar } from "@/components/operator-sidebar";
@@ -36,8 +31,9 @@ import { ProblemAlert } from "@/components/problem-alert";
 import { ReadinessPanel } from "@/components/readiness-panel";
 import { RoutinesPanel } from "@/components/routines-panel";
 import { SkillsPanel } from "@/components/skills-panel";
+import { consoleQueryKeys, createConsoleQueryClient } from "@/lib/console-queries";
 import { createOperatorApi, type OperatorApi } from "@/lib/operator-api";
-import { toOperatorProblem, type HealthResponse } from "@/lib/schemas";
+import { toOperatorProblem } from "@/lib/schemas";
 
 const styles = stylex.create({
   shell: {
@@ -126,9 +122,16 @@ const styles = stylex.create({
 export interface AppProps {
   readonly api?: OperatorApi;
   readonly fetcher?: typeof fetch;
+  /** How often the selected bot's session list is fetched again while the tab is visible. */
+  readonly sessionRefreshMs?: number;
 }
 
+const SESSION_REFRESH_MS = 5_000;
 const ACTOR_STORAGE_KEY = "der:operatorActor";
+const EMPTY_BOTS: readonly Bot[] = [];
+const EMPTY_SESSIONS: readonly Session[] = [];
+const EMPTY_ENGINES: readonly EngineReadiness[] = [];
+const EMPTY_CAPABILITIES: readonly CapabilityDescriptor[] = [];
 
 function loadStoredActor(): string {
   try {
@@ -139,85 +142,157 @@ function loadStoredActor(): string {
   }
 }
 
-export function App({ api: providedApi, fetcher }: AppProps) {
-  const api = useMemo(
-    () => providedApi ?? createOperatorApi(fetcher ? { fetcher } : {}),
-    [providedApi, fetcher],
-  );
+interface ConsoleShellProps {
+  readonly api: OperatorApi;
+  readonly fetcher?: typeof fetch;
+  readonly sessionRefreshMs: number;
+}
 
-  const [health, setHealth] = useState<HealthResponse | null>(null);
-  const [engines, setEngines] = useState<EngineReadiness[]>([]);
-  const [capabilities, setCapabilities] = useState<CapabilityDescriptor[]>([]);
-  const [bots, setBots] = useState<Bot[]>([]);
-  const [sessions, setSessions] = useState<Session[]>([]);
-  const [selectedBotId, setSelectedBotId] = useState<string | null>(null);
-  const [selectedSessionId, setSelectedSessionId] = useState<string | null>(null);
+function ConsoleShell({ api, fetcher, sessionRefreshMs }: ConsoleShellProps) {
+  const queryClient = useQueryClient();
+
+  const [chosenBotId, setChosenBotId] = useState<string | null>(null);
+  const [chosenSessionId, setChosenSessionId] = useState<string | null>(null);
   const [activeTab, setActiveTab] = useState<string>("chat");
   const [actor, setActor] = useState<string>(loadStoredActor);
-  const [loadingBootstrap, setLoadingBootstrap] = useState(false);
-  const [bootstrapProblem, setBootstrapProblem] = useState<ProblemDetails | null>(null);
   const [statusMessage, setStatusMessage] = useState<string>("");
+  const [dismissedErrorKey, setDismissedErrorKey] = useState<string | null>(null);
 
   const announce = useCallback((message: string) => {
     setStatusMessage(message);
   }, []);
 
-  const loadBootstrap = useCallback(async () => {
-    setLoadingBootstrap(true);
-    setBootstrapProblem(null);
-    try {
-      const [nextHealth, nextEngines, nextCapabilities, nextBots] = await Promise.all([
-        api.getHealth(),
-        api.listEngines(),
-        api.listCapabilities(),
-        api.listBots(),
-      ]);
-      setHealth(nextHealth);
-      setEngines(nextEngines);
-      setCapabilities(nextCapabilities);
-      setBots(nextBots);
-      setSelectedBotId((current) => {
-        if (current && nextBots.some((entry) => entry.id === current)) {
-          return current;
-        }
-        return nextBots[0]?.id ?? null;
-      });
-    } catch (error) {
-      setBootstrapProblem(toOperatorProblem(error, "/api/bots"));
-    } finally {
-      setLoadingBootstrap(false);
+  const healthQuery = useQuery({
+    queryKey: consoleQueryKeys.health(),
+    queryFn: ({ signal }) => api.getHealth(signal),
+  });
+  const enginesQuery = useQuery({
+    queryKey: consoleQueryKeys.engines(),
+    queryFn: ({ signal }) => api.listEngines(signal),
+  });
+  const capabilitiesQuery = useQuery({
+    queryKey: consoleQueryKeys.capabilities(),
+    queryFn: ({ signal }) => api.listCapabilities(signal),
+  });
+  const botsQuery = useQuery({
+    queryKey: consoleQueryKeys.bots(),
+    queryFn: ({ signal }) => api.listBots(signal),
+  });
+
+  const health = healthQuery.data ?? null;
+  const engines = enginesQuery.data ?? EMPTY_ENGINES;
+  const capabilities = capabilitiesQuery.data ?? EMPTY_CAPABILITIES;
+  const bots = botsQuery.data ?? EMPTY_BOTS;
+
+  const selectedBotId =
+    chosenBotId !== null && bots.some((entry) => entry.id === chosenBotId)
+      ? chosenBotId
+      : (bots[0]?.id ?? null);
+
+  const sessionsQuery = useQuery({
+    queryKey:
+      selectedBotId !== null
+        ? consoleQueryKeys.sessions(selectedBotId)
+        : (["console", "sessions", null] as const),
+    queryFn: ({ signal }) => {
+      if (selectedBotId === null) {
+        return Promise.resolve<Session[]>([]);
+      }
+      return api.listSessions(selectedBotId, signal);
+    },
+    enabled: selectedBotId !== null,
+    refetchInterval: sessionRefreshMs,
+    refetchIntervalInBackground: false,
+  });
+
+  const sessions = selectedBotId !== null ? (sessionsQuery.data ?? EMPTY_SESSIONS) : EMPTY_SESSIONS;
+
+  const selectedSessionId =
+    chosenSessionId !== null && sessions.some((entry) => entry.id === chosenSessionId)
+      ? chosenSessionId
+      : (sessions[0]?.id ?? null);
+
+  const loadingBootstrap =
+    healthQuery.isFetching ||
+    enginesQuery.isFetching ||
+    capabilitiesQuery.isFetching ||
+    botsQuery.isFetching;
+
+  const activeError = useMemo(() => {
+    if (healthQuery.error) {
+      return {
+        key: `health:${healthQuery.errorUpdatedAt}`,
+        problem: toOperatorProblem(healthQuery.error, "/healthz"),
+      };
     }
-  }, [api]);
+    if (enginesQuery.error) {
+      return {
+        key: `engines:${enginesQuery.errorUpdatedAt}`,
+        problem: toOperatorProblem(enginesQuery.error, "/api/engines"),
+      };
+    }
+    if (capabilitiesQuery.error) {
+      return {
+        key: `capabilities:${capabilitiesQuery.errorUpdatedAt}`,
+        problem: toOperatorProblem(capabilitiesQuery.error, "/api/capabilities"),
+      };
+    }
+    if (botsQuery.error) {
+      return {
+        key: `bots:${botsQuery.errorUpdatedAt}`,
+        problem: toOperatorProblem(botsQuery.error, "/api/bots"),
+      };
+    }
+    if (selectedBotId !== null && sessionsQuery.error) {
+      return {
+        key: `sessions:${selectedBotId}:${sessionsQuery.errorUpdatedAt}`,
+        problem: toOperatorProblem(sessionsQuery.error, `/api/bots/${selectedBotId}/sessions`),
+      };
+    }
+    return null;
+  }, [
+    botsQuery.error,
+    botsQuery.errorUpdatedAt,
+    capabilitiesQuery.error,
+    capabilitiesQuery.errorUpdatedAt,
+    enginesQuery.error,
+    enginesQuery.errorUpdatedAt,
+    healthQuery.error,
+    healthQuery.errorUpdatedAt,
+    selectedBotId,
+    sessionsQuery.error,
+    sessionsQuery.errorUpdatedAt,
+  ]);
 
-  useEffect(() => {
-    void loadBootstrap();
-  }, [loadBootstrap]);
+  const bootstrapProblem =
+    activeError !== null && activeError.key !== dismissedErrorKey ? activeError.problem : null;
 
-  useEffect(() => {
-    if (!selectedBotId) {
-      setSessions([]);
-      setSelectedSessionId(null);
+  const refreshBootstrap = useCallback(() => {
+    setDismissedErrorKey(null);
+    void Promise.all([
+      queryClient.invalidateQueries({ queryKey: consoleQueryKeys.health() }),
+      queryClient.invalidateQueries({ queryKey: consoleQueryKeys.engines() }),
+      queryClient.invalidateQueries({ queryKey: consoleQueryKeys.capabilities() }),
+      queryClient.invalidateQueries({ queryKey: consoleQueryKeys.bots() }),
+      ...(selectedBotId !== null
+        ? [queryClient.invalidateQueries({ queryKey: consoleQueryKeys.sessions(selectedBotId) })]
+        : []),
+    ]);
+  }, [queryClient, selectedBotId]);
+
+  const invalidateSelectedBotSessions = useCallback(() => {
+    if (selectedBotId === null) {
       return;
     }
-    const controller = new AbortController();
-    api
-      .listSessions(selectedBotId, controller.signal)
-      .then((loaded) => {
-        setSessions(loaded);
-        setSelectedSessionId((current) => {
-          if (current && loaded.some((entry) => entry.id === current)) {
-            return current;
-          }
-          return loaded[0]?.id ?? null;
-        });
-      })
-      .catch((error) => {
-        if (!controller.signal.aborted) {
-          setBootstrapProblem(toOperatorProblem(error, `/api/bots/${selectedBotId}/sessions`));
-        }
-      });
-    return () => controller.abort();
-  }, [api, selectedBotId]);
+    void queryClient.invalidateQueries({
+      queryKey: consoleQueryKeys.sessions(selectedBotId),
+    });
+  }, [queryClient, selectedBotId]);
+
+  function handleSelectBot(botId: string) {
+    setChosenBotId(botId);
+    setChosenSessionId(null);
+  }
 
   function handleActorChange(value: string) {
     setActor(value);
@@ -229,19 +304,14 @@ export function App({ api: providedApi, fetcher }: AppProps) {
   }
 
   function handleBotSaved(saved: Bot) {
-    setBots((prev) => {
-      const exists = prev.some((entry) => entry.id === saved.id);
-      return exists
-        ? prev.map((entry) => (entry.id === saved.id ? saved : entry))
-        : [...prev, saved];
-    });
-    setSelectedBotId(saved.id);
+    setChosenBotId(saved.id);
   }
 
   function handleSessionCreated(created: Session) {
-    setSessions((prev) => [...prev, created]);
-    setSelectedSessionId(created.id);
-    setActiveTab("chat");
+    if (created.botId === selectedBotId) {
+      setChosenSessionId(created.id);
+      setActiveTab("chat");
+    }
   }
 
   const selectedBot = bots.find((entry) => entry.id === selectedBotId) ?? null;
@@ -259,8 +329,8 @@ export function App({ api: providedApi, fetcher }: AppProps) {
           sessions={sessions}
           selectedBotId={selectedBotId}
           selectedSessionId={selectedSessionId}
-          onSelectBot={setSelectedBotId}
-          onSelectSession={setSelectedSessionId}
+          onSelectBot={handleSelectBot}
+          onSelectSession={setChosenSessionId}
           onBotSaved={handleBotSaved}
           onSessionCreated={handleSessionCreated}
           onAnnounce={announce}
@@ -300,7 +370,7 @@ export function App({ api: providedApi, fetcher }: AppProps) {
                 label="Refresh"
                 icon={<RefreshCwIcon {...stylex.props(styles.iconSm)} aria-hidden="true" />}
                 isDisabled={loadingBootstrap}
-                onClick={() => void loadBootstrap()}
+                onClick={refreshBootstrap}
               />
             </div>
           </header>
@@ -318,8 +388,8 @@ export function App({ api: providedApi, fetcher }: AppProps) {
             {bootstrapProblem ? (
               <ProblemAlert
                 problem={bootstrapProblem}
-                onDismiss={() => setBootstrapProblem(null)}
-                onRetry={() => void loadBootstrap()}
+                onDismiss={() => setDismissedErrorKey(activeError?.key ?? null)}
+                onRetry={refreshBootstrap}
               />
             ) : null}
 
@@ -373,6 +443,7 @@ export function App({ api: providedApi, fetcher }: AppProps) {
                     session={selectedSession}
                     actor={actor}
                     onAnnounce={announce}
+                    onRunActivity={invalidateSelectedBotSessions}
                   />
                 ) : (
                   <EmptyState
@@ -397,7 +468,7 @@ export function App({ api: providedApi, fetcher }: AppProps) {
                   capabilities={capabilities}
                   loading={loadingBootstrap}
                   problem={bootstrapProblem}
-                  onRefresh={() => void loadBootstrap()}
+                  onRefresh={refreshBootstrap}
                 />
               ) : (
                 <SkillsPanel api={api} />
@@ -407,5 +478,29 @@ export function App({ api: providedApi, fetcher }: AppProps) {
         </div>
       </div>
     </Theme>
+  );
+}
+
+export function App({
+  api: providedApi,
+  fetcher,
+  sessionRefreshMs = SESSION_REFRESH_MS,
+}: AppProps) {
+  const api = useMemo(
+    () => providedApi ?? createOperatorApi(fetcher ? { fetcher } : {}),
+    [providedApi, fetcher],
+  );
+  const [queryClient] = useState(createConsoleQueryClient);
+
+  useEffect(() => () => queryClient.clear(), [queryClient]);
+
+  return (
+    <QueryClientProvider client={queryClient}>
+      <ConsoleShell
+        api={api}
+        {...(fetcher !== undefined ? { fetcher } : {})}
+        sessionRefreshMs={sessionRefreshMs}
+      />
+    </QueryClientProvider>
   );
 }

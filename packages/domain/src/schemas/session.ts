@@ -7,6 +7,7 @@ export const session = z.object({
   botId: id,
   title: z.string().min(1),
   engine: engineKind.optional(),
+  pendingEventCount: z.number().int().min(0).optional(),
   createdAt: utcTimestamp,
   updatedAt: utcTimestamp,
 });

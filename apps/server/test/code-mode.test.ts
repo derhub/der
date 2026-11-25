@@ -12,7 +12,7 @@ import {
 } from "@der/domain";
 import type { AnyTool } from "@tanstack/ai";
 import { createExecuteTool } from "#code-mode/execute";
-import type { ScriptRuns } from "#scripts/script-workflow";
+import { boundResult } from "#code-mode/result-boundary";
 import { codeModeInstructions } from "#code-mode/instructions";
 import { createSearchTool } from "#code-mode/search";
 import { createFixtureCapabilities } from "#capabilities/fixture";
@@ -64,12 +64,15 @@ async function startDirectServer(
   return { server, host };
 }
 
+const ATTENDED_WAIT_MS = 60_000;
+
 function executeToolFor(server: RunningServer, run: Run, maxResultBytes = RESULT_BYTES): AnyTool {
   return createExecuteTool({
     run,
     scriptRunStore: server.scriptRunStore,
-    scriptRuns: server.scriptRuns!,
+    scriptDriver: server.scriptDriver,
     maxResultBytes,
+    inlineWaitMs: ATTENDED_WAIT_MS,
   });
 }
 
@@ -103,7 +106,7 @@ function decide(
   owner: { readonly run: Run; readonly botId: string; readonly sessionId: string },
   status: "approved" | "denied" | "expired",
 ) {
-  return server.coordinator.decide({
+  return server.commands.decideApproval({
     approvalId: approval.id,
     botId: owner.botId,
     sessionId: owner.sessionId,
@@ -126,7 +129,7 @@ const transfer = defineCapability({
   },
 }) as unknown as Capability;
 
-const PUBLISH = `return der.notes.publish({ text: "release" });`;
+const PUBLISH = `return await step.run("notes.publish", { text: "release" });`;
 
 describe("execute a gated script through the tool", () => {
   it("raises one approval, then returns the value with one effect once the approval is granted", async () => {
@@ -137,7 +140,30 @@ describe("execute a gated script through the tool", () => {
     const pending = callTool(execute, { script: PUBLISH });
     const approval = await awaitPendingApproval(server, owner.run.id);
     expect(host.published).toEqual([]);
-    await decide(server, approval, owner, "approved");
+    const detail = await fetch(`${server.url}/api/runs/${owner.run.id}`);
+    expect(await detail.json()).toMatchObject({
+      approvals: [
+        {
+          id: approval.id,
+          effect: {
+            operationId: "notes.publish",
+            canonicalArguments: { text: "release" },
+          },
+        },
+      ],
+    });
+    const decision = await fetch(`${server.url}/api/approvals/${approval.id}/decision`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        botId: owner.botId,
+        sessionId: owner.sessionId,
+        runId: owner.run.id,
+        status: "approved",
+        actor: "operator",
+      }),
+    });
+    expect(decision.status).toBe(200);
 
     expect(await pending).toEqual({
       ok: true,
@@ -157,7 +183,7 @@ describe("execute a gated script through the tool", () => {
     const execute = executeToolFor(server, owner.run);
 
     const result = await callTool(execute, {
-      script: `return der.bank.transfer({ amount: 5 });`,
+      script: `return await step.run("bank.transfer", { amount: 5 });`,
     });
 
     expect(result).toEqual({ ok: true, result: { moved: 5 }, logs: [], truncated: false });
@@ -169,7 +195,9 @@ describe("execute a gated script through the tool", () => {
     const owner = await admitOwningRun(server, "code-mode-approval-rule-large");
     const execute = executeToolFor(server, owner.run);
 
-    const pending = callTool(execute, { script: `return der.bank.transfer({ amount: 500 });` });
+    const pending = callTool(execute, {
+      script: `return await step.run("bank.transfer", { amount: 500 });`,
+    });
     const approval = await awaitPendingApproval(server, owner.run.id);
     await decide(server, approval, owner, "approved");
 
@@ -188,13 +216,9 @@ describe("pick a script back up after the tool call was cut", () => {
     const approval = await awaitPendingApproval(server, owner.run.id);
     cut.abort();
 
-    expect(await first).toEqual({
+    expect(await first).toMatchObject({
       ok: false,
-      error: {
-        kind: "cancelled",
-        message:
-          "execute was aborted before the script finished; call execute with the same script to pick the run back up",
-      },
+      error: { kind: "cancelled", message: expect.any(String) },
       logs: [],
     });
     expect(server.store.getApproval(approval.id)?.decision.status).toBe("pending");
@@ -208,97 +232,40 @@ describe("pick a script back up after the tool call was cut", () => {
   }, 60_000);
 });
 
-describe("return a stored result without attaching", () => {
-  it("returns the stored result of a finished undelivered script run when attach is unavailable", async () => {
+describe("run multiple Scripts in one Run", () => {
+  it("runs a different Script while another waits on approval", async () => {
     const { server, host } = await startDirectServer();
-    const owner = await admitOwningRun(server, "code-mode-stored-result");
-    const attachDown = new Error("workflow retention elapsed");
-    const finishThenFail: ScriptRuns = {
-      submit: (id) => server.scriptRuns!.submit(id),
-      cancel: (id) => server.scriptRuns!.cancel(id),
-      attach: async (id, signal) => {
-        await server.scriptRuns!.attach(id, signal);
-        throw attachDown;
-      },
-    };
-    const neverAttach: ScriptRuns = {
-      ...finishThenFail,
-      attach: async () => {
-        throw attachDown;
-      },
-    };
-    const append = `return der.notes.append({ text: "tick" });`;
-    const tool = (scriptRuns: ScriptRuns) =>
-      createExecuteTool({
-        run: owner.run,
-        scriptRunStore: server.scriptRunStore,
-        scriptRuns,
-        maxResultBytes: RESULT_BYTES,
-      });
-
-    const first = await callTool(tool(finishThenFail), { script: append });
-    const second = await callTool(tool(neverAttach), { script: append });
-
-    expect(first).toEqual({
-      ok: false,
-      error: { kind: "capability", message: "execute failed: workflow retention elapsed" },
-      logs: [],
-    });
-    expect(second).toEqual({ ok: true, result: { count: 1 }, logs: [], truncated: false });
-    expect(host.appended).toEqual(["tick"]);
-    expect(scriptRunCount(server, owner.run.id)).toBe(1);
-  }, 60_000);
-});
-
-describe("run one script at a time in a run", () => {
-  it("one at a time: a different script sent while another waits on an approval is refused with advice, and the first still completes", async () => {
-    const { server, host } = await startDirectServer();
-    const owner = await admitOwningRun(server, "code-mode-one-at-a-time");
+    const owner = await admitOwningRun(server, "code-mode-concurrent");
     const execute = executeToolFor(server, owner.run);
     const first = callTool(execute, { script: PUBLISH });
     const approval = await awaitPendingApproval(server, owner.run.id);
 
-    const refused = await callTool(execute, {
-      script: `return der.notes.publish({ text: "other" });`,
-    });
-    const again = callTool(execute, { script: PUBLISH });
-    await decide(server, approval, owner, "approved");
+    expect(
+      await callTool(execute, { script: `return await step.run("notes.read", { key: "a" });` }),
+    ).toEqual({ ok: true, result: { value: "value-a" }, logs: [], truncated: false });
+    expect(host.published).toEqual([]);
 
-    expect(refused).toEqual({
-      ok: false,
-      error: {
-        kind: "capability",
-        message:
-          "Another Script is still running in this run. Wait for it to finish, or send the same Script again to get its result.",
-      },
-      logs: [],
-    });
+    await decide(server, approval, owner, "approved");
     expect(await first).toEqual({
       ok: true,
       result: { published: true },
       logs: [],
       truncated: false,
     });
-    expect(await again).toEqual({
-      ok: true,
-      result: { published: true },
-      logs: [],
-      truncated: false,
-    });
     expect(host.published).toEqual(["release"]);
-    expect(scriptRunCount(server, owner.run.id)).toBe(1);
-  }, 60_000);
+    expect(scriptRunCount(server, owner.run.id)).toBe(2);
+  });
 });
 
 describe("repeat a script on purpose", () => {
-  it("runs the same script again after its result was returned, giving two script runs and two effects", async () => {
+  it("runs the same script again when given a new key, giving two script runs and two effects", async () => {
     const { server, host } = await startDirectServer();
     const owner = await admitOwningRun(server, "code-mode-repeat");
     const execute = executeToolFor(server, owner.run);
-    const append = `return der.notes.append({ text: "tick" });`;
+    const append = `return await step.run("notes.append", { text: "tick" });`;
 
     const first = await callTool(execute, { script: append });
-    const second = await callTool(execute, { script: append });
+    const second = await callTool(execute, { script: append, key: "again" });
 
     expect(first).toEqual({ ok: true, result: { count: 1 }, logs: [], truncated: false });
     expect(second).toEqual({ ok: true, result: { count: 2 }, logs: [], truncated: false });
@@ -308,23 +275,20 @@ describe("repeat a script on purpose", () => {
 });
 
 describe("report a refused approval", () => {
-  it.each([
-    { status: "denied", message: "Approval for notes.publish was denied" },
-    { status: "expired", message: "Approval for notes.publish expired" },
-  ] as const)(
-    "returns ok false with kind $status and records no effect",
-    async (testCase) => {
+  it.each(["denied", "expired"] as const)(
+    "returns ok false with kind %s and records no effect",
+    async (status) => {
       const { server, host } = await startDirectServer();
-      const owner = await admitOwningRun(server, `code-mode-${testCase.status}`);
+      const owner = await admitOwningRun(server, `code-mode-${status}`);
       const execute = executeToolFor(server, owner.run);
 
       const pending = callTool(execute, { script: PUBLISH });
       const approval = await awaitPendingApproval(server, owner.run.id);
-      await decide(server, approval, owner, testCase.status);
+      await decide(server, approval, owner, status);
 
-      expect(await pending).toEqual({
+      expect(await pending).toMatchObject({
         ok: false,
-        error: { kind: testCase.status, message: testCase.message, call: "notes.publish" },
+        error: { kind: status, call: "notes.publish", message: expect.any(String) },
         logs: [],
       });
       expect(host.published).toEqual([]);
@@ -392,10 +356,298 @@ describe("cancel script runs at run end", () => {
       logs: [],
     });
     expect(server.store.getRun(run.id)?.status).toBe("completed");
-    expect(server.scriptRunStore.listUnfinished(run.id)).toEqual([]);
+    expect(server.store.listPendingApprovalsForRun(run.id)).toEqual([]);
     expect(server.store.getApproval(approval.id)?.decision.status).toBe("expired");
   }, 60_000);
 });
+
+type DeclarationToken = {
+  readonly kind: "ident" | "string" | "punct" | "doc";
+  readonly value: string;
+};
+
+interface ParsedProperty {
+  readonly type: string;
+  readonly optional: boolean;
+  readonly doc: string;
+}
+
+type ParsedType = string | Readonly<Record<string, ParsedProperty>>;
+
+interface ParsedDeclaration {
+  readonly types: Readonly<Record<string, ParsedType>>;
+  readonly stepRun: {
+    readonly id: string;
+    readonly inputType: string;
+    readonly outputType: string;
+    readonly doc: string;
+  };
+}
+
+function cleanDocComment(raw: string): string {
+  return raw
+    .replace(/^\/\*\*?|\*\/$/g, "")
+    .replace(/^\/\//gm, "")
+    .replace(/^\s*\*\s?/gm, "")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function tokenizeDeclaration(source: string): DeclarationToken[] {
+  const tokens: DeclarationToken[] = [];
+  let index = 0;
+  while (index < source.length) {
+    const ch = source[index]!;
+    if (/\s/.test(ch)) {
+      index += 1;
+      continue;
+    }
+    if (ch === "/" && source[index + 1] === "*") {
+      const end = source.indexOf("*/", index + 2);
+      if (end < 0) {
+        throw new Error("Unterminated block comment in declaration");
+      }
+      tokens.push({ kind: "doc", value: cleanDocComment(source.slice(index, end + 2)) });
+      index = end + 2;
+      continue;
+    }
+    if (ch === "/" && source[index + 1] === "/") {
+      const end = source.indexOf("\n", index + 2);
+      const stop = end < 0 ? source.length : end;
+      tokens.push({ kind: "doc", value: cleanDocComment(source.slice(index, stop)) });
+      index = stop;
+      continue;
+    }
+    if (ch === '"' || ch === "'") {
+      let value = "";
+      index += 1;
+      while (index < source.length && source[index] !== ch) {
+        if (source[index] === "\\" && index + 1 < source.length) {
+          value += source[index + 1];
+          index += 2;
+        } else {
+          value += source[index];
+          index += 1;
+        }
+      }
+      if (source[index] !== ch) {
+        throw new Error("Unterminated string literal in declaration");
+      }
+      index += 1;
+      tokens.push({ kind: "string", value });
+      continue;
+    }
+    if (/[A-Za-z_$]/.test(ch)) {
+      let end = index + 1;
+      while (end < source.length && /[A-Za-z0-9_$]/.test(source[end]!)) {
+        end += 1;
+      }
+      tokens.push({ kind: "ident", value: source.slice(index, end) });
+      index = end;
+      continue;
+    }
+    tokens.push({ kind: "punct", value: ch });
+    index += 1;
+  }
+  return tokens;
+}
+
+function formatTypeTokens(tokens: readonly DeclarationToken[]): string {
+  const parts: string[] = [];
+  for (let i = 0; i < tokens.length; i += 1) {
+    const token = tokens[i]!;
+    if (token.kind === "doc") {
+      continue;
+    }
+    if (token.kind === "ident" && token.value === "Array" && tokens[i + 1]?.value === "<") {
+      let depth = 0;
+      let j = i + 1;
+      for (; j < tokens.length; j += 1) {
+        if (tokens[j]!.value === "<") depth += 1;
+        else if (tokens[j]!.value === ">") {
+          depth -= 1;
+          if (depth === 0) break;
+        }
+      }
+      const inner = formatTypeTokens(tokens.slice(i + 2, j));
+      parts.push(/[|&]/.test(inner) ? `(${inner})[]` : `${inner}[]`);
+      i = j;
+      continue;
+    }
+    if (token.kind === "string") {
+      parts.push(JSON.stringify(token.value));
+    } else if (token.value === "|" || token.value === "&") {
+      parts.push(` ${token.value} `);
+    } else if (token.value === ",") {
+      parts.push(", ");
+    } else {
+      parts.push(token.value);
+    }
+  }
+  return parts.join("");
+}
+
+function parseDeclaration(source: string): ParsedDeclaration {
+  const tokens = tokenizeDeclaration(source);
+  let pos = 0;
+  const peek = () => tokens[pos];
+  const take = () => {
+    const token = tokens[pos];
+    if (!token) {
+      throw new Error("Unexpected end of declaration");
+    }
+    pos += 1;
+    return token;
+  };
+  const takeDocs = () => {
+    const docs: string[] = [];
+    while (peek()?.kind === "doc") {
+      const value = take().value;
+      if (value.length > 0) {
+        docs.push(value);
+      }
+    }
+    return docs.join(" ");
+  };
+  const expectToken = (kind: DeclarationToken["kind"], value?: string) => {
+    const token = take();
+    if (token.kind !== kind || (value !== undefined && token.value !== value)) {
+      throw new Error(`Expected ${kind} ${value ?? ""}, got ${token.kind} ${token.value}`);
+    }
+    return token;
+  };
+  const readTypeTokens = (stops: ReadonlySet<string>): DeclarationToken[] => {
+    const collected: DeclarationToken[] = [];
+    let angle = 0;
+    let paren = 0;
+    let brace = 0;
+    let bracket = 0;
+    while (pos < tokens.length) {
+      const token = peek()!;
+      if (
+        angle === 0 &&
+        paren === 0 &&
+        brace === 0 &&
+        bracket === 0 &&
+        token.kind === "punct" &&
+        stops.has(token.value)
+      ) {
+        break;
+      }
+      take();
+      if (token.kind === "punct") {
+        if (token.value === "<") angle += 1;
+        else if (token.value === ">") angle -= 1;
+        else if (token.value === "(") paren += 1;
+        else if (token.value === ")") paren -= 1;
+        else if (token.value === "{") brace += 1;
+        else if (token.value === "}") brace -= 1;
+        else if (token.value === "[") bracket += 1;
+        else if (token.value === "]") bracket -= 1;
+      }
+      collected.push(token);
+    }
+    return collected;
+  };
+  const parseObjectType = (): Record<string, ParsedProperty> => {
+    expectToken("punct", "{");
+    const properties: Record<string, ParsedProperty> = {};
+    while (pos < tokens.length) {
+      const doc = takeDocs();
+      if (peek()?.kind === "punct" && peek()?.value === "}") {
+        take();
+        return properties;
+      }
+      const key = take();
+      if (key.kind !== "ident" && key.kind !== "string") {
+        throw new Error(`Unexpected property key ${key.kind} ${key.value}`);
+      }
+      let optional = false;
+      if (peek()?.kind === "punct" && peek()?.value === "?") {
+        take();
+        optional = true;
+      }
+      expectToken("punct", ":");
+      const type = formatTypeTokens(readTypeTokens(new Set([";", ",", "}"])));
+      if (peek()?.kind === "punct" && (peek()?.value === ";" || peek()?.value === ",")) {
+        take();
+      }
+      properties[key.value] = { type, optional, doc };
+    }
+    throw new Error("Unterminated object type in declaration");
+  };
+
+  const types: Record<string, ParsedType> = {};
+  let stepRun: ParsedDeclaration["stepRun"] | undefined;
+  while (pos < tokens.length) {
+    const doc = takeDocs();
+    if (pos >= tokens.length) {
+      break;
+    }
+    const lead = take();
+    if (lead.kind === "ident" && lead.value === "type") {
+      const name = expectToken("ident").value;
+      expectToken("punct", "=");
+      types[name] =
+        peek()?.kind === "punct" && peek()?.value === "{"
+          ? parseObjectType()
+          : formatTypeTokens(readTypeTokens(new Set([";"])));
+      if (peek()?.kind === "punct" && peek()?.value === ";") {
+        take();
+      }
+      continue;
+    }
+    if (lead.kind === "ident" && lead.value === "interface") {
+      const name = expectToken("ident").value;
+      types[name] = parseObjectType();
+      continue;
+    }
+    if (lead.kind === "ident" && lead.value === "declare") {
+      expectToken("ident", "const");
+      expectToken("ident", "step");
+      expectToken("punct", ":");
+      expectToken("punct", "{");
+      const memberDoc = takeDocs();
+      expectToken("ident", "run");
+      expectToken("punct", "(");
+      expectToken("ident");
+      expectToken("punct", ":");
+      const id = expectToken("string").value;
+      expectToken("punct", ",");
+      expectToken("ident");
+      expectToken("punct", ":");
+      const inputType = formatTypeTokens(readTypeTokens(new Set([",", ")"])));
+      if (peek()?.kind === "punct" && peek()?.value === ",") {
+        take();
+      }
+      expectToken("punct", ")");
+      expectToken("punct", ":");
+      expectToken("ident", "Promise");
+      expectToken("punct", "<");
+      const outputType = formatTypeTokens(readTypeTokens(new Set([">"])));
+      expectToken("punct", ">");
+      if (peek()?.kind === "punct" && (peek()?.value === ";" || peek()?.value === ",")) {
+        take();
+      }
+      expectToken("punct", "}");
+      if (peek()?.kind === "punct" && peek()?.value === ";") {
+        take();
+      }
+      stepRun = {
+        id,
+        inputType,
+        outputType,
+        doc: [doc, memberDoc].filter((part) => part.length > 0).join(" "),
+      };
+      continue;
+    }
+    throw new Error(`Unexpected token ${lead.kind} ${lead.value} in declaration`);
+  }
+  if (!stepRun) {
+    throw new Error("Declaration is missing step.run signature");
+  }
+  return { types, stepRun };
+}
 
 describe("search the catalog", () => {
   const archive = defineCapability({
@@ -405,7 +657,7 @@ describe("search the catalog", () => {
     output: z.object({ archived: z.boolean() }),
     effect: "write",
     approval: "none",
-    example: 'await der.notes.archive({ key: "a" })',
+    example: 'await step.run("notes.archive", { key: "a" })',
     async execute() {
       return { archived: true };
     },
@@ -413,28 +665,37 @@ describe("search the catalog", () => {
 
   it("returns the declaration and example of the one capability a query matches", async () => {
     const { server, host } = await startDirectServer({ extra: [archive] });
-    expect(server.scriptRuns).toBeDefined();
+    expect(server.scriptDriver).toBeDefined();
     const search = createSearchTool({ catalog: host.catalog, maxResultBytes: RESULT_BYTES });
 
-    expect(await search.execute!({ query: "archive" })).toEqual({
-      hits: [
-        {
-          id: "notes.archive",
-          summary: "Archive a note",
-          declaration: [
-            "type NotesArchiveInput = {",
-            "  key: string;",
-            "};",
-            "type NotesArchiveOutput = {",
-            "  archived: boolean;",
-            "};",
-            "/** Archive a note */",
-            "declare function der.notes.archive(input: NotesArchiveInput): Promise<NotesArchiveOutput>;",
-          ].join("\n"),
-          example: 'await der.notes.archive({ key: "a" })',
+    const result = (await search.execute!({ query: "archive" })) as {
+      hits: Array<{ id: string; summary: string; declaration: string; example?: string }>;
+      truncated: boolean;
+    };
+
+    expect(result.truncated).toBe(false);
+    expect(result.hits).toHaveLength(1);
+    const [hit] = result.hits;
+    expect(hit).toMatchObject({
+      id: "notes.archive",
+      summary: "Archive a note",
+      example: 'await step.run("notes.archive", { key: "a" })',
+    });
+    expect(parseDeclaration(hit!.declaration)).toEqual({
+      types: {
+        NotesArchiveInput: {
+          key: { type: "string", optional: false, doc: "" },
         },
-      ],
-      truncated: false,
+        NotesArchiveOutput: {
+          archived: { type: "boolean", optional: false, doc: "" },
+        },
+      },
+      stepRun: {
+        id: "notes.archive",
+        inputType: "NotesArchiveInput",
+        outputType: "NotesArchiveOutput",
+        doc: "Archive a note",
+      },
     });
   }, 60_000);
 
@@ -460,36 +721,149 @@ describe("search the catalog", () => {
 });
 
 describe("cap what execute hands back", () => {
-  it("cuts an oversized result to the byte budget and flags it truncated", async () => {
+  const bytes = (value: unknown) => new TextEncoder().encode(JSON.stringify(value)).byteLength;
+
+  it("fits a failed result with a long message and logs within the byte limit and flags cuts", async () => {
+    const { server } = await startDirectServer();
+    const owner = await admitOwningRun(server, "code-mode-truncate-error-long");
+
+    const result = await callTool(executeToolFor(server, owner.run, 256), {
+      script:
+        'console.log("a".repeat(60)); console.log("b".repeat(60)); throw new Error("y".repeat(400));',
+    });
+
+    expect(bytes(result)).toBeLessThanOrEqual(256);
+    expect(result).toMatchObject({ ok: false, error: { kind: "script" } });
+    if (!result.ok) {
+      expect(result.error.message).toContain("y".repeat(20));
+      expect(result.error.message).toMatch(/truncat/i);
+    }
+    expect(result.logs).not.toContain("a".repeat(60));
+    expect(result.logs.some((line) => /truncat/i.test(line))).toBe(true);
+  }, 60_000);
+
+  it("keeps fitting logs alongside a short error message within the byte limit and flags cut logs", async () => {
+    const { server } = await startDirectServer();
+    const owner = await admitOwningRun(server, "code-mode-truncate-error-logs");
+
+    const result = await callTool(executeToolFor(server, owner.run, 256), {
+      script:
+        'console.log("a".repeat(100)); console.log("b".repeat(100)); throw new Error("short");',
+    });
+
+    expect(bytes(result)).toBeLessThanOrEqual(256);
+    expect(result).toMatchObject({ ok: false, error: { kind: "script" } });
+    if (!result.ok) {
+      expect(result.error.message).toContain("short");
+      expect(result.error.message).not.toMatch(/truncat/i);
+    }
+    expect(result.logs).toContain("a".repeat(100));
+    expect(result.logs).not.toContain("b".repeat(100));
+    expect(result.logs.some((line) => /truncat/i.test(line))).toBe(true);
+  }, 60_000);
+
+  it("fits a call to a 70,000-character unknown capability into the default limit and flags truncation", async () => {
+    const { server } = await startDirectServer();
+    const owner = await admitOwningRun(server, "code-mode-truncate-call");
+
+    const result = await callTool(executeToolFor(server, owner.run), {
+      script: 'return await step.run("notes." + "z".repeat(70_000), {});',
+    });
+
+    expect(bytes(result)).toBeLessThanOrEqual(RESULT_BYTES);
+    expect(result).toMatchObject({ ok: false, error: { kind: "capability" }, logs: [] });
+    if (!result.ok) {
+      expect(result.error.message).toContain("notes.z");
+      expect(result.error.message).toMatch(/truncat/i);
+    }
+  }, 60_000);
+
+  it("cuts an oversized result to the byte budget, keeps original content, and flags it truncated", async () => {
     const { server } = await startDirectServer();
     const owner = await admitOwningRun(server, "code-mode-truncate");
 
-    const result = await callTool(executeToolFor(server, owner.run, 20), {
-      script: `return "x".repeat(100);`,
+    const result = await callTool(executeToolFor(server, owner.run, 256), {
+      script: `return "x".repeat(400);`,
     });
 
-    expect(result).toEqual({
-      ok: true,
-      result: `"${"x".repeat(19)}`,
-      logs: [],
-      truncated: true,
-    });
+    expect(bytes(result)).toBeLessThanOrEqual(256);
+    expect(result).toMatchObject({ ok: true, truncated: true, logs: [] });
+    expect(
+      result.ok && typeof result.result === "string" && result.result.includes("x".repeat(20)),
+    ).toBe(true);
   }, 60_000);
+
+  it("refuses a result limit below the minimum", () => {
+    expect(() => boundResult({ ok: true, result: "ok", logs: [], truncated: false }, 255)).toThrow(
+      RangeError,
+    );
+  });
 });
 
 describe("describe the tools to the model", () => {
-  it("lists each namespace on one line and states the script rules", async () => {
+  it("lists each namespace's members on one line and conveys safe retry and repeat-key rules", () => {
     const host = createNoteHost();
 
     const text = codeModeInstructions(host.catalog);
-
-    expect(text).toContain("- notes: append, publish, read");
-    expect(text).toContain("`await` every call");
-    expect(text).toContain(
-      "- Modules and `import` are not available. `eval` and `Function` are unavailable. There are no timers.",
+    const lines = text.split("\n");
+    const notesLine = lines.find(
+      (line) => /\bnotes\b/.test(line) && /\bappend\b/.test(line) && /\bpublish\b/.test(line),
     );
-    expect(text).toContain("`Date`, `Math.random` and `performance.now` return recorded values");
-  }, 60_000);
+    const sentences = text.split(/(?<=[.!?])\s+|\n+/);
+
+    expect(notesLine).toBeDefined();
+    expect(notesLine).toMatch(/\bread\b/);
+    expect(text).toMatch(/execute\([^)]*\bkey\??[^)]*\)/);
+    expect(
+      sentences.some((sentence) => /\bstep\.run\b/.test(sentence) && /\bawait\b/.test(sentence)),
+    ).toBe(true);
+    expect(
+      sentences.some(
+        (sentence) =>
+          /\bsame\s+script\b/i.test(sentence) &&
+          /\b(same\s+execution|reattach)\b/i.test(sentence) &&
+          !/\b(new|fresh|separate|another)\s+execution\b/i.test(sentence),
+      ),
+    ).toBe(true);
+    const interruptedSentences = sentences.filter((sentence) =>
+      /\b(cut\s+off|interrupt\w*|abort\w*|disconnect\w*|lost)\b/i.test(sentence),
+    );
+    expect(interruptedSentences.length).toBeGreaterThan(0);
+    expect(
+      interruptedSentences.every(
+        (sentence) =>
+          /\bsame\s+script\b/i.test(sentence) &&
+          /\bkey\b/i.test(sentence) &&
+          /\b(same\s+execution|that\s+execution|existing\s+execution|stored\s+result|reattach\w*|resume\w*|recover\w*)\b/i.test(
+            sentence,
+          ) &&
+          !/\b(new|fresh|separate|another)\s+execution\b/i.test(sentence),
+      ),
+    ).toBe(true);
+    expect(
+      sentences.some(
+        (sentence) =>
+          /\b(on\s+purpose|intentionally|again)\b/i.test(sentence) &&
+          /\bnew\s+`?key`?\b/i.test(sentence),
+      ),
+    ).toBe(true);
+    expect(
+      sentences.some(
+        (sentence) =>
+          /\b(failed|finished)\b/i.test(sentence) &&
+          /\b(retry|retrying|repeat)\b/i.test(sentence) &&
+          /\bnew\s+`?key`?\b/i.test(sentence),
+      ),
+    ).toBe(true);
+    expect(
+      sentences.some(
+        (sentence) =>
+          /\b(retry|retrying|same\s+script|cut\s+off|interrupt\w*|abort\w*)\b/i.test(sentence) &&
+          /\b(new|fresh|separate|another)\s+execution\b/i.test(sentence) &&
+          !/\bnew\s+`?key`?\b/i.test(sentence),
+      ),
+    ).toBe(false);
+  });
 });
 
 describe("give the engine its host tools", () => {
@@ -531,14 +905,14 @@ describe("drive a fixture capability through the execute tool", () => {
     });
 
     const approval = await awaitPendingApproval(server, run.id);
-    const [scriptRun] = server.scriptRunStore.listUnfinished(run.id);
+    const scriptRunId = approval.awakeable.slice("script:".length);
 
     expect(approval.effect).toEqual({
       runId: run.id,
       operationKind: "capability",
       operationId: "fixture.apply",
       canonicalArguments: { target: "lamp-1", mode: "apply" },
-      attemptId: `${scriptRun!.id}:1`,
+      attemptId: `${scriptRunId}:1`,
     });
     expect(fixture.applied).toEqual([]);
 
@@ -551,7 +925,7 @@ describe("drive a fixture capability through the execute tool", () => {
     expect(fixture.applied).toEqual([
       {
         operationId: "fixture.apply",
-        attemptId: `${scriptRun!.id}:1`,
+        attemptId: `${scriptRunId}:1`,
         runId: run.id,
         canonicalArguments: { target: "lamp-1", mode: "apply" },
       },

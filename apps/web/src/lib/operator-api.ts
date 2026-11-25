@@ -311,12 +311,21 @@ export function createOperatorApi(options: OperatorApiOptions = {}): OperatorApi
       );
       return data.runs;
     },
-    getRun(runId, signal) {
-      return requestJson(
+    async getRun(runId, signal) {
+      const detail = await requestJson(
         `/api/runs/${encodeURIComponent(runId)}`,
         runDetailResponseSchema,
         signalOpt(signal),
       );
+      return {
+        ...detail,
+        approvals:
+          detail.approvals.length > 0
+            ? detail.approvals
+            : detail.approval === null
+              ? []
+              : [detail.approval],
+      };
     },
     async decideApproval(approvalId, input, signal) {
       const data = await requestJson(

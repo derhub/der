@@ -1,7 +1,17 @@
 import * as z from "zod";
-import { CapabilityCatalog, defineCapability, type Capability, type Run } from "@der/domain";
+import {
+  CapabilityCatalog,
+  defineCapability,
+  formatUtcTimestamp,
+  type Approval,
+  type Capability,
+  type Run,
+} from "@der/domain";
 import { createFixtureCapabilities, type FixtureCall } from "#capabilities/fixture";
 import type { RunningServer } from "#main";
+import { openSqliteScriptStore, openSqliteStore } from "@der/storage";
+import { ScriptDriver, type ScriptDriverDeps } from "#scripts/script-driver";
+import { createTempDatabase } from "./restate-harness";
 
 export interface NoteHost {
   readonly catalog: CapabilityCatalog;
@@ -96,11 +106,86 @@ export async function submitScript(
   owner: { readonly run: Run; readonly botId: string },
   source: string,
 ) {
-  const { scriptRun } = await server.scriptRunStore.acquire({
+  const scriptRun = server.scriptRunStore.acquire({
     runId: owner.run.id,
     botId: owner.botId,
     source,
+    seed: 1,
   });
-  await server.scriptRuns!.submit(scriptRun.id);
+  await server.scriptDriver.kick(scriptRun.id);
   return scriptRun;
+}
+
+export async function openScriptFixture() {
+  const database = createTempDatabase("der-script-driver-");
+  const host = createNoteHost();
+  let time = Date.parse("2026-11-24T01:00:00Z");
+  const now = () => new Date(time);
+  const open = () => openSqliteStore({ filename: database.dbPath, now });
+  const store = open();
+  const bot = store.createBot({
+    id: "bot-script",
+    name: "Script",
+    persona: "Test bot",
+    defaultEngine: "fixture",
+    allowedEngines: ["fixture"],
+  });
+  const session = store.createSession({ id: "session-script", botId: bot.id, title: "Script" });
+  const { run } = await store.admit({
+    botId: bot.id,
+    sessionId: session.id,
+    origin: "http",
+    idempotencyKey: "script-driver",
+    input: { parts: [{ type: "text", text: "script" }] },
+  });
+  const openDriver = (
+    databaseStore = store,
+    limits?: Partial<ScriptDriverDeps["limits"]>,
+    options: Pick<ScriptDriverDeps, "writeCancelGraceMs" | "onRunFinished" | "deliverEvents"> = {},
+  ) => {
+    const scripts = openSqliteScriptStore({ database: databaseStore.database });
+    const driver = new ScriptDriver({
+      store: databaseStore,
+      scripts,
+      bots: databaseStore,
+      catalog: host.catalog,
+      limits: {
+        memoryBytes: 64 * 1024 * 1024,
+        activeMs: 5_000,
+        maxAll: 1000,
+        maxInFlight: 2000,
+        maxSteps: 2000,
+        outputBytes: 1024 * 1024,
+        ...limits,
+      },
+      approvalTimeoutMs: 5_000,
+      sweepIntervalMs: 1000,
+      now,
+      ...options,
+    });
+    const acquire = (source: string) =>
+      scripts.acquire({ runId: run.id, botId: bot.id, source, seed: 1 });
+    return { scripts, driver, acquire };
+  };
+  const decide = (approval: Approval, status: "approved" | "denied") => ({
+    approvalId: approval.id,
+    botId: bot.id,
+    sessionId: session.id,
+    runId: run.id,
+    status,
+    actor: "operator",
+    decidedAt: formatUtcTimestamp(now()),
+  });
+  return {
+    database,
+    host,
+    store,
+    run,
+    open,
+    openDriver,
+    decide,
+    advance: (ms: number) => {
+      time += ms;
+    },
+  };
 }

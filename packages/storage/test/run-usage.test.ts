@@ -46,9 +46,10 @@ async function runToCompletion(
   });
   await store.finishRun({
     runId: run.id,
-    status: "completed",
-    terminalEvent: { chunkKey: `${run.id}:terminal`, chunk: { type: "RUN_FINISHED" } },
-    ...(usage !== undefined ? { usage } : {}),
+    end: {
+      kind: "complete",
+      ...(usage !== undefined ? { usage } : {}),
+    },
   });
   return run.id;
 }

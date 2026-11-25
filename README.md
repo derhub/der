@@ -5,94 +5,96 @@ Self-hosted personal coworker platform built on [Bun](https://bun.sh), [SQLite](
 ## Workspace layout
 
 - `packages/domain` (`@der/domain`): Zod 4.6.7 schemas, compiled boundary parsers, W3C and open-format protocol modules (CloudEvents v1.0, RFC 9457 Problem Details, RFC 3339 UTC timestamps, W3C SSE), narrow storage ports, `WorkflowDriver` / `RunCoordinator` interfaces, and `defineCapability` / `defineIntegration` / `IntegrationRegistry` / `Catalog` / `OutboxSink` contracts.
-- `packages/storage` (`@der/storage`): SQLite WAL store implementing the domain storage ports, migrations, replay log, effect ledger, Script run records (`packages/storage/src/script-runs.ts`), Memory Markdown projection, Routine slots, and transactional CloudEvents outbox.
+- `packages/storage` (`@der/storage`): SQLite WAL store implementing the domain storage ports, migrations, replay log, effect ledger, the SQLite `ScriptStore` adapter, session events, Memory Markdown projection, Routine slots, and transactional CloudEvents outbox.
 - `packages/runtime` (`@der/runtime`): Hardened rootless Docker launcher, the Docker-hosted Wasmer sandbox behind `sandbox.wasmer`, the Script runner (`quickjs-emscripten` in a Bun Worker), TanStack AI official BYO engine harnesses (`@tanstack/ai-codex`, `@tanstack/ai-claude-code`, `@tanstack/ai-acp` for Codex, Claude Code, and Antigravity ACP) with live subprocess approval callbacks, doctor probes, context compaction, engine session resume, and Agent Skills catalog.
 - `integrations/mcp` (`@der/mcp`): Allowlisted MCP integration exported via `defineIntegration`; each remote MCP tool becomes an `mcp.<server>.<tool>` capability.
-- `apps/server` (`@der/server`): Singleton Bun server hosting the Hono HTTP/SSE operator API, unified `RunCoordinator`, Restate and direct `WorkflowDriver` implementations, the host capabilities and the `search` / `execute` tools, the `ScriptWorkflow` Restate workflow, `RoutineSchedule` Virtual Object, and `OutboxSender`.
+- `apps/server` (`@der/server`): Singleton Bun server hosting the Hono HTTP/SSE operator API, unified `RunCoordinator`, Restate and direct `WorkflowDriver` implementations, the host capabilities and the `search` / `execute` tools, the Script driver, session event delivery, the `RoutineSchedule` Virtual Object, and `OutboxSender`.
 - `apps/web` (`@der/web`): Optional React 19 operator Web console built on `@astryxdesign/core`, `@astryxdesign/theme-neutral`, and `@stylexjs/stylex`.
 
 ## Architecture
 
 ### Narrow domain storage ports
 
-`packages/domain/src/interfaces/store.ts` splits persistence into six narrow ports composed by `Store`:
+`@der/domain` (`Store`) splits persistence into six narrow ports so server modules stay independent of SQLite wiring:
 
-- `BotStore`: bot CRUD (`createBot`, `getBot`, `listBots`, `updateBot`).
-- `SessionStore`: session CRUD and paginated message reads (`createSession`, `getSession`, `listSessions`, `listMessages`).
-- `RunStore`: idempotent run admission, status transitions, ordered event log, stream state, and replay (`admit`, `getRun`, `markRunRunning`, `appendRunEvents`, `getRunStreamState`, `readRunEventsAfter`, `replay`, `finishRun`).
-- `ApprovalEffectStore`: exact-operation approval requests, decisions, and effect ledger state transitions (`requestApproval`, `getApproval`, `getLatestApprovalForRun`, `decide`, `beginEffect`, `completeEffect`, `markEffectUnknown`, `getEffect`).
-- `OutboxStore`: durable outbox queries and delivery recording (`listOutboxEvents`, `listDueOutboxEvents`, `recordOutboxDelivery`).
-- `RoutineStore`: scheduled routine storage (`createRoutine`, `getRoutine`).
-
-`apps/server/src/http`, `apps/server/src/workflows`, and `apps/server/src/messaging` depend only on these narrow ports. Concrete SQLite wiring stays in `packages/storage` and `apps/server/src/main.ts`.
+- `BotStore`: bot configuration, capability policy, and event chain budget.
+- `SessionStore`: sessions and paginated messages.
+- `RunStore`: idempotent run admission, status transitions, ordered stream log, and replay. One lifecycle owner (`run-lifecycle` in `@der/storage`) owns every Run status transition and writes the single terminal stream chunk when a Run finishes, first writer wins. Normal stream appends cannot carry terminal chunks, so an engine stream cannot contradict the stored Run status.
+- `ApprovalEffectStore`: exact-operation approval requests, decisions, and effect ledger transitions.
+- `OutboxStore`: durable outbox queries and delivery recording.
+- `RoutineStore`: scheduled routine storage.
 
 ### Capability catalog and integrations
 
-Everything an agent can do on the host is a capability: a typed, namespaced function with an input schema, an output schema, an effect class (`read` or `write`) and an approval policy. Capabilities live in one `Catalog` (`packages/domain/src/interfaces/capability.ts`). Integrations contribute to it; agents reach it only through the `search` and `execute` tools described below. The full integration API, with a worked example, is in [docs/integration-api.md](docs/integration-api.md).
+Everything an agent can do on the host is a capability: a typed, namespaced function with Zod input and output schemas, an effect class (`read` or `write`), and a default approval rule that each bot's policy can override. Integrations contribute capabilities to one `Catalog` (`@der/domain`); agents reach it only through `search` and `execute`. See [docs/integration-api.md](docs/integration-api.md) for the authoring overview and worked example.
 
-- `defineCapability`: declares one capability (`id`, `description`, Zod `input` and `output`, `effect`, `approval` `"none" | "always" | predicate`, optional `example`, `execute`). Ids are dot-separated identifiers with a namespace (`memory.write`). A `read` cannot require approval.
-- `defineIntegration`: declares a lifecycle-managed integration (`id`, `setup(ctx)`) returning an `IntegrationContribution` of static `capabilities`, a dynamic `listCapabilities`, `outboxSinks`, and optional `start` / `stop` hooks.
-- `IntegrationRegistry`: owns the `Catalog`. It rejects duplicate integration IDs, duplicate capability IDs and duplicate `OutboxSink` kinds with a `409` `DomainError`. The catalog validates input against the capability's schema before `execute` and parses the output after it.
-- `OutboxSink`: delivery-only outbound contract (`kind`, `deliver(destination, event)`) consumed by `OutboxSender` (`apps/server/src/messaging/outbox-sender.ts`). When no sink is registered for a destination or a destination is disabled, due outbox rows remain durably retained in SQLite. Transient delivery failures retry with exponential backoff (`DER_OUTBOX_POLL_INTERVAL_MS`, `DER_OUTBOX_INITIAL_BACKOFF_MS`, `DER_OUTBOX_MAX_BACKOFF_MS`).
+- `defineCapability`: declares one capability. Ids are dot-separated with a namespace (`memory.write`). A `read` cannot require approval; a capability's `approval` rule is the default, overridable by [Per-bot policy](#per-bot-policy).
+- `defineIntegration`: declares a lifecycle-managed integration contributing static capabilities, dynamic capabilities discovered on startup, and optional `OutboxSink`s.
+- `IntegrationRegistry`: owns the `Catalog`, rejects duplicate integration, capability, or sink registrations, and validates inputs and outputs against capability schemas.
+- `OutboxSink`: delivery-only outbound contract consumed by `OutboxSender`. Undelivered outbox rows remain durably retained in SQLite and retry transient failures with exponential backoff.
 
-`GET /api/capabilities` returns the catalog as `{ capabilities }`, each entry with `id`, `description`, `effect`, `requiresApproval`, `inputSchema`, `outputSchema` and `example`. The web console lists it on the Readiness tab.
+`GET /api/capabilities` exposes the catalog (schemas, effect class, default approval, example), which the web console lists on the Readiness tab.
 
-The `host` integration (`apps/server/src/main.ts`, `apps/server/src/capabilities/`) contributes:
+The `host` integration contributes:
 
 - `memory.read`, `skills.list`, `skills.read`, `sessions.list`, `sessions.messages`, `routines.list`, `catalog.search`: reads, no approval.
-- `memory.write`, `routines.create`, `routines.update`, `sandbox.docker`, `sandbox.wasmer`: writes, approval on every call.
+- `memory.write`, `routines.create`, `routines.update`, `sandbox.docker`, `sandbox.wasmer`: writes, approval on every call by default.
 - `fixture.apply`, `fixture.uncertain`: writes with approval, registered only when the `fixture` engine is enabled or `DER_SEED_FIXTURE=true`.
-- `mcp.<server>.<tool>`: one capability per tool of each server in `DER_MCP_SERVERS_JSON`, registered by `@der/mcp`. Server id and tool name are sanitised to identifier characters. Each is a `write`; it requires approval unless the tool is listed in the server's `readOnlyTools` or the server sets `defaultRequiresApproval` to `false`.
+- `mcp.<server>.<tool>`: one write capability per allowed tool of each configured MCP server (`@der/mcp`), requiring approval by default unless marked read-only or opted out in server config.
 
 ### Code mode: `search` and `execute`
 
-An engine run receives exactly two tools (`apps/server/src/main.ts`), plus system instructions that describe them (`apps/server/src/code-mode/instructions.ts`):
+Every engine Run receives exactly two host tools, plus instructions describing them:
 
-- `search({ query })` returns TypeScript declarations, a one-line summary and an example for the capabilities that match, best match first (`apps/server/src/code-mode/search.ts`). Input shapes come from these declarations; the agent does not guess them.
-- `execute({ script })` runs a Script and blocks until it ends, including while an operator decides an Approval. It returns `{ ok: true, result, logs, truncated }` or `{ ok: false, error: { kind, message }, logs }` and never throws. `kind` is one of `script`, `denied`, `expired`, `limit`, `capability`, `cancelled`, `nondeterministic`.
+- `search({ query })` returns TypeScript declarations, summaries, and examples for matching capabilities so the agent works from real schemas rather than guessing input shapes.
+- `execute({ script, key? })` runs a sandboxed Script. If it finishes within the inline wait, `execute` returns the result directly; otherwise it returns `pending` with any proposed writes waiting on Approval and delivers the final outcome later as a session event. `execute` never throws.
 
-A Script is the body of an async function. It calls `await der.<namespace>.<name>(input)` and gives its result back with `return`:
+A Script is the body of an async function that invokes capabilities with `await step.run(id, input)` and returns plain JSON:
 
 ```js
-const { hits } = await der.catalog.search("append note");
-const { memory } = await der.memory.read({});
+const { hits } = await step.run("catalog.search", "append note");
+const { memory } = await step.run("memory.read", {});
 return { matches: hits.map((hit) => hit.id), memoryVersion: memory?.version ?? null };
 ```
 
-What a Script can and cannot reach:
+- `step.run(id, input)` starts a step immediately; steps started before the next `await` (or grouped via `step.all`, `step.allSettled`, or `Promise` combinators) run concurrently. Writes still apply one at a time in step order, so `await` writes sequentially when ordering matters.
+- A failed step, denied or expired Approval, or policy refusal rejects only that step's promise. Catching it lets the Script continue; an uncaught or unobserved rejection fails the Script. Earlier writes stay applied; nothing rolls back.
+- Scripts run in `quickjs-emscripten` inside an empty-environment Bun Worker with no network, filesystem, process env, timers, modules, `eval`, or `Function`. Clock and randomness derive from recorded execution inputs so re-runs are deterministic. (`sandbox.wasmer` is a separate capability, not the Script engine.)
+- Server config (`Config` in `apps/server`) bounds steps, in-flight calls, guest CPU time, guest memory, guest output, serialized result size, inline wait, sweep cadence, and approval timeout. Hitting a limit stops the Script and reports which writes already applied. Serialized results cross one size boundary (`result-boundary` in `apps/server`) for both inline `execute` responses and event Run payloads.
 
-- It reaches capabilities and nothing else. It runs in `quickjs-emscripten` inside a Bun Worker started with an empty environment (`packages/runtime/src/script/script-runner.ts`, `script-worker.ts`). There is no network, filesystem, process environment or timer.
-- Modules and `import` are not available, and `eval` and `new Function` are unavailable; using them fails as a `script` error (`packages/runtime/src/script/guest-prelude.ts`).
-- `Date`, `Math.random` and `performance.now` return recorded values, so a replayed Script sees the same ones. A Script must not branch on them.
-- Wasmer is not part of the Script engine. It backs only the `sandbox.wasmer` capability.
+### Script execution
 
-Limits are server config (`apps/server/src/config.ts`):
+Script state lives behind `ScriptStore` (SQLite adapter), driven under a lease by `ScriptDriver` so only one driver advances an execution at a time. Restate drives agent Runs and routines, not Scripts; `DER_RESTATE_MODE` does not change Script execution.
 
-- `DER_SCRIPT_MAX_CALLS` (default `100`): capability calls per Script. The next call ends the Script with kind `limit`.
-- `DER_SCRIPT_ACTIVE_MS` (default `30000`): time spent running guest code. Time spent waiting for a capability call or an Approval does not count.
-- `DER_SCRIPT_MEMORY_BYTES` (default `268435456`): memory limit of the guest.
-- `DER_SCRIPT_OUTPUT_BYTES` (default `1048576`): total bytes the guest sends to the host (logs, call inputs and the result).
-- `DER_SCRIPT_RESULT_BYTES` (default `65536`): size cap on what `execute`, `search` and `catalog.search` hand back to the agent. A larger `execute` result is cut and flagged `truncated: true`; logs past the cap are dropped; `search` keeps at least one hit.
-- `DER_APPROVAL_TIMEOUT_MS` (default `300000`): how long an Approval waits before it expires, which ends the Script with kind `expired`. A denial ends it with kind `denied`.
+- **No write twice:** each step is validated against the catalog before it is stored and run. Completed reads cache their result with the step and replay it on resume (an interrupted read with no recorded result re-runs, so reads must have no side effects); writes apply once through the effect ledger. A write whose outcome is unknown (crash mid-call or unexpected host error) is never repeated: the execution ends `in_doubt`, an active owning Run is interrupted, and further writes in that Run are blocked while doubt remains.
+- **Same key, same execution:** within a Run, an execution is identified by Script text and optional `key` (absent and empty match). Calling `execute` again with the same Script and key reattaches while running and returns the stored result once finished, so reattaching after a vendor tool timeout (such as Codex's default timeout) never repeats writes. Pass a new `key` to run the same Script again intentionally.
+- **Resume is a re-run:** after a restart or Approval decision, the Script runs from the top in a fresh sandbox and replays stored step results in their original delivery order. Diverging from stored steps or hitting a changed or removed capability stops the execution without applying further writes.
+- **Denial stops one step:** writes waiting on Approval at the same point are requested together; denying or expiring one rejects only that step so independent work can proceed.
+- **Run end and pending detachment:** ending a Run cancels unfinished Scripts that have not returned `pending` and expires their pending Approvals. A Script that already returned `pending` continues running independently after its Run ends.
 
-### Scripts are durable workflows
+### Per-bot policy
 
-Each `execute` call creates a `ScriptRun` bound to the calling Run (`packages/storage/src/script-runs.ts`). With `DER_RESTATE_MODE=restate` it runs as the Restate workflow `ScriptWorkflow` (`apps/server/src/scripts/script-workflow.ts`, `script-execution.ts`):
+A bot's `capabilityPolicy` maps a capability id or dotted namespace to `allow`, `ask`, or `deny`. The most specific match wins (exact id, then longest namespace, then the capability's default `approval`). A read set to `ask` still runs without prompting; `deny` refuses the step without invoking it. Policy is recorded when a step is first stored, so later policy edits affect only new steps. Policy is configured via the bot API or the web console; agents have no capability to edit policy.
 
-- Every capability call is a journaled step. After a server restart the guest starts again from the top and finished calls return their recorded results, together with the recorded clock and random seed, so the Script continues where it stopped.
-- A `write` call records an Effect (operation kind `capability`) before it runs. A completed Effect returns its recorded outcome instead of running again. If the outcome of a write is unknown, the Script ends with a `capability` error and status `interrupted`.
-- If the model's `execute` call is cut off, calling `execute` again with the identical Script re-attaches to the same ScriptRun and returns its result. After that result has been delivered, the same Script starts a new ScriptRun: repeating a Script on purpose works.
-- One Script runs at a time per Run. While a ScriptRun is running or waiting for an Approval, `execute` with a different Script returns `ok: false` and calls nothing; the identical Script attaches to the running one.
-- A call a Script issues without `await` is carried to its recorded outcome before the result is reported, unless the Script already hit a limit or was cancelled; a `capability`, `denied`, `expired` or `cancelled` error from it becomes the result.
-- If a write's outcome is unknown, the Run is interrupted with `effect.outcome_uncertain` and no further Script runs in it.
-- A Script ends with its Run. When the Run finishes, unfinished ScriptRuns are cancelled and their pending Approvals expire.
-- A Script that does not replay the same calls on resume fails with kind `nondeterministic`.
-- With `DER_RESTATE_MODE=direct` there is no journal. A ScriptRun left running by the previous process is marked `interrupted` at startup and is not resumed; a write of it that had begun counts as a write in doubt, so the next Script in that Run interrupts the Run.
-- der does not change Codex's tool timeout, so Codex may end a long `execute` call before a pending Approval is decided; calling `execute` again with the same Script returns the result.
+`PATCH /api/bots/:botId`:
+
+```json
+{ "capabilityPolicy": { "memory.write": "allow", "mcp": "ask", "sandbox": "deny" } }
+```
+
+### Pending Scripts and events
+
+When `execute` returns `pending`, the Script keeps running and records a `script.finished` session event on completion. Event delivery turns queued events into `event`-origin Runs:
+
+- Events wait while the session has an active Run and deliver oldest first once the session is idle.
+- **Chain budget resets on human messages:** a per-bot `eventChainLimit` caps consecutive event Runs so event chains cannot loop indefinitely. Only a human-started Run (`http`, `web`, or `telegram`) resets the count; routine Runs do not. Excess events stay queued until a human Run runs.
+- Event Run messages cross the same result-size boundary as inline `execute` results, preserving the outcome and accounting for unknown-outcome writes.
+- Event Runs cannot be posted through the HTTP API and pass the same unattended eligibility gate as routine Runs.
+- **Direct-mode recovery:** every active Run has a driver. Direct startup recovers active Runs from an exhaustive engine, origin, status, and attempt-outcome table: Script Runs resume, engine Runs that already persisted an attempt outcome settle from that outcome (completed or failed), unfinished queued engine Runs start, and unfinished started engine Runs (which hold no live engine state in direct mode) end `interrupted` so the session's next event can deliver. An engine failure or stream rejection ends the Run as failed through the lifecycle owner and runs the same finish hook.
 
 ### Script routines
 
-A Routine carries either a `prompt` or a `script` (`packages/domain/src/schemas/routine.ts`). Create one with `POST /api/bots/:botId/routines` and a `script` field instead of `prompt`, or update it with `PATCH /api/routines/:routineId`; the `routines.create` and `routines.update` capabilities take the same fields. A script routine fires a Run with engine `script`: the Script runs as above, no engine adapter starts, and no unattended-terms check applies. The Script's result becomes the assistant message (`Script result: <json>`), and a failed Script fails the Run with code `script.<kind>`. Writes that need approval ask for an Approval on every firing. The `script` engine cannot be chosen on the chat and run routes; only a Routine firing selects it.
+A Routine carries either a `prompt` or a `script`. A script routine fires a Run with engine `script`: no engine adapter starts, no unattended-terms check applies, and writes requiring approval per bot policy ask on each firing. The `script` engine can only be triggered by a Routine, not through chat or run routes.
 
 ### Session resume
 
@@ -114,6 +116,8 @@ A memory or skill edit reaches a resumed session with the next user message. A r
 
 - Restate driver (`apps/server/src/workflows/restate-workflows.ts`, `DER_RESTATE_MODE=restate`): durable step execution (`ctx.run`), awakeable-backed approval waits, and the `RoutineSchedule` Virtual Object (`apps/server/src/workflows/routine-schedule.ts`).
 - Direct driver (`apps/server/src/workflows/direct-workflow.ts`, `DER_RESTATE_MODE=direct`): thin in-process driver over the same `RunCoordinator` for local development and fast test runs without a Restate server.
+
+These drivers carry agent Runs and routines. Scripts run on the Script driver in both modes.
 
 ### Hono HTTP/SSE server and wire standards
 
@@ -144,9 +148,9 @@ Key base settings:
 - `DER_ALLOWED_ORIGINS`: Comma-separated canonical `http(s)` origins permitted for mutating JSON requests.
 - `DER_SKILLS_HOST_DIR`: Host directory mounted read-only to `/data/skills` (default `./docker/skills`).
 - `DER_SEED_FIXTURE`: Set to `true` only to seed the credential-free `fixture` Bot and Session.
-- `DER_RESTATE_MODE`: `restate` (default) for durable Restate workflows or `direct` for in-process execution.
+- `DER_RESTATE_MODE`: `restate` for durable Restate workflows of agent Runs and routines, or `direct` for in-process execution (see `Config` in `apps/server`). It does not change how a Script runs.
 - `DER_OUTBOX_POLL_INTERVAL_MS`, `DER_OUTBOX_INITIAL_BACKOFF_MS`, `DER_OUTBOX_MAX_BACKOFF_MS`: Outbox polling interval and exponential backoff bounds.
-- `DER_SCRIPT_MAX_CALLS`, `DER_SCRIPT_ACTIVE_MS`, `DER_SCRIPT_MEMORY_BYTES`, `DER_SCRIPT_OUTPUT_BYTES`, `DER_SCRIPT_RESULT_BYTES`, `DER_APPROVAL_TIMEOUT_MS`: Script limits and Approval wait; defaults are under [Code mode](#code-mode-search-and-execute).
+- Script execution limits, inline wait, sweep interval, result cap, and approval timeout: see `Config` in `apps/server` (`config.ts`).
 - `DER_MEMORY_PROMPT_MAX_BYTES`: Size cap of the memory text in the system prompt (default `24000`, minimum `1024`). Longer text ends with a `[truncated: the rest is available through the memory capability]` line.
 - `DER_SKILL_CATALOG_MAX_BYTES`: Same cap for the skill catalog (default `8000`, minimum `1024`).
 - `DER_CONTEXT_MAX_TOKENS`: Token budget a rebuilt conversation is compacted to (default `32000`).
@@ -221,7 +225,3 @@ Ensure `DER_ALLOWED_ORIGINS` includes the Web UI's canonical origin.
 bun run test
 docker compose -f docker-compose.yml -f docker-compose.web.yml config --quiet
 ```
-
-## Contributor notes
-
-Do not import through a `src` path (`../src/...`, `@der/domain/src/...`). The lint rule `no-restricted-imports` in `vite.config.ts` rejects any specifier matching `(^|/)src(/|$)`. Import a package by name (`@der/<pkg>`), `apps/server` by its `#` imports map (`"#*": "./src/*.ts"` in `apps/server/package.json`), and `apps/web` by the `@/` alias.

@@ -3,42 +3,66 @@ import {
   newVariant,
   RELEASE_SYNC,
   type QuickJSDeferredPromise,
+  type QuickJSHandle,
 } from "quickjs-emscripten";
-import { GUEST_PRELUDE } from "./guest-prelude";
+import { GUEST_STEP } from "./guest-step";
 
-export interface ScriptWorkerInit {
+export interface SessionInit {
+  readonly type: "session-init";
   readonly script: string;
   readonly seed: number;
   readonly now: number;
   readonly memoryBytes: number;
   readonly activeMs: number;
+  readonly maxAll: number;
+  readonly outputBytes?: number;
   readonly stop: SharedArrayBuffer;
 }
 
-export interface ScriptWorkerReply {
-  readonly call: number;
+export interface SessionReply {
+  readonly position: number;
   readonly ok: boolean;
   readonly value?: unknown;
   readonly error?: { readonly kind: string; readonly message: string };
-  readonly now?: number | undefined;
 }
 
-export interface ScriptWorkerFailure {
-  readonly hostCall?: unknown;
-  readonly message?: unknown;
-  readonly line?: unknown;
+export interface SessionDeliver {
+  readonly type: "deliver";
+  readonly replies: readonly SessionReply[];
 }
 
-export type ScriptWorkerMessage =
-  | { readonly type: "log"; readonly text: string }
-  | { readonly type: "call"; readonly call: number; readonly id: string; readonly input: unknown }
+export interface SessionRequest {
+  readonly position: number;
+  readonly id: string;
+  readonly input: string;
+}
+
+export interface SessionEnded {
+  readonly ok: boolean;
+  readonly text?: string;
+  readonly error?: {
+    readonly message: string;
+    readonly kind: string;
+    readonly step?: number;
+    readonly capability?: string;
+  };
+}
+
+export type SessionOut =
   | {
-      readonly type: "done";
-      readonly result?: unknown;
-      readonly error?: ScriptWorkerFailure;
-      readonly limit?: "memory" | "time";
+      readonly type: "drained";
+      readonly requests: SessionRequest[];
+      readonly orphans: number[];
+      readonly ended: SessionEnded | null;
+      readonly unobserved: { n: number; kind: string; message: string }[];
+      readonly fatal?: { readonly kind: string; readonly message: string };
+      readonly logs: string[];
     }
-  | { readonly type: "fatal"; readonly code: string; readonly message: string };
+  | {
+      readonly type: "dead";
+      readonly limit?: "time" | "memory" | "output";
+      readonly message?: string;
+    };
 
 declare const self: Worker;
 
@@ -50,6 +74,8 @@ const WASM_OVERHEAD_BYTES = 32 * 1024 * 1024;
 const OUT_OF_MEMORY = "InternalError: out of memory";
 const WASM_OUT_OF_BOUNDS = "RuntimeError: Out of bounds memory access";
 const STOP_REQUESTED = 1;
+/** Charged per log entry on top of its text: its JSON quotes and comma, so empty entries still count. */
+const LOG_ENTRY_BYTES = 3;
 
 // The engine renders local time through the worker's Date; pinning it to UTC keeps a Script's
 // date strings independent of the host timezone.
@@ -85,13 +111,22 @@ for (const unit of [
 UtcDate.prototype.getTimezoneOffset = () => 0;
 globalThis.Date = UtcDate as DateConstructor;
 
-function post(message: ScriptWorkerMessage): void {
+function decodeJsonString(raw: string): string {
+  try {
+    const parsed: unknown = JSON.parse(raw);
+    return typeof parsed === "string" ? parsed : String(parsed);
+  } catch {
+    return raw;
+  }
+}
+
+function postSession(message: SessionOut): void {
   self.postMessage(JSON.stringify(message));
 }
 
-let onReply: (reply: ScriptWorkerReply) => void = () => {};
+let onDeliver: (message: SessionDeliver) => void = () => {};
 
-async function run(init: ScriptWorkerInit): Promise<void> {
+async function startSession(init: SessionInit): Promise<void> {
   const pages = Math.min(
     WASM_MAX_PAGES,
     Math.max(
@@ -108,13 +143,22 @@ async function run(init: ScriptWorkerInit): Promise<void> {
   const stop = new Int32Array(init.stop);
   const pending = new Map<number, QuickJSDeferredPromise>();
 
+  let queue: SessionRequest[] = [];
+  let ended: SessionEnded | null = null;
+  let fatal: { kind: string; message: string } | undefined;
+  let logs: string[] = [];
+  let orphans: number[] = [];
   let activeUsed = 0;
   let activeSince: number | undefined;
   let timedOut = false;
-  let finished = false;
+  let dead = false;
+  // Log text lives outside the guest heap, so it is capped here, not only by the host.
+  const encoder = new TextEncoder();
+  let logBytes = 0;
+  let outputFull = false;
 
   runtime.setInterruptHandler(() => {
-    if (Atomics.load(stop, 0) === STOP_REQUESTED) {
+    if (Atomics.load(stop, 0) === STOP_REQUESTED || outputFull) {
       return true;
     }
     if (
@@ -137,16 +181,17 @@ async function run(init: ScriptWorkerInit): Promise<void> {
     }
   };
 
-  const finish = (message: ScriptWorkerMessage): void => {
-    if (!finished) {
-      finished = true;
-      post(message);
+  const die = (error: unknown): void => {
+    if (dead) {
+      return;
     }
-  };
-
-  const finishWithEngineError = (error: unknown): void => {
+    dead = true;
+    if (outputFull) {
+      postSession({ type: "dead", limit: "output" });
+      return;
+    }
     if (timedOut) {
-      finish({ type: "done", limit: "time" });
+      postSession({ type: "dead", limit: "time" });
       return;
     }
     const detail = error as { name?: unknown; message?: unknown } | null;
@@ -159,111 +204,164 @@ async function run(init: ScriptWorkerInit): Promise<void> {
       message === OUT_OF_MEMORY ||
       message.startsWith(WASM_OUT_OF_BOUNDS)
     ) {
-      finish({ type: "done", limit: "memory" });
+      postSession({ type: "dead", limit: "memory" });
     } else {
-      finish({ type: "done", error: { message } });
+      postSession({ type: "dead", message });
     }
   };
 
-  const drainJobs = (): void => {
+  const request = vm.newFunction("request", (position, id, input) => {
+    const deferred = vm.newPromise();
+    const ordinal = vm.getNumber(position);
+    pending.set(ordinal, deferred);
+    queue.push({
+      position: ordinal,
+      id: decodeJsonString(vm.getString(id)),
+      input: vm.getString(input),
+    });
+    return deferred.handle;
+  });
+  const end = vm.newFunction("end", (text) => {
+    const outcome = JSON.parse(vm.getString(text)) as SessionEnded;
+    if (timedOut) {
+      die(null);
+    } else if (!outcome.ok && outcome.error?.message === OUT_OF_MEMORY) {
+      die({ name: "InternalError", message: "out of memory" });
+    } else {
+      ended = outcome;
+    }
+  });
+  const fatalNative = vm.newFunction("fatal", (kind, message) => {
+    fatal ??= { kind: vm.getString(kind), message: decodeJsonString(vm.getString(message)) };
+  });
+  const log = vm.newFunction("log", (text) => {
+    if (outputFull) {
+      return;
+    }
+    const line = decodeJsonString(vm.getString(text));
+    logBytes += LOG_ENTRY_BYTES + encoder.encode(line).byteLength;
+    if (init.outputBytes !== undefined && logBytes > init.outputBytes) {
+      outputFull = true;
+      return;
+    }
+    logs.push(line);
+  });
+
+  const drain = (): void => {
     const jobs = inGuest(() => runtime.executePendingJobs());
     if (jobs.error) {
       const dumped: unknown = vm.dump(jobs.error);
       jobs.error.dispose();
-      finishWithEngineError(dumped);
-    } else if (!finished && pending.size === 0) {
-      finish({ type: "done", error: { message: "script ended without a result" } });
+      die(dumped);
     }
   };
 
-  const log = vm.newFunction("log", (text) => {
-    post({ type: "log", text: vm.getString(text) });
-  });
-  const call = vm.newFunction("call", (ordinal, id, input) => {
-    const deferred = vm.newPromise();
-    const number = vm.getNumber(ordinal);
-    pending.set(number, deferred);
-    post({
-      type: "call",
-      call: number,
-      id: vm.getString(id),
-      input: JSON.parse(vm.getString(input)),
-    });
-    return deferred.handle;
-  });
-  const done = vm.newFunction("done", (outcome) => {
-    const parsed = JSON.parse(vm.getString(outcome)) as {
-      result?: unknown;
-      error?: ScriptWorkerFailure;
-    };
-    if (timedOut) {
-      finish({ type: "done", limit: "time" });
-    } else if (parsed.error?.message === OUT_OF_MEMORY) {
-      finish({ type: "done", limit: "memory" });
-    } else {
-      finish({
-        type: "done",
-        ...(parsed.result === undefined ? {} : { result: parsed.result }),
-        ...(parsed.error === undefined ? {} : { error: parsed.error }),
-      });
+  let audit: QuickJSHandle | undefined;
+  const unobservedSteps = (): { n: number; kind: string; message: string }[] => {
+    if (ended === null || audit === undefined) {
+      return [];
     }
-  });
+    const result = vm.unwrapResult(inGuest(() => vm.callFunction(audit!, vm.undefined)));
+    const text = vm.getString(result);
+    result.dispose();
+    return JSON.parse(text) as { n: number; kind: string; message: string }[];
+  };
 
-  onReply = (reply) => {
-    const deferred = pending.get(reply.call);
-    if (finished || deferred === undefined) {
+  const report = (): void => {
+    if (outputFull) {
+      die(null);
+    }
+    if (dead) {
       return;
     }
-    pending.delete(reply.call);
-    try {
-      const text = vm.newString(JSON.stringify(reply));
-      deferred.resolve(text);
-      text.dispose();
-      drainJobs();
-      deferred.dispose();
-    } catch (error) {
-      finishWithEngineError(error);
-    }
+    const unobserved = unobservedSteps();
+    postSession({
+      type: "drained",
+      requests: queue,
+      orphans,
+      ended,
+      unobserved,
+      ...(fatal === undefined ? {} : { fatal }),
+      logs,
+    });
+    queue = [];
+    orphans = [];
+    logs = [];
   };
 
   try {
-    const prelude = vm.unwrapResult(vm.evalCode(GUEST_PRELUDE, "prelude.js"));
+    const prelude = vm.unwrapResult(vm.evalCode(GUEST_STEP, "guest-step.js"));
+    const limits = vm.unwrapResult(
+      vm.evalCode(`({ maxAll: ${Number(init.maxAll)} })`, "limits.js"),
+    );
     const args = [
+      request,
+      end,
+      fatalNative,
       log,
-      call,
-      done,
       vm.newNumber(init.seed),
       vm.newNumber(init.now),
       vm.newString(init.script),
+      limits,
     ];
     const started = inGuest(() => vm.callFunction(prelude, vm.undefined, ...args));
     prelude.dispose();
-    for (const handle of args) {
+    for (const handle of args.slice(4)) {
       handle.dispose();
     }
     if (started.error) {
       const dumped: unknown = vm.dump(started.error);
       started.error.dispose();
-      finishWithEngineError(dumped);
+      die(dumped);
       return;
     }
-    started.value.dispose();
-    drainJobs();
+    audit = started.value;
+    drain();
+    report();
   } catch (error) {
-    finishWithEngineError(error);
+    die(error);
   }
+
+  onDeliver = (message) => {
+    if (dead) {
+      return;
+    }
+    try {
+      const settled: QuickJSDeferredPromise[] = [];
+      for (const reply of message.replies) {
+        const deferred = pending.get(reply.position);
+        if (deferred === undefined) {
+          orphans.push(reply.position);
+          continue;
+        }
+        pending.delete(reply.position);
+        const text = vm.newString(
+          JSON.stringify(
+            reply.ok ? { ok: true, value: reply.value } : { ok: false, error: reply.error },
+          ),
+        );
+        deferred.resolve(text);
+        text.dispose();
+        settled.push(deferred);
+      }
+      drain();
+      for (const deferred of settled) {
+        deferred.dispose();
+      }
+      report();
+    } catch (error) {
+      die(error);
+    }
+  };
 }
 
-self.onmessage = (event: MessageEvent<ScriptWorkerInit | ScriptWorkerReply>) => {
-  if ("script" in event.data) {
-    run(event.data).catch((error: unknown) => {
-      post({
-        type: "fatal",
-        code: "script.engine_start_failed",
-        message: error instanceof Error ? error.message : String(error),
-      });
-    });
-  } else {
-    onReply(event.data);
+self.onmessage = (event: MessageEvent<SessionInit | SessionDeliver>) => {
+  const data = event.data;
+  if (data.type === "deliver") {
+    onDeliver(data);
+    return;
   }
+  startSession(data).catch((error: unknown) => {
+    postSession({ type: "dead", message: error instanceof Error ? error.message : String(error) });
+  });
 };

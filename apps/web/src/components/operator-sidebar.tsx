@@ -23,12 +23,42 @@ import {
   typographyVars,
 } from "@astryxdesign/core/theme/tokens.stylex";
 import * as stylex from "@stylexjs/stylex";
-import { BotIcon, MessageSquareIcon, PencilIcon, PlusIcon } from "lucide-react";
-import { useState, type FormEvent } from "react";
-import type { Bot, EngineKind, ProblemDetails, Session } from "@der/domain";
+import { useMutation, useQueryClient } from "@tanstack/react-query";
+import { BotIcon, MessageSquareIcon, PencilIcon, PlusIcon, Trash2Icon } from "lucide-react";
+import { useRef, useState, type FormEvent } from "react";
+import type {
+  Bot,
+  CapabilityPolicy,
+  CreateBotInput,
+  EngineKind,
+  PolicyDecision,
+  ProblemDetails,
+  Session,
+  UpdateBotInput,
+} from "@der/domain";
 import { ProblemAlert } from "@/components/problem-alert";
-import type { OperatorApi } from "@/lib/operator-api";
+import { consoleQueryKeys } from "@/lib/console-queries";
+import type { CreateSessionPayload, OperatorApi } from "@/lib/operator-api";
 import { toOperatorProblem } from "@/lib/schemas";
+
+interface PolicyRow {
+  readonly id: number;
+  readonly selector: string;
+  readonly decision: PolicyDecision;
+}
+
+const POLICY_DECISION_OPTIONS = [
+  { value: "allow", label: "allow" },
+  { value: "ask", label: "ask" },
+  { value: "deny", label: "deny" },
+];
+
+function policyFromRows(rows: readonly PolicyRow[]): CapabilityPolicy {
+  const entries = rows
+    .map(({ selector, decision }) => [selector.trim(), decision] as const)
+    .filter(([selector]) => selector.length > 0);
+  return Object.fromEntries(entries);
+}
 
 const styles = stylex.create({
   sidebar: {
@@ -253,6 +283,11 @@ const styles = stylex.create({
     flexWrap: "wrap",
     gap: spacingVars["--spacing-3"],
   },
+  policyRow: {
+    display: "flex",
+    alignItems: "center",
+    gap: spacingVars["--spacing-2"],
+  },
   monoControl: {
     fontFamily: typographyVars["--font-family-code"],
     fontSize: textSizeVars["--font-size-sm"],
@@ -295,6 +330,8 @@ export function OperatorSidebar({
   onSessionCreated,
   onAnnounce,
 }: OperatorSidebarProps) {
+  const queryClient = useQueryClient();
+
   const [botDialogOpen, setBotDialogOpen] = useState(false);
   const [editingBot, setEditingBot] = useState<Bot | null>(null);
   const [botName, setBotName] = useState("");
@@ -302,16 +339,87 @@ export function OperatorSidebar({
   const [botDefaultEngine, setBotDefaultEngine] = useState<EngineKind>("fixture");
   const [botAllowedEngines, setBotAllowedEngines] = useState<EngineKind[]>(["fixture"]);
   const [botWorkspacePath, setBotWorkspacePath] = useState("");
-  const [botSaving, setBotSaving] = useState(false);
+  const [policyRows, setPolicyRows] = useState<PolicyRow[]>([]);
+  const nextPolicyRowId = useRef(0);
   const [botProblem, setBotProblem] = useState<ProblemDetails | null>(null);
 
   const [sessionDialogOpen, setSessionDialogOpen] = useState(false);
   const [sessionTitle, setSessionTitle] = useState("");
   const [sessionEngine, setSessionEngine] = useState<string>("default");
-  const [sessionSaving, setSessionSaving] = useState(false);
   const [sessionProblem, setSessionProblem] = useState<ProblemDetails | null>(null);
 
   const selectedBot = bots.find((entry) => entry.id === selectedBotId) ?? null;
+
+  const saveBotMutation = useMutation({
+    mutationFn: (
+      variables:
+        | { readonly editingBotId: string; readonly input: UpdateBotInput }
+        | { readonly editingBotId: null; readonly input: CreateBotInput },
+    ) =>
+      variables.editingBotId !== null
+        ? api.updateBot(variables.editingBotId, variables.input)
+        : api.createBot(variables.input),
+    onSuccess: async (saved, variables) => {
+      const key = consoleQueryKeys.bots();
+      await queryClient.cancelQueries({ queryKey: key });
+      queryClient.setQueryData<Bot[]>(key, (prev) => {
+        if (!prev) {
+          return [saved];
+        }
+        return prev.some((entry) => entry.id === saved.id)
+          ? prev.map((entry) => (entry.id === saved.id ? saved : entry))
+          : [...prev, saved];
+      });
+      onBotSaved(saved);
+      onAnnounce(
+        variables.editingBotId !== null
+          ? `Updated bot ${saved.name}.`
+          : `Created bot ${saved.name}.`,
+      );
+      setBotDialogOpen(false);
+    },
+    onError: (error, variables) => {
+      setBotProblem(
+        toOperatorProblem(
+          error,
+          variables.editingBotId !== null ? `/api/bots/${variables.editingBotId}` : "/api/bots",
+        ),
+      );
+    },
+  });
+
+  const createSessionMutation = useMutation({
+    mutationFn: ({
+      botId,
+      input,
+    }: {
+      readonly botId: string;
+      readonly input: CreateSessionPayload;
+    }) => api.createSession(botId, input),
+    onSuccess: async (created) => {
+      const key = consoleQueryKeys.sessions(created.botId);
+      await queryClient.cancelQueries({ queryKey: key });
+      const hadList = queryClient.getQueryData<Session[]>(key) !== undefined;
+      queryClient.setQueryData<Session[]>(key, (prev) => {
+        if (!prev) {
+          return [created];
+        }
+        return prev.some((entry) => entry.id === created.id) ? prev : [...prev, created];
+      });
+      if (!hadList) {
+        void queryClient.invalidateQueries({ queryKey: key });
+      }
+      onSessionCreated(created);
+      onAnnounce(`Created session ${created.title}.`);
+      setSessionDialogOpen(false);
+    },
+    onError: (error, variables) => {
+      setSessionProblem(toOperatorProblem(error, `/api/bots/${variables.botId}/sessions`));
+    },
+  });
+
+  const botSaving = saveBotMutation.isPending;
+  const sessionSaving = createSessionMutation.isPending;
 
   function openCreateBot() {
     setEditingBot(null);
@@ -320,8 +428,18 @@ export function OperatorSidebar({
     setBotDefaultEngine("fixture");
     setBotAllowedEngines(["fixture"]);
     setBotWorkspacePath("");
+    setPolicyRows([]);
     setBotProblem(null);
     setBotDialogOpen(true);
+  }
+
+  function addPolicyRow(selector = "", decision: PolicyDecision = "ask"): PolicyRow {
+    nextPolicyRowId.current += 1;
+    return { id: nextPolicyRowId.current, selector, decision };
+  }
+
+  function updatePolicyRow(id: number, change: Partial<Omit<PolicyRow, "id">>) {
+    setPolicyRows((rows) => rows.map((row) => (row.id === id ? { ...row, ...change } : row)));
   }
 
   function openEditBot(target: Bot) {
@@ -331,6 +449,11 @@ export function OperatorSidebar({
     setBotDefaultEngine(target.defaultEngine);
     setBotAllowedEngines([...target.allowedEngines]);
     setBotWorkspacePath(target.workspacePath ?? "");
+    setPolicyRows(
+      Object.entries(target.capabilityPolicy).map(([selector, decision]) =>
+        addPolicyRow(selector, decision),
+      ),
+    );
     setBotProblem(null);
     setBotDialogOpen(true);
   }
@@ -351,43 +474,28 @@ export function OperatorSidebar({
     });
   }
 
-  async function handleBotSubmit(event: FormEvent) {
+  function handleBotSubmit(event: FormEvent) {
     event.preventDefault();
     if (botName.trim().length === 0) {
       return;
     }
-    setBotSaving(true);
     setBotProblem(null);
-    try {
-      const allowed = botAllowedEngines.includes(botDefaultEngine)
-        ? botAllowedEngines
-        : [...botAllowedEngines, botDefaultEngine];
-      const trimmedWorkspace = botWorkspacePath.trim();
-      const saved = editingBot
-        ? await api.updateBot(editingBot.id, {
-            name: botName.trim(),
-            persona: botPersona,
-            defaultEngine: botDefaultEngine,
-            allowedEngines: allowed,
-            ...(trimmedWorkspace.length > 0 ? { workspacePath: trimmedWorkspace } : {}),
-          })
-        : await api.createBot({
-            name: botName.trim(),
-            persona: botPersona,
-            defaultEngine: botDefaultEngine,
-            allowedEngines: allowed,
-            ...(trimmedWorkspace.length > 0 ? { workspacePath: trimmedWorkspace } : {}),
-          });
-      onBotSaved(saved);
-      onAnnounce(editingBot ? `Updated bot ${saved.name}.` : `Created bot ${saved.name}.`);
-      setBotDialogOpen(false);
-    } catch (error) {
-      setBotProblem(
-        toOperatorProblem(error, editingBot ? `/api/bots/${editingBot.id}` : "/api/bots"),
-      );
-    } finally {
-      setBotSaving(false);
-    }
+    const allowed = botAllowedEngines.includes(botDefaultEngine)
+      ? botAllowedEngines
+      : [...botAllowedEngines, botDefaultEngine];
+    const trimmedWorkspace = botWorkspacePath.trim();
+    const capabilityPolicy = policyFromRows(policyRows);
+    const input = {
+      name: botName.trim(),
+      persona: botPersona,
+      defaultEngine: botDefaultEngine,
+      allowedEngines: allowed,
+      capabilityPolicy,
+      ...(trimmedWorkspace.length > 0 ? { workspacePath: trimmedWorkspace } : {}),
+    };
+    saveBotMutation.mutate(
+      editingBot !== null ? { editingBotId: editingBot.id, input } : { editingBotId: null, input },
+    );
   }
 
   function openCreateSession() {
@@ -397,26 +505,19 @@ export function OperatorSidebar({
     setSessionDialogOpen(true);
   }
 
-  async function handleSessionSubmit(event: FormEvent) {
+  function handleSessionSubmit(event: FormEvent) {
     event.preventDefault();
     if (!selectedBot || sessionTitle.trim().length === 0) {
       return;
     }
-    setSessionSaving(true);
     setSessionProblem(null);
-    try {
-      const created = await api.createSession(selectedBot.id, {
+    createSessionMutation.mutate({
+      botId: selectedBot.id,
+      input: {
         title: sessionTitle.trim(),
         ...(sessionEngine !== "default" ? { engine: sessionEngine as EngineKind } : {}),
-      });
-      onSessionCreated(created);
-      onAnnounce(`Created session ${created.title}.`);
-      setSessionDialogOpen(false);
-    } catch (error) {
-      setSessionProblem(toOperatorProblem(error, `/api/bots/${selectedBot.id}/sessions`));
-    } finally {
-      setSessionSaving(false);
-    }
+      },
+    });
   }
 
   const allEngineOptions = ALL_ENGINES.map((kind) => ({ value: kind, label: kind }));
@@ -540,6 +641,14 @@ export function OperatorSidebar({
                         />
                         <span {...stylex.props(styles.truncate)}>{entry.title}</span>
                       </span>
+                      {entry.pendingEventCount ? (
+                        <span
+                          data-pending-events={entry.pendingEventCount}
+                          {...stylex.props(styles.engineTag)}
+                        >
+                          {entry.pendingEventCount} waiting
+                        </span>
+                      ) : null}
                       {entry.engine ? (
                         <span {...stylex.props(styles.engineTag)}>{entry.engine}</span>
                       ) : null}
@@ -633,6 +742,54 @@ export function OperatorSidebar({
                     width="100%"
                     controlXstyle={styles.monoControl}
                   />
+
+                  <fieldset {...stylex.props(styles.fieldset)}>
+                    <legend {...stylex.props(styles.legend)}>Capability policy</legend>
+                    <Text type="supporting" as="p">
+                      Set allow, ask or deny for a capability id or a namespace such as mcp.github.
+                      The most specific rule wins; no rule keeps the capability's own approval
+                      setting.
+                    </Text>
+                    {policyRows.map((row, index) => (
+                      <div key={row.id} {...stylex.props(styles.policyRow)}>
+                        <TextInput
+                          label={`Policy selector ${index + 1}`}
+                          isLabelHidden
+                          value={row.selector}
+                          onChange={(value) => updatePolicyRow(row.id, { selector: value })}
+                          placeholder="notes.publish or mcp.github"
+                          width="100%"
+                          controlXstyle={styles.monoControl}
+                        />
+                        <Selector
+                          label={`Policy decision ${index + 1}`}
+                          isLabelHidden
+                          value={row.decision}
+                          options={POLICY_DECISION_OPTIONS}
+                          onChange={(value) =>
+                            updatePolicyRow(row.id, { decision: value as PolicyDecision })
+                          }
+                          width="7rem"
+                        />
+                        <IconButton
+                          label={`Remove policy rule ${index + 1}`}
+                          icon={<Trash2Icon {...stylex.props(styles.iconSm)} aria-hidden="true" />}
+                          variant="ghost"
+                          size="sm"
+                          onClick={() =>
+                            setPolicyRows((rows) => rows.filter((r) => r.id !== row.id))
+                          }
+                        />
+                      </div>
+                    ))}
+                    <div>
+                      <Button
+                        variant="secondary"
+                        label="Add policy rule"
+                        onClick={() => setPolicyRows((rows) => [...rows, addPolicyRow()])}
+                      />
+                    </div>
+                  </fieldset>
                 </div>
               </LayoutContent>
             }

@@ -1,719 +1,792 @@
-import { afterAll, afterEach, beforeAll, describe, expect, it } from "bun:test";
+import { describe, expect, it } from "bun:test";
 import * as z from "zod";
 import {
   defineCapability,
+  fingerprintJson,
   formatUtcTimestamp,
-  type Capability,
-  type Engine,
-  type EngineEvent,
-  type EngineKind,
-  type Run,
+  type NewStep,
+  type StepOutcome,
 } from "@der/domain";
-import { createExecuteTool } from "#code-mode/execute";
-import { startServer, type RunningServer } from "#main";
-import {
-  allocateLocalTcpNumber,
-  createTempDatabase,
-  ensureLocalRestate,
-  registerRestateDeployment,
-  waitUntil,
-  type LocalRestateHandle,
-  type TempDatabaseHandle,
-} from "./fixtures/restate-harness";
-import {
-  admitOwningRun,
-  createNoteHost,
-  submitScript,
-  type NoteHost,
-} from "./fixtures/script-host";
+import { openScriptFixture } from "./fixtures/script-host";
 
-let restateHandle: LocalRestateHandle | undefined;
-const cleanups: (() => Promise<void> | void)[] = [];
+const source = `
+  const a = await step.run("notes.read", { key: "a" });
+  await step.run("notes.append", { text: a.value });
+  const b = await step.run("notes.read", { key: "b" });
+  await step.run("notes.append", { text: b.value });
+  return await step.run("notes.read", { key: "c" });
+`;
 
-beforeAll(async () => {
-  restateHandle = await ensureLocalRestate();
-}, 150_000);
+const scenario = [
+  { capability: "notes.read", effect: "read", input: { key: "a" }, result: { value: "value-a" } },
+  { capability: "notes.append", effect: "write", input: { text: "value-a" }, result: { count: 1 } },
+  { capability: "notes.read", effect: "read", input: { key: "b" }, result: { value: "value-b" } },
+  { capability: "notes.append", effect: "write", input: { text: "value-b" }, result: { count: 2 } },
+  { capability: "notes.read", effect: "read", input: { key: "c" }, result: { value: "value-c" } },
+] as const;
 
-afterEach(async () => {
-  while (cleanups.length > 0) {
-    await cleanups.pop()!();
-  }
-});
-
-afterAll(async () => {
-  await restateHandle?.stop();
-}, 30_000);
-
-async function startRestateServer(
-  tempDb: TempDatabaseHandle,
-  restateListen: number,
-  host: NoteHost,
-  seedFixture: boolean,
-  extra: {
-    readonly approvalTimeoutMs?: number;
-    readonly engines?: ReadonlyMap<EngineKind, Engine>;
-  } = {},
-): Promise<RunningServer> {
-  const restate = restateHandle!;
-  const server = await startServer({
-    config: {
-      host: "127.0.0.1",
-      port: 0,
-      restateHost: "127.0.0.1",
-      restateListen,
-      restateIngressUrl: restate.ingressUrl,
-      restateAdminUrl: restate.adminUrl,
-      restateMode: "restate",
-      databasePath: tempDb.dbPath,
-      memoryProjectionDir: `${tempDb.dir}/memory`,
-      skillsRootDir: `${tempDb.dir}/skills`,
-      workspaceRootDir: `${tempDb.dir}/workspaces`,
-      enabledEngines: ["fixture"],
-      approvalTimeoutMs: extra.approvalTimeoutMs ?? 120_000,
-      seedFixture,
-    },
-    catalog: host.catalog,
-    ...(extra.engines === undefined ? {} : { engines: extra.engines }),
-  });
-  await registerRestateDeployment(restate.adminUrl, server.restateUrl!, { force: true });
-  return server;
-}
-
-describe("recover a script run across a server restart", () => {
-  it("restart: a script run parked on an approval completes after approval with every earlier call executed once", async () => {
-    const tempDb = createTempDatabase("der-script-recovery-");
-    cleanups.push(() => tempDb.cleanup());
-    const restateListen = await allocateLocalTcpNumber();
-    const host = createNoteHost();
-
-    let first: RunningServer | undefined = await startRestateServer(
-      tempDb,
-      restateListen,
-      host,
-      true,
-    );
-    cleanups.push(async () => {
-      await first?.close();
-    });
-    const owner = await admitOwningRun(first, "recovery-1");
-    const scriptRun = await submitScript(
-      first,
-      owner,
-      `
-        const a = await der.notes.read({ key: "a" });
-        const b = await der.notes.read({ key: "b" });
-        const published = await der.notes.publish({ text: a.value + b.value });
-        const c = await der.notes.read({ key: "c" });
-        return { published, c: c.value };
-      `,
-    );
-
-    const approval = await waitUntil(
-      async () => {
-        const latest = first!.store.getLatestApprovalForRun(owner.run.id);
-        return latest?.decision.status === "pending" ? latest : false;
-      },
-      { timeoutMs: 60_000, label: "pending approval before restart" },
-    );
-    expect(host.reads).toEqual(["a", "b"]);
-    expect(host.published).toEqual([]);
-
-    const closing = first;
-    first = undefined;
-    await closing.close();
-    const replacement = await startRestateServer(tempDb, restateListen, host, false);
-    cleanups.push(() => replacement.close());
-
-    await replacement.coordinator.decide({
-      approvalId: approval.id,
-      botId: owner.botId,
-      sessionId: owner.sessionId,
-      runId: owner.run.id,
-      status: "approved",
-      actor: "operator",
-      decidedAt: formatUtcTimestamp(new Date()),
-    });
-    const result = await replacement.scriptRuns!.attach(scriptRun.id, AbortSignal.timeout(90_000));
-
-    expect(result).toEqual({
-      ok: true,
-      result: { published: { published: true }, c: "value-c" },
-      logs: [],
-      truncated: false,
-    });
-    expect(host.reads).toEqual(["a", "b", "c"]);
-    expect(host.published).toEqual(["value-avalue-b"]);
-    expect(
-      replacement.store.getEffect({ ...approval.effect, operationKind: "capability" })?.status,
-    ).toBe("completed");
-    expect(replacement.scriptRunStore.get(scriptRun.id)?.status).toBe("completed");
-  }, 240_000);
-
-  it("predicate: an approval rule that answers differently after a restart still follows its first answer", async () => {
-    const tempDb = createTempDatabase("der-script-predicate-");
-    cleanups.push(() => tempDb.cleanup());
-    const restateListen = await allocateLocalTcpNumber();
-    const host = createNoteHost();
-    const applied: string[] = [];
-    let evaluations = 0;
-    host.catalog.add(
-      defineCapability({
-        id: "ledger.post",
-        description: "Post an entry",
-        input: z.object({ text: z.string() }),
-        output: z.object({ posted: z.boolean() }),
-        effect: "write",
-        approval: () => {
-          evaluations += 1;
-          return evaluations === 1;
-        },
-        async execute(input) {
-          applied.push(input.text);
-          return { posted: true };
-        },
-      }) as unknown as Capability,
-    );
-
-    let first: RunningServer | undefined = await startRestateServer(
-      tempDb,
-      restateListen,
-      host,
-      true,
-    );
-    cleanups.push(async () => {
-      await first?.close();
-    });
-    const owner = await admitOwningRun(first, "recovery-predicate");
-    const scriptRun = await submitScript(
-      first,
-      owner,
-      `return der.ledger.post({ text: "entry" });`,
-    );
-    const approval = await awaitPendingApproval(first, owner.run.id);
-
-    const closing = first;
-    first = undefined;
-    await closing.close();
-    const replacement = await startRestateServer(tempDb, restateListen, host, false);
-    cleanups.push(() => replacement.close());
-    await replacement.coordinator.decide({
-      approvalId: approval.id,
-      botId: owner.botId,
-      sessionId: owner.sessionId,
-      runId: owner.run.id,
-      status: "approved",
-      actor: "operator",
-      decidedAt: formatUtcTimestamp(new Date()),
-    });
-    const result = await replacement.scriptRuns!.attach(scriptRun.id, AbortSignal.timeout(90_000));
-
-    expect(result).toEqual({ ok: true, result: { posted: true }, logs: [], truncated: false });
-    expect(applied).toEqual(["entry"]);
-  }, 240_000);
-});
-
-describe("replay a script against its journal", () => {
-  it("deterministic: a script branching on Date.now and Math.random across ten calls completes without a journal mismatch", async () => {
-    const tempDb = createTempDatabase("der-script-deterministic-");
-    cleanups.push(() => tempDb.cleanup());
-    const host = createNoteHost();
-    const server = await startRestateServer(tempDb, await allocateLocalTcpNumber(), host, true);
-    cleanups.push(() => server.close());
-    const owner = await admitOwningRun(server, "deterministic-1");
-
-    const scriptRun = await submitScript(
-      server,
-      owner,
-      `
-        const keys = [];
-        for (let i = 0; i < 10; i++) {
-          const key = (Math.random() < 0.5 ? "lo" : "hi") + "-" + (Date.now() % 1000);
-          keys.push((await der.notes.read({ key })).value);
+describe("recover Scripts from SQLite", () => {
+  it.each([
+    { position: 1, phase: "registered" },
+    { position: 1, phase: "completed" },
+    { position: 1, phase: "delivered" },
+    { position: 2, phase: "registered" },
+    { position: 2, phase: "ledger" },
+    { position: 2, phase: "completed" },
+    { position: 2, phase: "delivered" },
+    { position: 3, phase: "registered" },
+    { position: 3, phase: "completed" },
+    { position: 3, phase: "delivered" },
+    { position: 4, phase: "registered" },
+    { position: 4, phase: "ledger" },
+    { position: 4, phase: "completed" },
+    { position: 4, phase: "delivered" },
+    { position: 5, phase: "registered" },
+    { position: 5, phase: "completed" },
+    { position: 5, phase: "delivered" },
+  ])(
+    "resumes step $position at $phase without repeating a stored read or write",
+    async ({ position, phase }) => {
+      const fixture = await openScriptFixture();
+      const first = fixture.openDriver();
+      const execution = first.acquire(source);
+      let restarted: ReturnType<typeof fixture.open> | undefined;
+      let second: ReturnType<typeof fixture.openDriver> | undefined;
+      try {
+        const { scripts } = first;
+        for (const [index, entry] of scenario.slice(0, position).entries()) {
+          const n = index + 1;
+          const step: NewStep = {
+            position: n,
+            capability: entry.capability,
+            effect: entry.effect,
+            decision: "allow",
+            input: entry.input,
+            inputHash: await fingerprintJson(entry.input),
+          };
+          scripts.registerSteps(execution.id, [step]);
+          if (n === position && phase === "registered") break;
+          if (entry.effect === "write") {
+            fixture.host.appended.push(entry.input.text);
+            const begun = await fixture.store.beginEffect({
+              runId: fixture.run.id,
+              operationKind: "capability",
+              operationId: entry.capability,
+              canonicalArguments: entry.input,
+              attemptId: `${execution.id}:${n}`,
+            });
+            await fixture.store.completeEffect(begun.effect.id, { ok: true, value: entry.result });
+            if (n === position && phase === "ledger") break;
+          } else {
+            fixture.host.reads.push(entry.input.key);
+          }
+          scripts.completeStep(execution.id, n, { status: "done", result: entry.result });
+          if (n === position && phase === "completed") break;
+          scripts.markDelivered(execution.id, [n]);
         }
-        return keys;
-      `,
-    );
-    const result = await server.scriptRuns!.attach(scriptRun.id, AbortSignal.timeout(120_000));
+        await first.driver.close();
+        fixture.store.close();
 
-    expect(result.ok).toBe(true);
-    expect(host.reads).toHaveLength(10);
-    expect(result.ok && result.result).toEqual(host.reads.map((key) => `value-${key}`));
-  }, 180_000);
-});
+        restarted = fixture.open();
+        second = fixture.openDriver(restarted);
+        await second.driver.kick(execution.id);
 
-const PUBLISH = `return der.notes.publish({ text: "release" });`;
-
-function awaitPendingApproval(server: RunningServer, runId: string) {
-  return waitUntil(
-    async () => {
-      const latest = server.store.getLatestApprovalForRun(runId);
-      return latest?.decision.status === "pending" ? latest : false;
+        expect(second.scripts.load(execution.id).execution.result).toEqual({
+          ok: true,
+          result: { value: "value-c" },
+          logs: [],
+          truncated: false,
+        });
+        expect(fixture.host.reads).toEqual(["a", "b", "c"]);
+        expect(fixture.host.appended).toEqual(["value-a", "value-b"]);
+      } finally {
+        await first.driver.close();
+        await second?.driver.close();
+        (restarted ?? fixture.store).close();
+        fixture.database.cleanup();
+      }
     },
-    { timeoutMs: 60_000, label: "pending approval" },
   );
-}
 
-async function startOwned(
-  key: string,
-  extra: Parameters<typeof startRestateServer>[4] = {},
-): Promise<{
-  readonly server: RunningServer;
-  readonly host: NoteHost;
-  readonly owner: Awaited<ReturnType<typeof admitOwningRun>>;
-}> {
-  const tempDb = createTempDatabase("der-script-restate-");
-  const host = createNoteHost();
-  const server = await startRestateServer(
-    tempDb,
-    await allocateLocalTcpNumber(),
-    host,
-    true,
-    extra,
-  );
-  cleanups.push(async () => {
-    await server.close();
-    tempDb.cleanup();
-  });
-  return { server, host, owner: await admitOwningRun(server, key) };
-}
-
-describe("end a parked script run under Restate", () => {
-  it("cancel: a script run parked on an approval ends cancelled, expires the approval and records no effect", async () => {
-    const { server, host, owner } = await startOwned("restate-cancel");
-    const scriptRun = await submitScript(server, owner, PUBLISH);
-    const approval = await awaitPendingApproval(server, owner.run.id);
-
-    await server.scriptRuns!.cancel(scriptRun.id);
-    const result = await server.scriptRuns!.attach(scriptRun.id, AbortSignal.timeout(60_000));
-
-    expect(result).toEqual({
-      ok: false,
-      error: { kind: "cancelled", message: "script cancelled" },
-      logs: [],
-    });
-    expect(server.store.getApproval(approval.id)?.decision.status).toBe("expired");
-    expect(server.scriptRunStore.get(scriptRun.id)?.status).toBe("cancelled");
-    expect(host.published).toEqual([]);
-    expect(
-      server.store.getEffect({ ...approval.effect, operationKind: "capability" }),
-    ).toBeUndefined();
-  }, 120_000);
-
-  it("expired: an approval that times out fails the script run with kind expired and records no effect", async () => {
-    const { server, host, owner } = await startOwned("restate-expired", {
-      approvalTimeoutMs: 2_000,
-    });
-    const scriptRun = await submitScript(server, owner, PUBLISH);
-
-    const result = await server.scriptRuns!.attach(scriptRun.id, AbortSignal.timeout(90_000));
-
-    expect(result).toEqual({
-      ok: false,
-      error: {
-        kind: "expired",
-        message: "Approval for notes.publish expired",
-        call: "notes.publish",
+  it("does not repeat an ambiguous write, applies its sibling, and blocks a different execution's write", async () => {
+    const fixture = await openScriptFixture();
+    const first = fixture.openDriver();
+    const { id } = first.acquire(`
+      return await step.all([
+        step.run("notes.append", { text: "ambiguous" }),
+        step.run("notes.append", { text: "sibling" }),
+      ]);
+    `);
+    const input = { text: "ambiguous" };
+    first.scripts.registerSteps(id, [
+      {
+        position: 1,
+        capability: "notes.append",
+        effect: "write",
+        decision: "allow",
+        input,
+        inputHash: await fingerprintJson(input),
       },
-      logs: [],
-    });
-    expect(server.scriptRunStore.get(scriptRun.id)?.status).toBe("failed");
-    expect(host.published).toEqual([]);
-    const approval = server.store.getLatestApprovalForRun(owner.run.id)!;
-    expect(approval.decision.status).toBe("expired");
-    expect(
-      server.store.getEffect({ ...approval.effect, operationKind: "capability" }),
-    ).toBeUndefined();
-  }, 120_000);
-});
-
-describe("replay a write against the effects ledger under Restate", () => {
-  it("unknown: a started write with no recorded outcome interrupts the script run and the run without calling the capability", async () => {
-    const { server, host, owner } = await startOwned("restate-unknown");
-    const { scriptRun } = await server.scriptRunStore.acquire({
-      runId: owner.run.id,
-      botId: owner.botId,
-      source: `return der.notes.append({ text: "tick" });`,
-    });
+    ]);
     const effect = {
-      runId: owner.run.id,
+      runId: fixture.run.id,
       operationKind: "capability",
       operationId: "notes.append",
-      canonicalArguments: { text: "tick" },
-      attemptId: `${scriptRun.id}:1`,
+      canonicalArguments: input,
+      attemptId: `${id}:1`,
     } as const;
-    await server.store.beginEffect(effect);
+    await fixture.store.beginEffect(effect);
+    await first.driver.close();
+    fixture.store.close();
 
-    await server.scriptRuns!.submit(scriptRun.id);
-    const result = await server.scriptRuns!.attach(scriptRun.id, AbortSignal.timeout(90_000));
+    const reopened = fixture.open();
+    const second = fixture.openDriver(reopened);
+    try {
+      await second.driver.kick(id);
+      const { execution, steps } = second.scripts.load(id);
+      expect(execution.status).toBe("in_doubt");
+      expect(steps.map(({ status, seq }) => [status, seq])).toEqual([
+        ["unknown", null],
+        ["done", 1],
+      ]);
+      expect(reopened.getEffect(effect)?.status).toBe("unknown");
 
-    expect(result).toEqual({
-      ok: false,
-      error: {
-        kind: "capability",
-        message: `Effect capability:notes.append (${effect.attemptId}) had a prior started marker with uncertain outcome.`,
-      },
-      logs: [],
-    });
-    expect(host.appended).toEqual([]);
-    expect(server.store.getEffect(effect)?.status).toBe("unknown");
-    expect(server.store.getRun(owner.run.id)?.status).toBe("interrupted");
-    expect(server.scriptRunStore.get(scriptRun.id)?.status).toBe("interrupted");
-  }, 120_000);
-});
-
-describe("pick a script back up under Restate", () => {
-  it("attach: an aborted execute followed by the same script returns one result with one effect", async () => {
-    const { server, host, owner } = await startOwned("restate-attach");
-    const execute = createExecuteTool({
-      run: owner.run,
-      scriptRunStore: server.scriptRunStore,
-      scriptRuns: server.scriptRuns!,
-      maxResultBytes: 65_536,
-    });
-    const call = (signal: AbortSignal) => execute.execute!({ script: PUBLISH }, { signal });
-    const cut = new AbortController();
-
-    const first = call(cut.signal);
-    const approval = await awaitPendingApproval(server, owner.run.id);
-    cut.abort();
-    const aborted = await first;
-
-    expect(aborted).toEqual({
-      ok: false,
-      error: {
-        kind: "cancelled",
-        message:
-          "execute was aborted before the script finished; call execute with the same script to pick the run back up",
-      },
-      logs: [],
-    });
-    expect(server.store.getApproval(approval.id)?.decision.status).toBe("pending");
-
-    await server.coordinator.decide({
-      approvalId: approval.id,
-      botId: owner.botId,
-      sessionId: owner.sessionId,
-      runId: owner.run.id,
-      status: "approved",
-      actor: "operator",
-      decidedAt: formatUtcTimestamp(new Date()),
-    });
-    const second = await call(AbortSignal.timeout(90_000));
-
-    expect(second).toEqual({ ok: true, result: { published: true }, logs: [], truncated: false });
-    expect(host.published).toEqual(["release"]);
-    expect(
-      server.store.database.db
-        .query<{ n: number }, [string]>("SELECT COUNT(*) AS n FROM script_runs WHERE run_id = ?")
-        .get(owner.run.id)!.n,
-    ).toBe(1);
-  }, 150_000);
-});
-
-describe("end a run that owns a parked script under Restate", () => {
-  it("run end: a run that finishes cancels its parked script run and expires the approval", async () => {
-    let release!: () => void;
-    const gate = new Promise<void>((resolve) => {
-      release = resolve;
-    });
-    const gatedEngine: Engine = {
-      kind: "fixture",
-      async *run(run: Run): AsyncIterable<EngineEvent> {
-        yield {
-          type: "chunk",
-          chunkKey: `${run.id}:started`,
-          chunk: { type: "RUN_STARTED", threadId: run.sessionId, runId: run.id },
-        };
-        await gate;
-        yield { type: "completed" };
-      },
-    };
-    const tempDb = createTempDatabase("der-script-run-end-");
-    cleanups.push(() => tempDb.cleanup());
-    const host = createNoteHost();
-    const server = await startRestateServer(tempDb, await allocateLocalTcpNumber(), host, true, {
-      engines: new Map<EngineKind, Engine>([["fixture", gatedEngine]]),
-    });
-    cleanups.push(() => server.close());
-    const botId = server.seededFixture!.bot.id;
-    const { run } = await server.coordinator.admit({
-      botId,
-      sessionId: server.seededFixture!.session.id,
-      origin: "http",
-      idempotencyKey: "restate-run-end",
-      input: { parts: [{ type: "text", text: "owner" }] },
-    });
-    await waitUntil(async () => server.store.getRun(run.id)?.status === "running", {
-      timeoutMs: 30_000,
-      label: "run started",
-    });
-    const { scriptRun } = await server.scriptRunStore.acquire({
-      runId: run.id,
-      botId,
-      source: PUBLISH,
-    });
-    await server.scriptRuns!.submit(scriptRun.id);
-    const approval = await awaitPendingApproval(server, run.id);
-
-    release();
-    const result = await server.scriptRuns!.attach(scriptRun.id, AbortSignal.timeout(90_000));
-
-    expect(result).toEqual({
-      ok: false,
-      error: { kind: "cancelled", message: "script cancelled" },
-      logs: [],
-    });
-    await waitUntil(async () => server.store.getRun(run.id)?.status === "completed", {
-      timeoutMs: 30_000,
-      label: "run completed",
-    });
-    expect(server.scriptRunStore.listUnfinished(run.id)).toEqual([]);
-    expect(server.store.getApproval(approval.id)?.decision.status).toBe("expired");
-    expect(host.published).toEqual([]);
-  }, 150_000);
-});
-
-describe("end a script run that hits an unexpected failure under Restate", () => {
-  it("predicate throws: the call fails with kind capability and records no effect", async () => {
-    const { server, host, owner } = await startOwned("restate-predicate-throws");
-    const applied: string[] = [];
-    host.catalog.add(
-      defineCapability({
-        id: "ledger.post",
-        description: "Post an entry",
-        input: z.object({ text: z.string() }),
-        output: z.object({ posted: z.boolean() }),
-        effect: "write",
-        approval: () => {
-          throw new Error("rule broke");
+      const foreign = second.acquire('return await step.run("notes.append", { text: "foreign" });');
+      await second.driver.kick(foreign.id);
+      expect(second.scripts.load(foreign.id).execution.result).toMatchObject({
+        ok: false,
+        error: {
+          kind: "capability",
+          message: expect.stringContaining("notes.append"),
         },
-        async execute(input) {
-          applied.push(input.text);
-          return { posted: true };
+      });
+      expect(fixture.host.appended).toEqual(["sibling"]);
+    } finally {
+      await second.driver.close();
+      reopened.close();
+      fixture.database.cleanup();
+    }
+  });
+
+  it("skips saved writes and withdraws Approval when a requested input differs", async () => {
+    const fixture = await openScriptFixture();
+    const { scripts, driver, acquire } = fixture.openDriver();
+    try {
+      const { id } = acquire('return await step.run("notes.publish", { text: "changed" });');
+      const input = { text: "original" };
+      scripts.registerSteps(id, [
+        {
+          position: 1,
+          capability: "notes.publish",
+          effect: "write",
+          decision: "ask",
+          input,
+          inputHash: await fingerprintJson(input),
+          round: 1,
         },
-      }) as unknown as Capability,
-    );
-    const scriptRun = await submitScript(
-      server,
-      owner,
-      `return der.ledger.post({ text: "entry" });`,
-    );
+      ]);
+      const { approval } = await fixture.store.requestApproval({
+        id: `appr_${id}_1`,
+        botId: fixture.run.botId,
+        sessionId: fixture.run.sessionId,
+        runId: fixture.run.id,
+        effect: {
+          runId: fixture.run.id,
+          operationKind: "capability",
+          operationId: "notes.publish",
+          canonicalArguments: input,
+          attemptId: `${id}:1`,
+        },
+        awakeable: `script:${id}`,
+        deadline: formatUtcTimestamp(new Date("2026-11-24T02:00:00Z")),
+        prompt: "Publish original",
+      });
+      await driver.kick(id);
+      expect(scripts.load(id)).toMatchObject({
+        execution: {
+          status: "failed",
+          result: {
+            ok: false,
+            error: {
+              kind: "nondeterministic",
+              message: expect.any(String),
+            },
+          },
+        },
+        steps: [{ status: "skipped" }],
+      });
+      expect(fixture.store.getApproval(approval.id)?.decision.status).toBe("expired");
+      expect(fixture.host.published).toEqual([]);
+    } finally {
+      await driver.close();
+      fixture.store.close();
+      fixture.database.cleanup();
+    }
+  });
 
-    const result = await server.scriptRuns!.attach(scriptRun.id, AbortSignal.timeout(30_000));
+  it("replays six asynchronous branches in recorded order across different read completion orders", async () => {
+    const fixture = await openScriptFixture();
+    const first = fixture.openDriver();
+    const { id } = first.acquire(`
+      return await Promise.all(["a","b","c","d","e","f"].map(async (key) => {
+        const first = await step.run("notes.read", { key });
+        const second = await step.run("notes.read", { key: first.value });
+        return await step.run("notes.publish", { text: second.value });
+      }));
+    `);
+    try {
+      // The first wave completed in reverse branch order. Its undelivered next read
+      // is durable even though the restarted fixture would invoke reads in call order.
+      const initial = ["a", "b", "c", "d", "e", "f"];
+      const requests = await Promise.all(
+        initial.map(async (key, index): Promise<NewStep> => ({
+          position: index + 1,
+          capability: "notes.read",
+          effect: "read",
+          decision: "allow",
+          input: { key },
+          inputHash: await fingerprintJson({ key }),
+        })),
+      );
+      first.scripts.registerSteps(id, requests);
+      for (const [index, key] of initial.entries()) {
+        first.scripts.completeStep(id, index + 1, {
+          status: "done",
+          result: { value: `value-${key}` },
+        });
+      }
+      first.scripts.markDelivered(id, [6, 5, 4]);
+      for (const [index, key] of ["value-e", "value-d"].entries()) {
+        const input = { key };
+        first.scripts.registerSteps(id, [
+          {
+            position: index + 8,
+            capability: "notes.read",
+            input,
+            inputHash: await fingerprintJson(input),
+            effect: "read",
+            decision: "allow",
+          },
+        ]);
+      }
+      first.scripts.markDelivered(id, [3, 2, 1]);
+      const input = { key: "value-f" };
+      first.scripts.registerSteps(id, [
+        {
+          position: 7,
+          capability: "notes.read",
+          input,
+          inputHash: await fingerprintJson(input),
+          effect: "read",
+          decision: "allow",
+        },
+      ]);
+      const outcome: StepOutcome = { status: "done", result: { value: "value-value-f" } };
+      first.scripts.completeStep(id, 7, outcome);
+      await first.driver.close();
 
-    expect(result).toEqual({
-      ok: false,
-      error: { kind: "capability", message: "rule broke", call: "ledger.post" },
-      logs: [],
-    });
-    expect(applied).toEqual([]);
-    expect(server.store.getLatestApprovalForRun(owner.run.id)).toBeUndefined();
-  }, 120_000);
+      const reopened = fixture.open();
+      const second = fixture.openDriver(reopened);
+      try {
+        await second.driver.kick(id);
+        const approvals = reopened.listPendingApprovalsForRun(fixture.run.id);
+        expect(approvals).toHaveLength(6);
+        for (const approval of approvals) {
+          await second.driver.decide(fixture.decide(approval, "approved"));
+        }
+        await second.driver.wait(id, AbortSignal.timeout(3000));
+        expect(
+          second.scripts
+            .load(id)
+            .steps.slice(6, 12)
+            .map(({ input: args }) => args),
+        ).toEqual([
+          { key: "value-f" },
+          { key: "value-e" },
+          { key: "value-d" },
+          { key: "value-c" },
+          { key: "value-b" },
+          { key: "value-a" },
+        ]);
+        expect(fixture.host.reads).toEqual(["value-e", "value-d", "value-c", "value-b", "value-a"]);
+        expect(fixture.host.published).toEqual([
+          "value-value-f",
+          "value-value-e",
+          "value-value-d",
+          "value-value-c",
+          "value-value-b",
+          "value-value-a",
+        ]);
+      } finally {
+        await second.driver.close();
+        reopened.close();
+      }
+    } finally {
+      await first.driver.close();
+      fixture.store.close();
+      fixture.database.cleanup();
+    }
+  });
 
-  it("bounded: a finish step that keeps failing ends the script run failed instead of retrying forever", async () => {
-    const { server, owner } = await startOwned("restate-bounded");
-    server.store.database.db.run(
-      `CREATE TRIGGER refuse_completed BEFORE UPDATE ON script_runs WHEN NEW.status = 'completed' BEGIN SELECT RAISE(ABORT, 'disk full'); END`,
-    );
-    const scriptRun = await submitScript(server, owner, `return 1;`);
-
-    const result = await server.scriptRuns!.attach(scriptRun.id, AbortSignal.timeout(60_000));
-
-    expect(result).toMatchObject({
-      ok: false,
-      error: { kind: "capability", message: expect.stringContaining("disk full") },
-    });
-    expect(server.scriptRunStore.get(scriptRun.id)?.status).toBe("failed");
-  }, 120_000);
-});
-
-describe("keep a write at most once when the store fails around it under Restate", () => {
-  it("store fault: a write the store cannot record is not repeated and ends the script run interrupted once the store recovers", async () => {
-    const { server, host, owner } = await startOwned("restate-store-fault");
-    const applied: string[] = [];
-    host.catalog.add(
+  it("keeps six branches at their recorded positions when the external read order changes after restart", async () => {
+    const fixture = await openScriptFixture();
+    const keys = ["a", "b", "c", "d", "e", "f"];
+    const gates = new Map(keys.map((key) => [key, Promise.withResolvers<void>()]));
+    const secondReads = new Map(keys.map((key) => [key, Promise.withResolvers<void>()]));
+    const allStarted = Promise.withResolvers<void>();
+    const reads: string[] = [];
+    let restarted = false;
+    fixture.host.catalog.add(
       defineCapability({
-        id: "ledger.post",
-        description: "Post an entry",
-        input: z.object({ text: z.string() }),
-        output: z.object({ posted: z.boolean() }),
+        id: "notes.branch",
+        description: "Read a branch from the external store.",
+        input: z.string(),
+        output: z.string(),
+        effect: "read",
+        approval: "none",
+        async execute(key) {
+          reads.push(key);
+          if (reads.length === 6) allStarted.resolve();
+          if (restarted) {
+            // The replacement transport returns initial reads immediately in call order.
+            return key;
+          }
+          await gates.get(key)?.promise;
+          secondReads.get(key.slice(1))?.resolve();
+          return key;
+        },
+      }),
+    );
+    const first = fixture.openDriver();
+    const { id } = first.acquire(`
+      return await Promise.all(["a","b","c","d","e","f"].map(async (key) => {
+        const first = await step.run("notes.branch", key);
+        const second = await step.run("notes.branch", ":" + first);
+        return await step.run("notes.publish", { text: second });
+      }));
+    `);
+    let reopened: ReturnType<typeof fixture.open> | undefined;
+    let second: ReturnType<typeof fixture.openDriver> | undefined;
+    try {
+      const driving = first.driver.kick(id);
+      await allStarted.promise;
+      for (const key of ["f", "e", "d", "c", "b", "a"]) {
+        gates.get(key)!.resolve();
+        await secondReads.get(key)!.promise;
+      }
+      await driving;
+      const stored = first.scripts
+        .load(id)
+        .steps.map(({ position, capability, input }) => ({ position, capability, input }));
+      expect(
+        stored
+          .filter(({ capability, position }) => capability === "notes.branch" && position > 6)
+          .map(({ input }) => input),
+      ).toEqual([":f", ":e", ":d", ":c", ":b", ":a"]);
+      await first.driver.close();
+      fixture.store.close();
+
+      restarted = true;
+      reopened = fixture.open();
+      second = fixture.openDriver(reopened);
+      await second.driver.kick(id);
+      const approvals = reopened.listPendingApprovalsForRun(fixture.run.id);
+      expect(approvals.map(({ effect }) => effect.canonicalArguments)).toEqual([
+        { text: ":f" },
+        { text: ":e" },
+        { text: ":d" },
+        { text: ":c" },
+        { text: ":b" },
+        { text: ":a" },
+      ]);
+      for (const approval of approvals) {
+        await second.driver.decide(fixture.decide(approval, "approved"));
+      }
+      expect(await second.driver.wait(id, AbortSignal.timeout(3000))).toMatchObject({ ok: true });
+      expect(
+        second.scripts
+          .load(id)
+          .steps.map(({ position, capability, input }) => ({ position, capability, input })),
+      ).toEqual(stored);
+      expect(reads).toEqual(["a", "b", "c", "d", "e", "f", ":f", ":e", ":d", ":c", ":b", ":a"]);
+      expect(fixture.host.published).toEqual([":f", ":e", ":d", ":c", ":b", ":a"]);
+    } finally {
+      await first.driver.close();
+      await second?.driver.close();
+      (reopened ?? fixture.store).close();
+      fixture.database.cleanup();
+    }
+  });
+
+  it("drops the driver while a write is in flight and resumes its independent sibling after reopening", async () => {
+    const fixture = await openScriptFixture();
+    const first = fixture.openDriver();
+    const invoked = Promise.withResolvers<void>();
+    const reply = Promise.withResolvers<string>();
+    const attempts: string[] = [];
+    fixture.host.catalog.add(
+      defineCapability({
+        id: "notes.pending",
+        description: "Wait for an external acknowledgement.",
+        input: z.string(),
+        output: z.string(),
         effect: "write",
         approval: "none",
-        async execute(input) {
-          applied.push(input.text);
-          return { posted: true };
+        async execute(value) {
+          attempts.push(value);
+          invoked.resolve();
+          return reply.promise;
         },
-      }) as unknown as Capability,
+      }),
     );
-    server.store.database.db.run(
-      "CREATE TRIGGER refuse_updates BEFORE UPDATE ON effects BEGIN SELECT RAISE(ABORT, 'disk full'); END",
-    );
-    const scriptRun = await submitScript(
-      server,
-      owner,
-      `
-        const seen = [];
-        for (let i = 0; i < 2; i++) {
-          try { await der.ledger.post({ text: "entry" }); seen.push("ok"); } catch (e) { seen.push("caught"); }
-        }
-        return seen;
-      `,
-    );
-    await waitUntil(async () => applied.length >= 1, { timeoutMs: 30_000, label: "first write" });
-    await Bun.sleep(4_000);
+    const { id } = first.acquire(`
+      return await step.all([
+        step.run("notes.pending", "slow"),
+        step.run("notes.append", { text: "sibling" }),
+      ]);
+    `);
+    const driving = first.driver.kick(id);
+    const stopped = driving.catch((error: unknown) => error);
+    await invoked.promise;
+    await first.driver.close();
+    expect(await stopped).toMatchObject({ name: "AbortError" });
+    expect(first.scripts.load(id).steps.map(({ status }) => status)).toEqual([
+      "pending",
+      "pending",
+    ]);
+    fixture.store.close();
 
-    expect(applied).toEqual(["entry"]);
-    expect(server.scriptRunStore.get(scriptRun.id)?.status).toBe("running");
-    server.store.database.db.run("DROP TRIGGER refuse_updates");
-    const result = await server.scriptRuns!.attach(scriptRun.id, AbortSignal.timeout(60_000));
+    const reopened = fixture.open();
+    const second = fixture.openDriver(reopened);
+    try {
+      await second.driver.kick(id);
+      expect(second.scripts.load(id)).toMatchObject({
+        execution: { status: "in_doubt" },
+        steps: [
+          { status: "unknown", seq: null },
+          { status: "done", seq: 1 },
+        ],
+      });
+      expect(attempts).toEqual(["slow"]);
+      expect(fixture.host.appended).toEqual(["sibling"]);
+    } finally {
+      reply.resolve("late");
+      await second.driver.close();
+      reopened.close();
+      fixture.database.cleanup();
+    }
+  });
 
-    expect(result).toMatchObject({ ok: false, error: { kind: "capability" } });
-    expect(applied).toEqual(["entry"]);
-    expect(server.scriptRunStore.get(scriptRun.id)?.status).toBe("interrupted");
-    expect(server.store.getRun(owner.run.id)?.status).toBe("interrupted");
-    expect(
-      server.store.getEffect({
-        runId: owner.run.id,
-        operationKind: "capability",
-        operationId: "ledger.post",
-        canonicalArguments: { text: "entry" },
-        attemptId: `${scriptRun.id}:1`,
-      })?.status,
-    ).toBe("unknown");
-  }, 180_000);
-});
-
-function ledgerCapability(applied: string[], delayMs = 0): Capability {
-  return defineCapability({
-    id: "ledger.post",
-    description: "Post an entry",
-    input: z.object({ text: z.string() }),
-    output: z.object({ posted: z.boolean() }),
-    effect: "write",
-    approval: "none",
-    async execute(input) {
-      await Bun.sleep(delayMs);
-      applied.push(input.text);
-      return { posted: true };
+  it.each([
+    {
+      case: "a stored read whose capability now declares write",
+      capability: "notes.publish",
+      effect: "read",
     },
-  }) as unknown as Capability;
-}
-
-describe("refuse and settle at the edges of a script run under Restate", () => {
-  it("in doubt: a script run in a run whose earlier script run left a write started calls no capability", async () => {
-    const { server, host, owner } = await startOwned("restate-in-doubt");
-    const applied: string[] = [];
-    host.catalog.add(ledgerCapability(applied));
-    const { scriptRun: earlier } = await server.scriptRunStore.acquire({
-      runId: owner.run.id,
-      botId: owner.botId,
-      source: `return 0;`,
-    });
-    await server.store.beginEffect({
-      runId: owner.run.id,
-      operationKind: "capability",
-      operationId: "ledger.post",
-      canonicalArguments: { text: "entry" },
-      attemptId: `${earlier.id}:1`,
-    });
-    await server.scriptRunStore.finish(earlier.id, "failed", {
-      ok: false,
-      error: { kind: "script", message: "store fault" },
-      logs: [],
-    });
-
-    const later = await submitScript(
-      server,
-      owner,
-      `await der.ledger.post({ text: "entry" }); return 1;`,
+    {
+      case: "a stored write whose capability now declares read",
+      capability: "notes.read",
+      effect: "write",
+    },
+    {
+      case: "a stored step whose capability no longer exists",
+      capability: "notes.removed",
+      effect: "read",
+    },
+  ] as const)("fails the re-run of $case before invoking anything", async (testCase) => {
+    const fixture = await openScriptFixture();
+    const first = fixture.openDriver();
+    const input = { text: "x", key: "x" };
+    const { id } = first.acquire(
+      `return await step.run(${JSON.stringify(testCase.capability)}, ${JSON.stringify(input)});`,
     );
-    const result = await server.scriptRuns!.attach(later.id, AbortSignal.timeout(60_000));
-
-    expect(result).toEqual({
-      ok: false,
-      error: {
-        kind: "capability",
-        message: `The outcome of a previous write in this Run (capability:ledger.post, ${earlier.id}:1) is unknown, so the Run was interrupted.`,
+    first.scripts.registerSteps(id, [
+      {
+        position: 1,
+        capability: testCase.capability,
+        effect: testCase.effect,
+        decision: "allow",
+        input,
+        inputHash: await fingerprintJson(input),
       },
-      logs: [],
-    });
-    expect(applied).toEqual([]);
-    expect(server.scriptRunStore.get(later.id)?.status).toBe("interrupted");
-    expect(server.store.getRun(owner.run.id)?.status).toBe("interrupted");
-    expect(
-      server.store
-        .readRunEventsAfter(owner.run.id, 0)
-        .map((event) => event.chunk as { type: string; code?: string })
-        .some((chunk) => chunk.type === "RUN_ERROR" && chunk.code === "effect.outcome_uncertain"),
-    ).toBe(true);
-  }, 120_000);
+    ]);
+    await first.driver.close();
+    fixture.store.close();
 
-  it("without await: a write issued and not awaited runs and is recorded completed before the result is reported", async () => {
-    const { server, host, owner } = await startOwned("restate-without-await");
-    const applied: string[] = [];
-    host.catalog.add(ledgerCapability(applied, 300));
-    const scriptRun = await submitScript(
-      server,
-      owner,
-      `der.ledger.post({ text: "entry" }); return 1;`,
-    );
+    const reopened = fixture.open();
+    const second = fixture.openDriver(reopened);
+    try {
+      await second.driver.kick(id);
 
-    const result = await server.scriptRuns!.attach(scriptRun.id, AbortSignal.timeout(60_000));
+      expect({
+        execution: second.scripts.load(id).execution.status,
+        result: second.scripts.load(id).execution.result,
+        invoked: [...fixture.host.reads, ...fixture.host.appended, ...fixture.host.published],
+        approvals: reopened.listPendingApprovalsForRun(fixture.run.id),
+      }).toMatchObject({
+        execution: "failed",
+        result: {
+          ok: false,
+          error: {
+            kind: "nondeterministic",
+            message: expect.stringContaining(testCase.capability),
+          },
+          logs: [],
+        },
+        invoked: [],
+        approvals: [],
+      });
+    } finally {
+      await second.driver.close();
+      reopened.close();
+      fixture.database.cleanup();
+    }
+  });
 
-    expect(result).toEqual({ ok: true, result: 1, logs: [], truncated: false });
-    expect(applied).toEqual(["entry"]);
-    expect(
-      server.store.getEffect({
-        runId: owner.run.id,
+  it.each([
+    {
+      case: "a removed capability",
+      second: "notes.removed",
+      limits: {},
+      kind: "nondeterministic",
+    },
+    {
+      case: "the step limit",
+      second: "notes.read",
+      limits: { maxSteps: 1 },
+      kind: "limit",
+    },
+  ] as const)(
+    "ends in doubt and interrupts the Run when a re-run stops on $case after a write that started",
+    async (testCase) => {
+      const fixture = await openScriptFixture();
+      const first = fixture.openDriver();
+      const write = { text: "x" };
+      const read = { key: "x" };
+      const { id } = first.acquire(`
+        return await step.all([
+          step.run("notes.append", ${JSON.stringify(write)}),
+          step.run(${JSON.stringify(testCase.second)}, ${JSON.stringify(read)}),
+        ]);
+      `);
+      first.scripts.registerSteps(id, [
+        {
+          position: 1,
+          capability: "notes.append",
+          effect: "write",
+          decision: "allow",
+          input: write,
+          inputHash: await fingerprintJson(write),
+        },
+        ...(testCase.second === "notes.removed"
+          ? [
+              {
+                position: 2,
+                capability: "notes.removed",
+                effect: "read" as const,
+                decision: "allow" as const,
+                input: read,
+                inputHash: await fingerprintJson(read),
+              },
+            ]
+          : []),
+      ]);
+      const effect = {
+        runId: fixture.run.id,
         operationKind: "capability",
-        operationId: "ledger.post",
-        canonicalArguments: { text: "entry" },
-        attemptId: `${scriptRun.id}:1`,
-      })?.status,
-    ).toBe("completed");
-  }, 120_000);
-});
+        operationId: "notes.append",
+        canonicalArguments: write,
+        attemptId: `${id}:1`,
+      } as const;
+      await fixture.store.beginEffect(effect);
+      await first.driver.close();
+      fixture.store.close();
 
-describe("run one script at a time in a run under Restate", () => {
-  it("one at a time: a different script sent while another waits on an approval is refused and the first completes", async () => {
-    const { server, host, owner } = await startOwned("restate-one-at-a-time");
-    const execute = createExecuteTool({
-      run: owner.run,
-      scriptRunStore: server.scriptRunStore,
-      scriptRuns: server.scriptRuns!,
-      maxResultBytes: 65_536,
-    });
-    const call = (script: string) =>
-      execute.execute!({ script }, { signal: AbortSignal.timeout(90_000) });
-    const first = call(PUBLISH);
-    const approval = await awaitPendingApproval(server, owner.run.id);
+      const reopened = fixture.open();
+      const second = fixture.openDriver(reopened, testCase.limits);
+      try {
+        const result = await second.driver.wait(id, new AbortController().signal);
 
-    const refused = await call(`return der.notes.publish({ text: "other" });`);
-    await server.coordinator.decide({
-      approvalId: approval.id,
-      botId: owner.botId,
-      sessionId: owner.sessionId,
-      runId: owner.run.id,
-      status: "approved",
-      actor: "operator",
-      decidedAt: formatUtcTimestamp(new Date()),
-    });
+        expect({
+          execution: second.scripts.load(id).execution.status,
+          result,
+          effect: reopened.getEffect(effect)?.status,
+          run: reopened.getRun(fixture.run.id)?.status,
+          appended: fixture.host.appended,
+        }).toMatchObject({
+          execution: "in_doubt",
+          result: {
+            ok: false,
+            error: {
+              kind: testCase.kind,
+              message: expect.stringMatching(/Unknown outcome:.*notes\.append/),
+            },
+            logs: [],
+          },
+          effect: "unknown",
+          run: "interrupted",
+          appended: [],
+        });
+      } finally {
+        await second.driver.close();
+        reopened.close();
+        fixture.database.cleanup();
+      }
+    },
+  );
 
-    expect(refused).toEqual({
-      ok: false,
-      error: {
-        kind: "capability",
-        message:
-          "Another Script is still running in this run. Wait for it to finish, or send the same Script again to get its result.",
+  it("interrupts at startup the active Run of an execution that ended in doubt", async () => {
+    const fixture = await openScriptFixture();
+    const first = fixture.openDriver();
+    const input = { text: "x" };
+    const { id } = first.acquire('return await step.run("notes.append", { text: "x" });');
+    first.scripts.registerSteps(id, [
+      {
+        position: 1,
+        capability: "notes.append",
+        effect: "write",
+        decision: "allow",
+        input,
+        inputHash: await fingerprintJson(input),
       },
-      logs: [],
+    ]);
+    const { effect } = await fixture.store.beginEffect({
+      runId: fixture.run.id,
+      operationKind: "capability",
+      operationId: "notes.append",
+      canonicalArguments: input,
+      attemptId: `${id}:1`,
     });
-    expect(await first).toEqual({
-      ok: true,
-      result: { published: true },
-      logs: [],
-      truncated: false,
+    await fixture.store.markEffectUnknown(effect.id);
+    const message = "Write 1 (notes.append) has an unknown outcome: process stopped";
+    first.scripts.completeStep(id, 1, {
+      status: "unknown",
+      error: { kind: "failed", message: "process stopped" },
     });
-    expect(host.published).toEqual(["release"]);
-  }, 150_000);
+    first.scripts.finish(id, {
+      status: "in_doubt",
+      result: { ok: false, error: { kind: "capability", message }, logs: [] },
+    });
+    await first.driver.close();
+    fixture.store.close();
+
+    const reopened = fixture.open();
+    const second = fixture.openDriver(reopened);
+    try {
+      await second.driver.sweep();
+
+      expect({
+        run: reopened.getRun(fixture.run.id)?.status,
+        checkpoint: reopened.getRun(fixture.run.id)?.checkpoint,
+      }).toEqual({
+        run: "interrupted",
+        checkpoint: { interruptedEffectId: effect.id, recordedAt: "2026-11-24T01:00:00.000Z" },
+      });
+    } finally {
+      await second.driver.close();
+      reopened.close();
+      fixture.database.cleanup();
+    }
+  });
+
+  it("keeps the registered Approval decision when the capability predicate changes on restart", async () => {
+    const fixture = await openScriptFixture();
+    let asks = true;
+    fixture.host.catalog.add(
+      defineCapability({
+        id: "notes.policy",
+        description: "Write a note.",
+        input: z.string(),
+        output: z.string(),
+        effect: "write",
+        approval: () => asks,
+        async execute(text) {
+          fixture.host.appended.push(text);
+          return text;
+        },
+      }),
+    );
+    const first = fixture.openDriver();
+    const { id } = first.acquire('return await step.run("notes.policy", "entry");');
+    let reopened: ReturnType<typeof fixture.open> | undefined;
+    let second: ReturnType<typeof fixture.openDriver> | undefined;
+    try {
+      await first.driver.kick(id);
+      const [approval] = fixture.store.listPendingApprovalsForRun(fixture.run.id);
+      await first.driver.close();
+      fixture.store.close();
+
+      asks = false;
+      reopened = fixture.open();
+      second = fixture.openDriver(reopened);
+      await second.driver.kick(id);
+      expect(
+        reopened.listPendingApprovalsForRun(fixture.run.id).map(({ id: approvalId }) => approvalId),
+      ).toEqual([approval!.id]);
+      expect(fixture.host.appended).toEqual([]);
+
+      await second.driver.decide(fixture.decide(approval!, "approved"));
+      expect(await second.driver.wait(id, AbortSignal.timeout(3000))).toEqual({
+        ok: true,
+        result: "entry",
+        logs: [],
+        truncated: false,
+      });
+      expect(fixture.host.appended).toEqual(["entry"]);
+    } finally {
+      await first.driver.close();
+      await second?.driver.close();
+      (reopened ?? fixture.store).close();
+      fixture.database.cleanup();
+    }
+  });
+
+  it("leaves a live lease alone and resumes after its deadline in the sweep", async () => {
+    const fixture = await openScriptFixture();
+    const { scripts, driver, acquire } = fixture.openDriver();
+    try {
+      const { id } = acquire('return await step.run("notes.append", { text: "recovered" });');
+      expect(
+        scripts.takeLease(
+          id,
+          "previous-driver",
+          formatUtcTimestamp(new Date("2026-11-24T01:00:02Z")),
+        ),
+      ).toBe(true);
+      await driver.kick(id);
+      expect(scripts.load(id).steps).toEqual([]);
+      fixture.advance(2001);
+      await driver.sweep();
+      expect(await driver.wait(id, AbortSignal.timeout(3000))).toEqual({
+        ok: true,
+        result: { count: 1 },
+        logs: [],
+        truncated: false,
+      });
+      expect(fixture.host.appended).toEqual(["recovered"]);
+    } finally {
+      await driver.close();
+      fixture.store.close();
+      fixture.database.cleanup();
+    }
+  });
+
+  it("two drivers kicked together apply each write once", async () => {
+    const fixture = await openScriptFixture();
+    const reopened = fixture.open();
+    const first = fixture.openDriver();
+    const second = fixture.openDriver(reopened);
+    try {
+      const { id } = first.acquire(source);
+      await Promise.all([first.driver.kick(id), second.driver.kick(id)]);
+      expect(fixture.host.appended).toEqual(["value-a", "value-b"]);
+      expect(fixture.host.reads).toEqual(["a", "b", "c"]);
+      expect(second.scripts.load(id).execution.status).toBe("completed");
+    } finally {
+      await Promise.all([first.driver.close(), second.driver.close()]);
+      reopened.close();
+      fixture.store.close();
+      fixture.database.cleanup();
+    }
+  });
 });

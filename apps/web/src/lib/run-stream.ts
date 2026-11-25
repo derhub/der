@@ -354,6 +354,8 @@ function extractLatestUserText(
 
 /** Written by the server when a replayed engine step abandons an attempt and starts over. */
 const ATTEMPT_RESET_EVENT = "der.attempt-reset";
+/** Written by the server at the end of a finished engine attempt for replay recovery. */
+const ENGINE_ATTEMPT_FINISHED_EVENT = "der.engine-attempt-finished";
 
 type ConversationBeforeRun = Parameters<ConnectConnectionAdapter["connect"]>[0];
 
@@ -388,6 +390,9 @@ export function createDerChatConnection(
               messages: [...conversationBeforeRun],
             } as unknown as StreamChunk;
           }
+          continue;
+        }
+        if (record["type"] === "CUSTOM" && record["name"] === ENGINE_ATTEMPT_FINISHED_EVENT) {
           continue;
         }
         if (record["type"] === "CUSTOM" && typeof record["name"] === "string") {

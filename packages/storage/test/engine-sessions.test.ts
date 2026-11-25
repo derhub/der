@@ -66,9 +66,10 @@ async function admitRun(store: SqliteStore, row: EngineSessionInput, text = "hel
 function completion(runId: string, row?: EngineSessionInput): FinishRunInput {
   return {
     runId,
-    status: "completed",
-    terminalEvent: { chunkKey: `${runId}:terminal`, chunk: { type: "RUN_FINISHED" } },
-    ...(row !== undefined ? { engineSession: row } : {}),
+    end: {
+      kind: "complete",
+      ...(row !== undefined ? { engineSession: row } : {}),
+    },
   };
 }
 
@@ -81,8 +82,12 @@ describe("hand the engine session over with the Run's finish", () => {
       const runId = await admitRun(store, rowA);
 
       await store.finishRun({
-        ...completion(runId, { ...rowA, lastOrdinal: 1 }),
-        finalMessageParts: [{ type: "text", text: "hi" }],
+        runId,
+        end: {
+          kind: "complete",
+          finalMessageParts: [{ type: "text", text: "hi" }],
+          engineSession: { ...rowA, lastOrdinal: 1 },
+        },
       });
 
       expect([store.getRun(runId)?.status, store.getEngineSession("sess-a", "codex")]).toEqual([
@@ -146,10 +151,7 @@ describe("hand the engine session over with the Run's finish", () => {
       const second = await admitRun(store, rowA, "second");
       await store.finishRun(completion(second, { ...rowA, vendorSessionId: "vendor-b" }));
 
-      await store.finishRun({
-        ...completion(first),
-        terminalEvent: { chunkKey: `${first}:terminal-late`, chunk: { type: "RUN_FINISHED" } },
-      });
+      await store.finishRun(completion(first));
 
       expect(store.getEngineSession("sess-a", "codex")?.vendorSessionId).toBe("vendor-b");
     } finally {
@@ -223,7 +225,10 @@ describe("take the engine session when a Run plans its turn", () => {
     const store = openStore();
     try {
       const stale = await admitRun(store, rowA, "first");
-      await store.finishRun({ ...completion(stale), status: "interrupted" });
+      await store.finishRun({
+        runId: stale,
+        end: { kind: "interrupt", detail: "interrupted" },
+      });
       await store.finishRun(completion(await admitRun(store, rowA, "second"), rowA));
       const plannedWith: unknown[] = [];
 

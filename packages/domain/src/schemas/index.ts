@@ -20,10 +20,15 @@ export {
 } from "./approval";
 export {
   bot,
+  capabilityPolicy,
   createBotInput,
+  DEFAULT_EVENT_CHAIN_LIMIT,
+  policyDecision,
   updateBotInput,
   type Bot,
+  type CapabilityPolicy,
   type CreateBotInput,
+  type PolicyDecision,
   type UpdateBotInput,
 } from "./bot";
 export {
@@ -111,6 +116,7 @@ export {
   runEvent,
   runOrigin,
   runRequest,
+  activeRunStatus,
   runStatus,
   runUsage,
   terminalRunStatus,
@@ -122,6 +128,7 @@ export {
   type RunEvent,
   type RunOrigin,
   type RunRequest,
+  type ActiveRunStatus,
   type RunStatus,
   type RunUsage,
   type TerminalRunStatus,
@@ -138,5 +145,13 @@ export {
   type ScriptRunStatus,
   type TerminalScriptRunStatus,
 } from "./script-run";
+export {
+  newSessionEvent,
+  sessionEvent,
+  sessionEventKind,
+  type NewSessionEvent,
+  type SessionEvent,
+  type SessionEventKind,
+} from "./session-event";
 export { createSessionInput, session, type CreateSessionInput, type Session } from "./session";
 export { skill, skillFrontmatter, type Skill, type SkillFrontmatter } from "./skill";
